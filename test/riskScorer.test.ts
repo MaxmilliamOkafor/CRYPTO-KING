@@ -1,0 +1,160 @@
+/**
+ * test/riskScorer.test.ts — plain-assertion unit tests for the pure scorer.
+ * Run with:  npm test   (bundles via esbuild, executes under Node)
+ *
+ * These pin the three fixtures to their documented walkthrough scores, plus
+ * edge behavior: clamping, mitigation cap, null → data gap (never points),
+ * and the insufficient-data guard.
+ */
+
+import assert from 'node:assert/strict';
+import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
+import { FIXTURE_AVOID, FIXTURE_NEUTRAL, FIXTURE_WATCH } from '../mock/fixtures.ts';
+import type { TokenAnalysis } from '../lib/types.ts';
+
+let passed = 0;
+function test(name: string, fn: () => void): void {
+  try {
+    fn();
+    passed++;
+    console.log(`  ✓ ${name}`);
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    throw err;
+  }
+}
+
+console.log('riskScorer.test.ts');
+
+/* ── Fixture walkthroughs (see mock/fixtures.ts for the arithmetic) ────── */
+
+test('RUGKING scores 90 → AVOID (mint +25, freeze +20, LP +20, top10 +15, no socials +10)', () => {
+  const r = scoreToken(FIXTURE_AVOID);
+  assert.equal(r.riskScore, 90);
+  assert.equal(r.signal, 'AVOID');
+  assert.ok(r.riskScore >= 80);
+  assert.equal(r.insufficientData, false);
+  // Highest-weight reason must surface first for the overlay's one-liner.
+  assert.match(r.reasons[0].text, /Mint authority active/);
+  assert.ok(r.reasons.length >= 5);
+  assert.ok(r.reasons.some((x) => /freeze holder wallets/i.test(x.text)));
+  assert.ok(r.reasons.some((x) => /rug vector/i.test(x.text)));
+});
+
+test('WIFCAT scores 45 → WATCH (metadata +5, top10 +15, thin liq +10, young+volume +10, unverified socials +5)', () => {
+  const r = scoreToken(FIXTURE_WATCH);
+  assert.equal(r.riskScore, 45);
+  assert.equal(r.signal, 'WATCH');
+  assert.ok(r.riskScore >= 40 && r.riskScore < 60);
+  assert.ok(r.reasons.some((x) => /Thin liquidity/.test(x.text)));
+  assert.ok(r.reasons.some((x) => /22 min old/.test(x.text)));
+});
+
+test('QUOKKA scores 0 → NEUTRAL (no triggers; -15 mitigation floors at 0)', () => {
+  const r = scoreToken(FIXTURE_NEUTRAL);
+  assert.equal(r.riskScore, 0);
+  assert.equal(r.signal, 'NEUTRAL');
+  assert.ok(r.riskScore < 20);
+  assert.equal(r.reasons.length, 0);
+  assert.equal(r.mitigations.length, 2); // verified socials + smart money accumulating
+});
+
+/* ── Signal thresholds ─────────────────────────────────────────────────── */
+
+test('signal thresholds map exactly per spec', () => {
+  assert.equal(signalForScore(100), 'AVOID');
+  assert.equal(signalForScore(80), 'AVOID');
+  assert.equal(signalForScore(79), 'HIGH_RISK');
+  assert.equal(signalForScore(60), 'HIGH_RISK');
+  assert.equal(signalForScore(59), 'WATCH');
+  assert.equal(signalForScore(40), 'WATCH');
+  assert.equal(signalForScore(39), 'CONSIDER');
+  assert.equal(signalForScore(20), 'CONSIDER');
+  assert.equal(signalForScore(19), 'NEUTRAL');
+  assert.equal(signalForScore(0), 'NEUTRAL');
+});
+
+/* ── Edge behavior ─────────────────────────────────────────────────────── */
+
+test('score clamps at 100 when everything is on fire', () => {
+  const worst: TokenAnalysis = structuredClone(FIXTURE_AVOID);
+  worst.mint = {
+    mintAuthorityActive: true,
+    freezeAuthorityActive: true,
+    metadataMutable: true,
+    isToken2022: true,
+    transferFeeBps: 2500,
+    feeAuthorityActive: true,
+  };
+  worst.market = {
+    ...worst.market!,
+    marketCapEur: 40_000,
+    liquidityEur: 5_000,
+    sellSimulation: { ok: false, slippagePct: 90 },
+  };
+  worst.behavior = {
+    volumeSpikeFlatPrice: true,
+    manySmallBuysOneHugeSell: true,
+    mcapSpikeNoOrganicVolume: true,
+    deployerLinkedSelling: true,
+    abnormalEarlyVolume: true,
+  };
+  worst.identity = { ...worst.identity, ageMinutes: 5 };
+  worst.deployer = { priorRugs: 3, fundingSource: 'known_rugger' };
+  worst.holders = { holderCount: 900, top5Pct: 91, top10Pct: 95, largestNonLpWalletPct: 55, bundledLaunchPct: 60 };
+  const r = scoreToken(worst);
+  assert.equal(r.riskScore, 100);
+  assert.equal(r.signal, 'AVOID');
+});
+
+test('nulls award zero points and become data gaps (never fake a score)', () => {
+  const sparse: TokenAnalysis = {
+    ...structuredClone(FIXTURE_NEUTRAL),
+    mint: null,
+    behavior: null,
+    deployer: null,
+    socials: null,
+    smartMoney: null,
+  };
+  const r = scoreToken(sparse);
+  assert.equal(r.insufficientData, false); // market + holders still present
+  assert.equal(r.riskScore, 0);
+  assert.ok(r.dataGaps.some((g) => /mint data unavailable/i.test(g)));
+  assert.ok(r.dataGaps.some((g) => /Deployer wallet history unavailable/i.test(g)));
+});
+
+test('insufficientData flags when mint, market AND holders are all missing', () => {
+  const empty: TokenAnalysis = {
+    ...structuredClone(FIXTURE_NEUTRAL),
+    mint: null,
+    market: null,
+    holders: null,
+  };
+  const r = scoreToken(empty);
+  assert.equal(r.insufficientData, true);
+});
+
+test('mitigations are capped at -15 and cannot drag a risky token below its floor', () => {
+  const risky: TokenAnalysis = structuredClone(FIXTURE_AVOID);
+  risky.socials = { website: 'https://x.example', twitter: 'https://x.com/x', telegram: null, verified: true }; // -5 (replaces +10 noSocials)
+  risky.smartMoney = { accumulating: true, exiting: false, walletCount: 9 }; // -10
+  const r = scoreToken(risky);
+  // 90 - 10 (noSocials gone) = 80 positives, minus capped -15 = 65
+  assert.equal(r.riskScore, 65);
+  assert.equal(r.signal, 'HIGH_RISK');
+  const totalMitigation = r.mitigations.reduce((s, m) => s + m.points, 0);
+  assert.ok(totalMitigation >= -15 || r.riskScore === 80 + Math.max(totalMitigation, -15) - 15);
+});
+
+test('Token-2022 very-high fee outranks the high-fee tier (replaces, not additive)', () => {
+  const feeToken: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  feeToken.mint = { ...feeToken.mint!, isToken2022: true, transferFeeBps: 2500 };
+  feeToken.socials = null; // avoid mitigation noise
+  feeToken.smartMoney = null;
+  const r = scoreToken(feeToken);
+  assert.equal(r.riskScore, 15);
+  assert.ok(r.reasons.some((x) => /25\.0% — very high/.test(x.text)));
+  assert.equal(r.reasons.length, 1);
+});
+
+console.log(`\n${passed} tests passed.`);

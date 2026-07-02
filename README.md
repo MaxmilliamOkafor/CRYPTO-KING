@@ -10,20 +10,22 @@
 - ✅ **Read-only**: no private keys, no wallet connections, no transaction signing, no auto-trading. Ever.
 - ❌ Not a signal service. `CONSIDER`/`NEUTRAL` mean *lower observed risk*, never "buy". **Lower observed risk ≠ safe.**
 
-## Quick start (mock mode — works immediately)
+## Quick start (mock mode — works immediately, no build needed)
+
+The repo ships with a pre-built **`dist/`** folder, so you can load it straight away:
+
+1. Open `chrome://extensions`
+2. Enable **Developer mode** (top right)
+3. Click **Load unpacked** → select the **`dist/`** folder — ⚠️ **NOT the repo root**. The root contains the TypeScript sources; Chrome can only run the bundled JavaScript in `dist/`. (Loading the root gives *"Could not load javascript 'content/content.js'"*.)
+4. Browse any token page on `gmgn.ai` (e.g. `https://gmgn.ai/sol/token/<ADDRESS>`) — the overlay appears top-right with a badge, score, top risk reason and a **Details** panel. The `MOCK` tag reminds you fixtures are active.
+
+If you edit any source file (including `config.ts`), rebuild `dist/` and hit ↻ reload on the extension card:
 
 ```bash
 npm install
 npm run build     # bundles into dist/
 npm test          # riskScorer unit tests (3 fixtures + edge cases)
 ```
-
-Then in Chrome:
-
-1. Open `chrome://extensions`
-2. Enable **Developer mode** (top right)
-3. Click **Load unpacked** → select the **`dist/`** folder
-4. Browse any token page on `gmgn.ai` (e.g. `https://gmgn.ai/sol/token/<ADDRESS>`) — the overlay appears top-right with a badge, score, top risk reason and a **Details** panel. The `MOCK` tag reminds you fixtures are active.
 
 Mock mode ships three fixture tokens — **RUGKING** (90 → AVOID), **WIFCAT** (45 → WATCH), **QUOKKA** (0 → NEUTRAL) — and deterministically maps any real address you browse onto one of them. See `mock/fixtures.ts` for the worked point-by-point walkthroughs.
 

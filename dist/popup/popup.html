@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>CRYPTO-KING</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>CRYPTO-KING</h1>
+      <span class="subtitle">Solana meme-coin risk scanner</span>
+      <span id="mock-badge" class="mock" hidden>MOCK DATA</span>
+    </header>
+
+    <main id="main">
+      <div id="state" class="state">Checking current tab…</div>
+
+      <section id="result" hidden>
+        <div class="token-row">
+          <div>
+            <div id="token-symbol" class="token-symbol"></div>
+            <div id="token-address" class="token-address"></div>
+          </div>
+          <span id="signal-badge" class="badge"></span>
+        </div>
+
+        <div class="score-wrap">
+          <div class="score-bar"><div id="score-fill" class="score-fill"></div></div>
+          <div class="score-legend">
+            <span id="score-num" class="score-num"></span>
+            <span class="legend-note">0 = lower observed risk (≠ safe) · 100 = severe risk</span>
+          </div>
+        </div>
+
+        <details id="reasons-details" open>
+          <summary>Why this score?</summary>
+          <ul id="reasons"></ul>
+          <ul id="mitigations"></ul>
+        </details>
+
+        <details id="gaps-details">
+          <summary>Not checked (data unavailable)</summary>
+          <ul id="gaps"></ul>
+        </details>
+
+        <h2>Metrics</h2>
+        <div id="metrics" class="metrics"></div>
+
+        <div class="links">
+          <a id="link-solscan" target="_blank" rel="noreferrer">Solscan ↗</a>
+          <a id="link-rugcheck" target="_blank" rel="noreferrer">RugCheck ↗</a>
+          <a id="link-gmgn" target="_blank" rel="noreferrer">GMGN ↗</a>
+        </div>
+      </section>
+
+      <section id="no-token" hidden>
+        <p>Open a token page on <b>gmgn.ai</b> (or pump.fun) to scan it.</p>
+        <h2>Recently analyzed</h2>
+        <ul id="recent-list" class="recent"></ul>
+      </section>
+
+      <button id="open-dashboard">Open dashboard</button>
+    </main>
+
+    <footer id="disclaimer"></footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

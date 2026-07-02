@@ -1,0 +1,201 @@
+// config.ts
+var CACHE_TTL_MS = 5 * 6e4;
+var SIGNAL_META = {
+  AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe risk factors observed." },
+  HIGH_RISK: { color: "#f76b15", textColor: "#ffffff", label: "HIGH RISK", blurb: "Multiple serious risk factors." },
+  WATCH: { color: "#ffb224", textColor: "#1b1b18", label: "WATCH", blurb: "Notable risk factors present." },
+  CONSIDER: { color: "#46a758", textColor: "#ffffff", label: "CONSIDER", blurb: "Fewer observed risks \u2014 NOT a buy signal." },
+  NEUTRAL: { color: "#64748b", textColor: "#ffffff", label: "NEUTRAL", blurb: "Low observed risk \u2260 safe." }
+};
+var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
+
+// popup/popup.ts
+var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
+var URL_PATTERNS = [
+  new RegExp(`/sol/token/(${BASE58})(?:[/?#]|$)`),
+  new RegExp(`/coin/(${BASE58})(?:[/?#]|$)`)
+];
+var $ = (id) => document.getElementById(id);
+document.addEventListener("DOMContentLoaded", () => {
+  $("disclaimer").textContent = DISCLAIMER;
+  $("open-dashboard").addEventListener("click", () => {
+    chrome.tabs.create({ url: chrome.runtime.getURL("dashboard/dashboard.html") });
+  });
+  void init();
+});
+async function init() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const address = extractAddress(tab?.url ?? "");
+  if (!address) {
+    await showRecent();
+    return;
+  }
+  $("state").textContent = "Analyzing token\u2026";
+  chrome.runtime.sendMessage({ type: "ANALYZE_TOKEN", address }, (res) => {
+    if (chrome.runtime.lastError || !res) {
+      $("state").textContent = "Risk data unavailable.";
+      return;
+    }
+    if (!res.ok) {
+      $("state").textContent = res.error;
+      return;
+    }
+    render(res.analysis, res.risk, res.mock);
+  });
+}
+function extractAddress(url) {
+  try {
+    const path = new URL(url).pathname;
+    for (const re of URL_PATTERNS) {
+      const m = path.match(re);
+      if (m) return m[1];
+    }
+  } catch {
+  }
+  return null;
+}
+function render(analysis, risk, mock) {
+  $("state").hidden = true;
+  $("mock-badge").hidden = !mock;
+  if (risk.insufficientData) {
+    $("state").hidden = false;
+    $("state").textContent = "Not enough data to assess this token \u2014 no score shown.";
+    return;
+  }
+  $("result").hidden = false;
+  const meta = SIGNAL_META[risk.signal];
+  const addr = analysis.identity.address;
+  $("token-symbol").textContent = analysis.identity.symbol ?? "(unknown symbol)";
+  $("token-address").textContent = addr;
+  const badge = $("signal-badge");
+  badge.textContent = meta.label;
+  badge.style.background = meta.color;
+  badge.style.color = meta.textColor;
+  const fill = $("score-fill");
+  fill.style.width = `${risk.riskScore}%`;
+  fill.style.background = meta.color;
+  $("score-num").textContent = `${risk.riskScore} / 100`;
+  const reasons = $("reasons");
+  reasons.innerHTML = "";
+  if (risk.reasons.length === 0) {
+    reasons.appendChild(li("gap-item", "No individual risk factors triggered \u2014 low observed risk \u2260 safe."));
+  }
+  for (const r of risk.reasons.slice(0, 6)) {
+    reasons.appendChild(reasonLi(`+${r.points}`, r.text, "bad"));
+  }
+  const mitigations = $("mitigations");
+  mitigations.innerHTML = "";
+  for (const m of risk.mitigations) {
+    mitigations.appendChild(reasonLi(`${m.points}`, m.text, "good"));
+  }
+  const gaps = $("gaps");
+  gaps.innerHTML = "";
+  for (const g of risk.dataGaps) gaps.appendChild(li("gap-item", g));
+  $("gaps-details").hidden = risk.dataGaps.length === 0;
+  renderMetrics(analysis);
+  $("link-solscan").href = `https://solscan.io/token/${addr}`;
+  $("link-rugcheck").href = `https://rugcheck.xyz/tokens/${addr}`;
+  $("link-gmgn").href = `https://gmgn.ai/sol/token/${addr}`;
+}
+function renderMetrics(a) {
+  const m = a.market;
+  const h = a.holders;
+  const mint = a.mint;
+  const lpText = {
+    burned: { v: "Burned", cls: "good" },
+    locked: { v: "Locked", cls: "good" },
+    deployer_held: { v: "Deployer-held", cls: "bad" },
+    unlocked: { v: "Unlocked", cls: "bad" },
+    unknown: { v: "unknown", cls: "unknown" }
+  };
+  const lp = lpText[m?.lpStatus ?? "unknown"];
+  const metrics = [
+    { k: "Liquidity", v: eur(m?.liquidityEur) },
+    { k: "Market cap", v: eur(m?.marketCapEur) },
+    { k: "Top-10 holders", v: pct(h?.top10Pct), cls: h?.top10Pct != null && h.top10Pct > 60 ? "bad" : void 0 },
+    { k: "Token age", v: age(a.identity.ageMinutes) },
+    {
+      k: "Transfer fee",
+      v: mint?.transferFeeBps != null ? `${(mint.transferFeeBps / 100).toFixed(1)}%` : mint?.isToken2022 === false ? "0% (SPL)" : "unknown",
+      cls: mint?.transferFeeBps != null && mint.transferFeeBps > 1e3 ? "bad" : void 0
+    },
+    { k: "LP status", v: lp.v, cls: lp.cls },
+    ...authorityMetric("Mint authority", mint?.mintAuthorityActive ?? null),
+    ...authorityMetric("Freeze authority", mint?.freezeAuthorityActive ?? null)
+  ];
+  const grid = $("metrics");
+  grid.innerHTML = "";
+  for (const item of metrics) {
+    const div = document.createElement("div");
+    div.className = "metric";
+    const k = document.createElement("div");
+    k.className = "k";
+    k.textContent = item.k;
+    const v = document.createElement("div");
+    v.className = `v ${item.v === "unknown" ? "unknown" : item.cls ?? ""}`;
+    v.textContent = item.v;
+    div.append(k, v);
+    grid.appendChild(div);
+  }
+}
+function authorityMetric(label, active) {
+  if (active === null) return [{ k: label, v: "unknown" }];
+  return [{ k: label, v: active ? "ACTIVE" : "Revoked", cls: active ? "bad" : "good" }];
+}
+async function showRecent() {
+  $("state").hidden = true;
+  $("no-token").hidden = false;
+  chrome.runtime.sendMessage({ type: "GET_RECENT" }, (res) => {
+    const list = $("recent-list");
+    list.innerHTML = "";
+    if (!res?.ok || res.recent.length === 0) {
+      list.appendChild(li("gap-item", "Nothing analyzed yet."));
+      return;
+    }
+    for (const row of res.recent.slice(0, 8)) {
+      const meta = SIGNAL_META[row.signal];
+      const item = document.createElement("li");
+      const sym = document.createElement("span");
+      sym.className = "sym";
+      sym.textContent = row.symbol ?? `${row.address.slice(0, 4)}\u2026${row.address.slice(-4)}`;
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = `${row.riskScore} ${meta.label}`;
+      badge.style.background = meta.color;
+      badge.style.color = meta.textColor;
+      item.append(sym, badge);
+      list.appendChild(item);
+    }
+  });
+}
+function li(cls, text) {
+  const el = document.createElement("li");
+  el.className = cls;
+  el.textContent = text;
+  return el;
+}
+function reasonLi(points, text, cls) {
+  const el = document.createElement("li");
+  const pts = document.createElement("span");
+  pts.className = `pts ${cls}`;
+  pts.textContent = points;
+  const txt = document.createElement("span");
+  txt.textContent = text;
+  el.append(pts, txt);
+  return el;
+}
+function eur(v) {
+  if (v == null) return "unknown";
+  if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
+  return `\u20AC${v.toFixed(v < 1 ? 6 : 2)}`;
+}
+function pct(v) {
+  return v == null ? "unknown" : `${v.toFixed(0)}%`;
+}
+function age(minutes) {
+  if (minutes == null) return "unknown";
+  if (minutes < 60) return `${Math.round(minutes)} min`;
+  if (minutes < 1440) return `${(minutes / 60).toFixed(1)} h`;
+  return `${(minutes / 1440).toFixed(1)} d`;
+}

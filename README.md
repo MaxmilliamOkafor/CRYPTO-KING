@@ -10,14 +10,16 @@
 - ✅ **Read-only**: no private keys, no wallet connections, no transaction signing, no auto-trading. Ever.
 - ❌ Not a signal service. `CONSIDER`/`NEUTRAL` mean *lower observed risk*, never "buy". **Lower observed risk ≠ safe.**
 
-## Quick start (mock mode — works immediately, no build needed)
+## Quick start (live data, no build, no keys, no setup)
 
-The repo ships with a pre-built **`dist/`** folder, so you can load it straight away:
+The repo ships with a pre-built **`dist/`** folder running in **live mode** — real GMGN / pump.fun / Solana-RPC data out of the box:
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode** (top right)
 3. Click **Load unpacked** → select the **`dist/`** folder — ⚠️ **NOT the repo root**. The root contains the TypeScript sources; Chrome can only run the bundled JavaScript in `dist/`. (Loading the root gives *"Could not load javascript 'content/content.js'"*.)
-4. Browse any token page on `gmgn.ai` (e.g. `https://gmgn.ai/sol/token/<ADDRESS>`) — the overlay appears top-right with a badge, score, top risk reason and a **Details** panel. The `MOCK` tag reminds you fixtures are active.
+4. Browse any token page on `gmgn.ai` (e.g. `https://gmgn.ai/sol/token/<ADDRESS>`) — the risk card appears top-right on the page itself with a badge, score, top risk reason and a **Details** panel. Click the toolbar icon for the full breakdown; the dashboard (history + P&L journal) fills up as you browse.
+
+Any check that can't be answered live shows up under "Not checked (data unavailable)" rather than being guessed — e.g. metadata mutability stays unknown until you add a free Helius RPC key (see below). To demo with fixtures instead, set `MOCK_MODE = true` in `config.ts` and rebuild.
 
 If you edit any source file (including `config.ts`), rebuild `dist/` and hit ↻ reload on the extension card:
 
@@ -27,19 +29,11 @@ npm run build     # bundles into dist/
 npm test          # riskScorer unit tests (3 fixtures + edge cases)
 ```
 
-Mock mode ships three fixture tokens — **RUGKING** (90 → AVOID), **WIFCAT** (45 → WATCH), **QUOKKA** (0 → NEUTRAL) — and deterministically maps any real address you browse onto one of them. See `mock/fixtures.ts` for the worked point-by-point walkthroughs.
+Mock mode (opt-in) ships three fixture tokens — **RUGKING** (90 → AVOID), **WIFCAT** (45 → WATCH), **QUOKKA** (0 → NEUTRAL) — and deterministically maps any real address you browse onto one of them. See `mock/fixtures.ts` for the worked point-by-point walkthroughs.
 
-## Going live
+## Data sources (all configured in `config.ts`)
 
-Everything lives in **`config.ts`**:
-
-### 1. Flip the flag
-
-```ts
-export const MOCK_MODE = false;
-```
-
-### 2. GMGN endpoints (already pre-filled)
+### 1. GMGN endpoints (already pre-filled)
 
 The six internal GMGN paths in `config.GMGN.endpoints` were captured live from DevTools → Network and are pre-filled:
 

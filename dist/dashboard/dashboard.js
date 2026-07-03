@@ -1,5 +1,5 @@
 // config.ts
-var MOCK_MODE = true;
+var MOCK_MODE = false;
 var CACHE_TTL_MS = 5 * 6e4;
 var SIGNAL_META = {
   AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe risk factors observed." },

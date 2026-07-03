@@ -16,8 +16,11 @@
 
 import type { Signal } from './lib/types.ts';
 
-/** true = ship with deterministic fixtures (mock/fixtures.ts). No network calls at all. */
-export const MOCK_MODE = true;
+/**
+ * LIVE by default — real GMGN/pump.fun/Solana-RPC data, no keys or setup needed.
+ * Set to true to demo with deterministic fixtures (mock/fixtures.ts) instead.
+ */
+export const MOCK_MODE = false;
 
 /** Display currency. All fixture values and converted live values are EUR. */
 export const DISPLAY_CURRENCY = 'EUR' as const;

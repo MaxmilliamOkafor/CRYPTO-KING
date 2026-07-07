@@ -61,6 +61,11 @@ var LIVE_FEED = {
   /** Feed cache size. */
   maxRows: 60
 };
+var DEXSCREENER = {
+  enabled: true,
+  /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
+  latestProfilesUrl: "https://api.dexscreener.com/token-profiles/latest/v1"
+};
 var SOLANA = {
   /**
    * Authoritative fallback for mint/freeze authority, Token-2022 fees, and
@@ -188,6 +193,109 @@ var nullDeployerAdapter = {
     };
   }
 };
+
+// lib/http.ts
+function rateLimitFor(host) {
+  const bare = host.replace(/^www\./, "");
+  return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
+}
+var hostQueues = /* @__PURE__ */ new Map();
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid";
+  }
+}
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function fetchJson(url, init) {
+  const host = hostOf(url);
+  const q = hostQueues.get(host) ?? { lastAt: 0, chain: Promise.resolve() };
+  const run = q.chain.then(async () => {
+    const wait = q.lastAt + rateLimitFor(host) - Date.now();
+    if (wait > 0) await sleep(wait);
+    q.lastAt = Date.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      if (!res.ok) {
+        console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
+        return null;
+      }
+      return await res.json();
+    } catch (err) {
+      console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  hostQueues.set(host, { lastAt: q.lastAt, chain: run.catch(() => void 0) });
+  const result = await run;
+  const entry = hostQueues.get(host);
+  if (entry) entry.lastAt = Math.max(entry.lastAt, Date.now() - 1);
+  return result;
+}
+async function rpcCall(rpcUrl, method, params) {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
+  const json = await fetchJson(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body
+  });
+  if (json && typeof json === "object" && "result" in json) {
+    return json.result ?? null;
+  }
+  return null;
+}
+function pick(obj, paths) {
+  for (const path of paths) {
+    let cur = obj;
+    let ok = true;
+    for (const key of path.split(".")) {
+      if (cur !== null && typeof cur === "object" && key in cur) {
+        cur = cur[key];
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (ok && cur !== void 0 && cur !== null) return cur;
+  }
+  return void 0;
+}
+function asNumber(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+function asString(v) {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+// lib/dexscreenerClient.ts
+var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+async function fetchDexscreenerNewSolana(limit) {
+  if (MOCK_MODE || !DEXSCREENER.enabled) return [];
+  const json = await fetchJson(DEXSCREENER.latestProfilesUrl);
+  const arr = Array.isArray(json) ? json : Array.isArray(json?.profiles) ? json.profiles : [];
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const item of arr) {
+    const chain = asString(pick(item, ["chainId", "chain"]));
+    if (chain !== "solana") continue;
+    const addr = asString(pick(item, ["tokenAddress", "address"]));
+    if (!addr || !BASE58_RE.test(addr) || seen.has(addr)) continue;
+    seen.add(addr);
+    out.push(addr);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
 
 // mock/fixtures.ts
 var now = () => Date.now();
@@ -360,89 +468,6 @@ function simpleHash(s) {
     h = h * 31 + s.charCodeAt(i) >>> 0;
   }
   return h;
-}
-
-// lib/http.ts
-function rateLimitFor(host) {
-  const bare = host.replace(/^www\./, "");
-  return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
-}
-var hostQueues = /* @__PURE__ */ new Map();
-function hostOf(url) {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "invalid";
-  }
-}
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function fetchJson(url, init) {
-  const host = hostOf(url);
-  const q = hostQueues.get(host) ?? { lastAt: 0, chain: Promise.resolve() };
-  const run = q.chain.then(async () => {
-    const wait = q.lastAt + rateLimitFor(host) - Date.now();
-    if (wait > 0) await sleep(wait);
-    q.lastAt = Date.now();
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { ...init, signal: ctrl.signal });
-      if (!res.ok) {
-        console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
-        return null;
-      }
-      return await res.json();
-    } catch (err) {
-      console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-  hostQueues.set(host, { lastAt: q.lastAt, chain: run.catch(() => void 0) });
-  const result = await run;
-  const entry = hostQueues.get(host);
-  if (entry) entry.lastAt = Math.max(entry.lastAt, Date.now() - 1);
-  return result;
-}
-async function rpcCall(rpcUrl, method, params) {
-  const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
-  const json = await fetchJson(rpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body
-  });
-  if (json && typeof json === "object" && "result" in json) {
-    return json.result ?? null;
-  }
-  return null;
-}
-function pick(obj, paths) {
-  for (const path of paths) {
-    let cur = obj;
-    let ok = true;
-    for (const key of path.split(".")) {
-      if (cur !== null && typeof cur === "object" && key in cur) {
-        cur = cur[key];
-      } else {
-        ok = false;
-        break;
-      }
-    }
-    if (ok && cur !== void 0 && cur !== null) return cur;
-  }
-  return void 0;
-}
-function asNumber(v) {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
-  }
-  return null;
-}
-function asString(v) {
-  return typeof v === "string" && v.length > 0 ? v : null;
 }
 
 // lib/gmgnClient.ts
@@ -672,7 +697,7 @@ async function fetchPumpfunData(address) {
     socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null
   };
 }
-var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 async function fetchPumpfunNewCoins(limit, offset = 0) {
   if (MOCK_MODE || !PUMPFUN.enabled) return [];
   const path = PUMPFUN.listEndpoint.replace("{offset}", String(offset)).replace("{limit}", String(limit));
@@ -681,7 +706,7 @@ async function fetchPumpfunNewCoins(limit, offset = 0) {
   const out = [];
   for (const c of arr) {
     const mint = asString(pick(c, ["mint", "address", "coin_mint"]));
-    if (!mint || !BASE58_RE.test(mint)) continue;
+    if (!mint || !BASE58_RE2.test(mint)) continue;
     out.push({
       mint,
       symbol: asString(pick(c, ["symbol"])),
@@ -1009,7 +1034,7 @@ async function fetchOwners(tokenAccounts) {
 
 // background/service-worker.ts
 var RECENT_KEY = "ck:recent";
-var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+var BASE58_RE3 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var cache = /* @__PURE__ */ new Map();
 var inFlight = /* @__PURE__ */ new Map();
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1036,7 +1061,11 @@ async function handle(msg) {
 var feed = /* @__PURE__ */ new Map();
 async function getLiveFeed() {
   if (!LIVE_FEED.enabled) return { ok: false, error: "Live feed disabled in config." };
-  const coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
+  let coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
+  if (coins.length === 0) {
+    const addrs = await fetchDexscreenerNewSolana(LIVE_FEED.fetchCount);
+    coins = addrs.map((mint) => ({ mint, symbol: null, name: null, createdMs: null }));
+  }
   if (coins.length === 0 && feed.size === 0) {
     return {
       ok: false,
@@ -1079,7 +1108,7 @@ async function getLiveFeed() {
   return { ok: true, feed: rows, source: MOCK_MODE ? "mock" : "ok", scannedThisPoll };
 }
 async function analyzeToken(address, force, rawGmgn) {
-  if (!BASE58_RE2.test(address)) {
+  if (!BASE58_RE3.test(address)) {
     return { ok: false, error: "Not a valid Solana address." };
   }
   const cached = cache.get(address);

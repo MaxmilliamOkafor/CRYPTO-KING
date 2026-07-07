@@ -16,6 +16,7 @@
 
 import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter } from '../lib/deployerClient.ts';
+import { fetchDexscreenerNewSolana } from '../lib/dexscreenerClient.ts';
 import { fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
@@ -78,7 +79,12 @@ const feed = new Map<string, FeedRow>();
 async function getLiveFeed(): Promise<LiveFeedResponse> {
   if (!LIVE_FEED.enabled) return { ok: false, error: 'Live feed disabled in config.' };
 
-  const coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
+  let coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
+  if (coins.length === 0) {
+    // Fallback: DexScreener fresh Solana tokens (address-only; details fill in on scan).
+    const addrs = await fetchDexscreenerNewSolana(LIVE_FEED.fetchCount);
+    coins = addrs.map((mint) => ({ mint, symbol: null, name: null, createdMs: null }));
+  }
   if (coins.length === 0 && feed.size === 0) {
     return {
       ok: false,

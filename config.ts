@@ -112,6 +112,17 @@ export const LIVE_FEED = {
   maxRows: 60,
 };
 
+/**
+ * DexScreener — keyless, CORS-friendly public API. Used as a FALLBACK source of
+ * fresh Solana token addresses for the Live feed when pump.fun is unreachable or
+ * its response shape drifts, so the feed is never dependent on one endpoint.
+ */
+export const DEXSCREENER = {
+  enabled: true,
+  /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
+  latestProfilesUrl: 'https://api.dexscreener.com/token-profiles/latest/v1',
+};
+
 export const SOLANA = {
   /**
    * Authoritative fallback for mint/freeze authority, Token-2022 fees, and

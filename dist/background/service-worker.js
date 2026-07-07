@@ -427,7 +427,10 @@ function asString(v) {
 }
 
 // lib/gmgnClient.ts
-async function fetchGmgnRaw(address) {
+async function fetchGmgnRaw(address, lite = false) {
+  if (lite) {
+    return { security: await call("security", address), tokenInfo: null, preview: null, feeDist: null, slippage: null, topBuyers: null };
+  }
   const [security, tokenInfo, preview, feeDist, slippage, topBuyers] = await Promise.all([
     call("security", address),
     call("tokenInfo", address),

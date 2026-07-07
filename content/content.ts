@@ -23,7 +23,7 @@
 
 import { DISCLAIMER, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
-import type { AnalyzeResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
+import type { AnalyzeResponse, RiskResult, Signal, TokenAnalysis } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -34,7 +34,7 @@ const URL_PATTERNS = [
 
 let currentAddress: string | null = null;
 let lastHref = '';
-let lastAutoToken: string | null = null;
+let view: 'none' | 'home' | 'token' = 'none';
 
 /* ── Address detection ─────────────────────────────────────────────────── */
 
@@ -55,53 +55,62 @@ function addressFromDom(): string | null {
   return m ? m[1] : null;
 }
 
-/** React to the current page: auto-scan a detected token, else show the scan box. */
+/** React to the current page: auto-scan a detected token page, else show the
+ *  home view (scan box + whole-page coin scan). */
 function detect(): void {
   if (collapsed) return; // user minimized us; don't pop back open on navigation
   const address = addressFromUrl() ?? addressFromDom();
   if (address) {
-    if (address === lastAutoToken && address === currentAddress) return; // already showing it
-    lastAutoToken = address;
+    if (view === 'token' && address === currentAddress) return; // already showing it
+    view = 'token';
     void analyze(address);
-  } else if (currentAddress === null) {
-    lastAutoToken = null;
-    renderHome(); // persistent scan box on list/trending pages
+    return;
+  }
+  // No single token in the URL → list/trending page.
+  if (view !== 'home') {
+    view = 'home';
+    currentAddress = null;
+    renderHome();
+  } else if (!scanning) {
+    void scanPage(); // infinite-scroll may have loaded more coins; pick them up (no re-render)
   }
 }
 
-async function analyze(address: string, _manual = false): Promise<void> {
-  currentAddress = address;
-  showLoading(address);
-
-  // On gmgn.ai (live mode), grab GMGN's same-origin JSON with the page's
-  // cookies and hand it to the background. Failures degrade to null → the
-  // background falls back to its own fetch, and unfetchable checks become
-  // honest "data unavailable" — never a faked score.
+/**
+ * Ask the background to analyze one token. On gmgn.ai (live mode) we first grab
+ * GMGN's same-origin JSON with the page's cookies and forward it; failures
+ * degrade to null so the background falls back to its own fetch and unfetchable
+ * checks become honest "data unavailable" — never a faked score.
+ * `lite` limits GMGN to a single call (used for bulk page scans).
+ */
+async function requestAnalysis(address: string, lite = false): Promise<AnalyzeResponse> {
   let rawGmgn: GmgnRaw | undefined;
   if (!MOCK_MODE && location.hostname.endsWith('gmgn.ai')) {
     try {
-      rawGmgn = await fetchGmgnRaw(address);
+      rawGmgn = await fetchGmgnRaw(address, lite);
     } catch {
       rawGmgn = undefined;
     }
-    if (address !== currentAddress) return; // navigated away / user scanned another
   }
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'ANALYZE_TOKEN', address, rawGmgn }, (res: AnalyzeResponse | undefined) => {
+      if (chrome.runtime.lastError || !res) resolve({ ok: false, error: 'Risk data unavailable.' });
+      else resolve(res);
+    });
+  });
+}
 
-  chrome.runtime.sendMessage(
-    { type: 'ANALYZE_TOKEN', address, rawGmgn },
-    (res: AnalyzeResponse | undefined) => {
-      if (address !== currentAddress) return; // superseded
-      if (chrome.runtime.lastError || !res) {
-        showError('Risk data unavailable.');
-        return;
-      }
-      if (!res.ok) {
-        showError(res.error);
-        return;
-      }
-      render(res.analysis, res.risk, res.mock);
-    },
-  );
+/** Scan a single token and show its full card. */
+async function analyze(address: string, _manual = false): Promise<void> {
+  currentAddress = address;
+  showLoading(address);
+  const res = await requestAnalysis(address, false);
+  if (address !== currentAddress) return; // superseded by another scan/navigation
+  if (!res.ok) {
+    showError(res.error);
+    return;
+  }
+  render(res.analysis, res.risk, res.mock);
 }
 
 /* ── Persistent on-page assistant (shadow DOM) ─────────────────────────── */
@@ -180,6 +189,23 @@ const STYLES = `
     font-size: 22px; cursor: pointer; border: 1px solid #3a5bd0;
   }
   .fab:hover { filter: brightness(1.1); }
+  /* page scan list */
+  .scan-section { margin-top: 12px; border-top: 1px solid #2c303a; padding-top: 10px; }
+  .scan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .scan-head .t { font-weight: 700; font-size: 11.5px; letter-spacing: .04em; flex: 1; color: #cfd3dc; }
+  .scan-head .rescan { color: #7aa2ff; font-size: 11px; }
+  .scan-status { color: #8a91a0; font-size: 11px; margin-bottom: 6px; }
+  .scanlist { max-height: 260px; overflow-y: auto; margin: 0 -4px; }
+  .scan-item {
+    display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: 8px; cursor: pointer;
+  }
+  .scan-item:hover { background: #1c1f26; }
+  .mini-badge { font-weight: 800; font-size: 10px; letter-spacing: .03em; padding: 2px 6px; border-radius: 6px; min-width: 58px; text-align: center; }
+  .si-main { flex: 1; min-width: 0; }
+  .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .scan-empty { color: #8a91a0; font-size: 11.5px; font-style: italic; padding: 4px; }
 `;
 
 function ensureHost(): ShadowRoot {
@@ -209,8 +235,13 @@ function renderCollapsed(): void {
   w.querySelector('.fab')?.addEventListener('click', () => {
     collapsed = false;
     // Re-show whatever we last had: a scanned token, or the home scan box.
-    if (currentAddress) void analyze(currentAddress);
-    else renderHome();
+    if (currentAddress) {
+      view = 'token';
+      void analyze(currentAddress);
+    } else {
+      view = 'home';
+      renderHome();
+    }
   });
 }
 
@@ -246,9 +277,17 @@ function renderHome(): void {
     </div>
     ${
       onThisPage
-        ? `<div class="home-note">Detected on this page: <a href="#" class="detected">${esc(short(onThisPage))}</a></div>`
-        : `<div class="home-note">Tip: open any coin on gmgn.ai and it scans automatically.</div>`
+        ? `<div class="home-note">On this page: <a href="#" class="detected">${esc(short(onThisPage))}</a> — auto-scanning.</div>`
+        : ''
     }
+    <div class="scan-section">
+      <div class="scan-head">
+        <span class="t">Coins on this page</span>
+        <button class="rescan">↻ Rescan</button>
+      </div>
+      <div class="scan-status"></div>
+      <div class="scanlist"></div>
+    </div>
     <div class="disclaimer">${esc(DISCLAIMER)}</div>`;
 
   const input = body.querySelector<HTMLInputElement>('.scan-input');
@@ -268,6 +307,172 @@ function renderHome(): void {
   body.querySelector('.detected')?.addEventListener('click', (e) => {
     e.preventDefault();
     if (onThisPage) void analyze(onThisPage, true);
+  });
+  body.querySelector('.rescan')?.addEventListener('click', () => {
+    pageScan.clear();
+    void scanPage();
+  });
+
+  updateScanList();
+  void scanPage(); // auto-scan the coins visible on this page
+}
+
+/* ── Whole-page scanning + replica/copycat detection ───────────────────── */
+
+interface ScanRow {
+  address: string;
+  symbol: string | null;
+  name: string | null;
+  score: number;
+  signal: Signal;
+  topReason: string | null;
+  insufficient: boolean;
+}
+
+const MAX_SCAN = 40; // cap coins per sweep so we never hammer GMGN
+const pageScan = new Map<string, ScanRow>();
+const symbolHints = new Map<string, string>(); // mint → symbol read from the page link text
+let scanning = false;
+
+/** Every distinct token mint linked from the current page (gmgn/pump/solscan links),
+ *  capturing a symbol hint from each link's text for replica detection + display. */
+function collectMints(): string[] {
+  const set = new Set<string>();
+  const res = [
+    new RegExp(`/sol/token/(${BASE58})`),
+    new RegExp(`/coin/(${BASE58})`),
+    new RegExp(`solscan\\.io/token/(${BASE58})`),
+  ];
+  document.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((a) => {
+    const href = a.getAttribute('href') ?? '';
+    for (const re of res) {
+      const m = href.match(re);
+      if (m) {
+        set.add(m[1]);
+        const hint = symbolFromText(a.textContent ?? '');
+        if (hint && !symbolHints.has(m[1])) symbolHints.set(m[1], hint);
+        break;
+      }
+    }
+  });
+  return [...set].slice(0, MAX_SCAN);
+}
+
+/** Best-effort leading ticker from a link's text, e.g. "$W26 / SOL" → "W26". */
+function symbolFromText(t: string): string | null {
+  const m = t.trim().match(/\$?([A-Za-z][A-Za-z0-9]{0,14})/);
+  return m ? m[1].toUpperCase() : null;
+}
+
+async function scanPage(): Promise<void> {
+  if (scanning || collapsed) return;
+  const queue = collectMints().filter((m) => !pageScan.has(m));
+  if (queue.length === 0) {
+    updateScanList();
+    return;
+  }
+  scanning = true;
+  setScanStatus(`Scanning ${queue.length} coin${queue.length > 1 ? 's' : ''}…`);
+
+  let i = 0;
+  const worker = async () => {
+    while (i < queue.length) {
+      const mint = queue[i++];
+      const res = await requestAnalysis(mint, /*lite*/ true);
+      const hint = symbolHints.get(mint) ?? null;
+      pageScan.set(
+        mint,
+        res.ok
+          ? {
+              address: mint,
+              symbol: res.analysis.identity.symbol ?? hint,
+              name: res.analysis.identity.name,
+              score: res.risk.riskScore,
+              signal: res.risk.signal,
+              topReason: res.risk.reasons[0]?.text ?? null,
+              insufficient: res.risk.insufficientData,
+            }
+          : { address: mint, symbol: hint, name: null, score: 0, signal: 'NEUTRAL', topReason: null, insufficient: true },
+      );
+      updateScanList();
+    }
+  };
+  await Promise.all([worker(), worker()]); // concurrency 2; per-host rate limiter throttles further
+  scanning = false;
+  updateScanList();
+}
+
+/** Symbols that appear on more than one distinct mint → likely copycats/replicas. */
+function replicaSymbols(): Set<string> {
+  const counts = new Map<string, number>();
+  for (const r of pageScan.values()) {
+    if (!r.symbol) continue;
+    const k = r.symbol.trim().toUpperCase();
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
+}
+
+function setScanStatus(text: string): void {
+  const el = shadow?.querySelector('.scan-status');
+  if (el) el.textContent = text;
+}
+
+function updateScanList(): void {
+  const list = shadow?.querySelector<HTMLDivElement>('.scanlist');
+  if (!list) return; // home view not mounted right now; data is retained in pageScan
+
+  const replicas = replicaSymbols();
+  const rows = [...pageScan.values()].sort((a, b) => {
+    // Worst first: insufficient-data last, otherwise highest risk score first.
+    if (a.insufficient !== b.insufficient) return a.insufficient ? 1 : -1;
+    return b.score - a.score;
+  });
+
+  const replicaCount = rows.filter((r) => r.symbol && replicas.has(r.symbol.trim().toUpperCase())).length;
+  const avoid = rows.filter((r) => !r.insufficient && (r.signal === 'AVOID' || r.signal === 'HIGH_RISK')).length;
+  if (!scanning) {
+    const parts: string[] = [];
+    parts.push(rows.length ? `${rows.length} scanned` : '');
+    if (avoid) parts.push(`⚠ ${avoid} high-risk`);
+    if (replicaCount) parts.push(`👥 ${replicaCount} possible copycat${replicaCount > 1 ? 's' : ''}`);
+    setScanStatus(parts.filter(Boolean).join(' · ') || 'No linked coins found on this page.');
+  }
+
+  if (rows.length === 0) {
+    list.innerHTML = `<div class="scan-empty">No token links detected here yet. Use the scan box above, or open a coin.</div>`;
+    return;
+  }
+
+  list.innerHTML = rows
+    .map((r) => {
+      const meta = SIGNAL_META[r.signal];
+      const isReplica = r.symbol && replicas.has(r.symbol.trim().toUpperCase());
+      const label = r.insufficient ? 'NO DATA' : `${r.score} ${meta.label}`;
+      const bg = r.insufficient ? '#3a3f4c' : meta.color;
+      const fg = r.insufficient ? '#e6e8ee' : meta.textColor;
+      const sym = r.symbol ?? short(r.address);
+      const reason = r.insufficient
+        ? 'Not enough data to assess'
+        : isReplica
+          ? 'Shares a symbol with another coin here — possible copycat/rug'
+          : (r.topReason ?? 'Lower observed risk — not a buy signal');
+      return `
+        <div class="scan-item" data-addr="${esc(r.address)}">
+          <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
+          <span class="si-main">
+            <span class="si-sym">${esc(sym)}${isReplica ? '<span class="replica">COPYCAT?</span>' : ''}</span>
+            <span class="si-reason">${esc(reason)}</span>
+          </span>
+        </div>`;
+    })
+    .join('');
+
+  list.querySelectorAll<HTMLElement>('.scan-item').forEach((el) => {
+    el.addEventListener('click', () => {
+      const addr = el.getAttribute('data-addr');
+      if (addr) void analyze(addr, true);
+    });
   });
 }
 
@@ -342,6 +547,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
 
 function backToHome(): void {
   currentAddress = null;
+  view = 'home';
   renderHome();
 }
 
@@ -381,21 +587,25 @@ function esc(s: string): string {
 }
 
 function tick(): void {
+  if (collapsed) return;
   if (location.href !== lastHref) {
     lastHref = location.href;
-    currentAddress = null; // new route → re-detect fresh
+    currentAddress = null;
+    view = 'none'; // new route → re-detect fresh (token page vs list page)
+    pageScan.clear(); // coins differ per page
+    symbolHints.clear();
     detect();
-  } else if (currentAddress === null && !collapsed) {
-    // SPA may still be rendering the token header — retry the DOM fallback.
+  } else {
+    // Same route: retry detection so we catch a late-rendering token header or
+    // newly loaded coins on an infinite-scroll list. detect() is idempotent.
     detect();
   }
 }
 
 // Show the assistant as soon as the page has a <body>, then keep watching the SPA.
 function boot(): void {
-  renderHome();
   detect();
-  setInterval(tick, 1000);
+  setInterval(tick, 1500);
 }
 if (document.body) boot();
 else document.addEventListener('DOMContentLoaded', boot);

@@ -251,7 +251,10 @@ async function fetchJson(url, init) {
 }
 
 // lib/gmgnClient.ts
-async function fetchGmgnRaw(address) {
+async function fetchGmgnRaw(address, lite = false) {
+  if (lite) {
+    return { security: await call("security", address), tokenInfo: null, preview: null, feeDist: null, slippage: null, topBuyers: null };
+  }
   const [security, tokenInfo, preview, feeDist, slippage, topBuyers] = await Promise.all([
     call("security", address),
     call("tokenInfo", address),
@@ -288,7 +291,7 @@ var URL_PATTERNS = [
 ];
 var currentAddress = null;
 var lastHref = "";
-var lastAutoToken = null;
+var view = "none";
 function addressFromUrl() {
   for (const re of URL_PATTERNS) {
     const m = location.pathname.match(re);
@@ -306,41 +309,45 @@ function detect() {
   if (collapsed) return;
   const address = addressFromUrl() ?? addressFromDom();
   if (address) {
-    if (address === lastAutoToken && address === currentAddress) return;
-    lastAutoToken = address;
+    if (view === "token" && address === currentAddress) return;
+    view = "token";
     void analyze(address);
-  } else if (currentAddress === null) {
-    lastAutoToken = null;
-    renderHome();
+    return;
   }
+  if (view !== "home") {
+    view = "home";
+    currentAddress = null;
+    renderHome();
+  } else if (!scanning) {
+    void scanPage();
+  }
+}
+async function requestAnalysis(address, lite = false) {
+  let rawGmgn;
+  if (!MOCK_MODE && location.hostname.endsWith("gmgn.ai")) {
+    try {
+      rawGmgn = await fetchGmgnRaw(address, lite);
+    } catch {
+      rawGmgn = void 0;
+    }
+  }
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "ANALYZE_TOKEN", address, rawGmgn }, (res) => {
+      if (chrome.runtime.lastError || !res) resolve({ ok: false, error: "Risk data unavailable." });
+      else resolve(res);
+    });
+  });
 }
 async function analyze(address, _manual = false) {
   currentAddress = address;
   showLoading(address);
-  let rawGmgn;
-  if (!MOCK_MODE && location.hostname.endsWith("gmgn.ai")) {
-    try {
-      rawGmgn = await fetchGmgnRaw(address);
-    } catch {
-      rawGmgn = void 0;
-    }
-    if (address !== currentAddress) return;
+  const res = await requestAnalysis(address, false);
+  if (address !== currentAddress) return;
+  if (!res.ok) {
+    showError(res.error);
+    return;
   }
-  chrome.runtime.sendMessage(
-    { type: "ANALYZE_TOKEN", address, rawGmgn },
-    (res) => {
-      if (address !== currentAddress) return;
-      if (chrome.runtime.lastError || !res) {
-        showError("Risk data unavailable.");
-        return;
-      }
-      if (!res.ok) {
-        showError(res.error);
-        return;
-      }
-      render(res.analysis, res.risk, res.mock);
-    }
-  );
+  render(res.analysis, res.risk, res.mock);
 }
 var host = null;
 var shadow = null;
@@ -415,6 +422,23 @@ var STYLES = `
     font-size: 22px; cursor: pointer; border: 1px solid #3a5bd0;
   }
   .fab:hover { filter: brightness(1.1); }
+  /* page scan list */
+  .scan-section { margin-top: 12px; border-top: 1px solid #2c303a; padding-top: 10px; }
+  .scan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .scan-head .t { font-weight: 700; font-size: 11.5px; letter-spacing: .04em; flex: 1; color: #cfd3dc; }
+  .scan-head .rescan { color: #7aa2ff; font-size: 11px; }
+  .scan-status { color: #8a91a0; font-size: 11px; margin-bottom: 6px; }
+  .scanlist { max-height: 260px; overflow-y: auto; margin: 0 -4px; }
+  .scan-item {
+    display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: 8px; cursor: pointer;
+  }
+  .scan-item:hover { background: #1c1f26; }
+  .mini-badge { font-weight: 800; font-size: 10px; letter-spacing: .03em; padding: 2px 6px; border-radius: 6px; min-width: 58px; text-align: center; }
+  .si-main { flex: 1; min-width: 0; }
+  .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .scan-empty { color: #8a91a0; font-size: 11.5px; font-style: italic; padding: 4px; }
 `;
 function ensureHost() {
   if (host && shadow && document.body.contains(host)) return shadow;
@@ -439,8 +463,13 @@ function renderCollapsed() {
   w.innerHTML = `<div class="fab" title="Open CRYPTO-KING risk scanner">\u{1F451}</div>`;
   w.querySelector(".fab")?.addEventListener("click", () => {
     collapsed = false;
-    if (currentAddress) void analyze(currentAddress);
-    else renderHome();
+    if (currentAddress) {
+      view = "token";
+      void analyze(currentAddress);
+    } else {
+      view = "home";
+      renderHome();
+    }
   });
 }
 function cardBody() {
@@ -470,7 +499,15 @@ function renderHome() {
       <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
       <button class="scan-btn">Scan</button>
     </div>
-    ${onThisPage ? `<div class="home-note">Detected on this page: <a href="#" class="detected">${esc(short(onThisPage))}</a></div>` : `<div class="home-note">Tip: open any coin on gmgn.ai and it scans automatically.</div>`}
+    ${onThisPage ? `<div class="home-note">On this page: <a href="#" class="detected">${esc(short(onThisPage))}</a> \u2014 auto-scanning.</div>` : ""}
+    <div class="scan-section">
+      <div class="scan-head">
+        <span class="t">Coins on this page</span>
+        <button class="rescan">\u21BB Rescan</button>
+      </div>
+      <div class="scan-status"></div>
+      <div class="scanlist"></div>
+    </div>
     <div class="disclaimer">${esc(DISCLAIMER)}</div>`;
   const input = body.querySelector(".scan-input");
   const go = () => {
@@ -493,6 +530,137 @@ function renderHome() {
   body.querySelector(".detected")?.addEventListener("click", (e) => {
     e.preventDefault();
     if (onThisPage) void analyze(onThisPage, true);
+  });
+  body.querySelector(".rescan")?.addEventListener("click", () => {
+    pageScan.clear();
+    void scanPage();
+  });
+  updateScanList();
+  void scanPage();
+}
+var MAX_SCAN = 40;
+var pageScan = /* @__PURE__ */ new Map();
+var symbolHints = /* @__PURE__ */ new Map();
+var scanning = false;
+function collectMints() {
+  const set = /* @__PURE__ */ new Set();
+  const res = [
+    new RegExp(`/sol/token/(${BASE58})`),
+    new RegExp(`/coin/(${BASE58})`),
+    new RegExp(`solscan\\.io/token/(${BASE58})`)
+  ];
+  document.querySelectorAll("a[href]").forEach((a) => {
+    const href = a.getAttribute("href") ?? "";
+    for (const re of res) {
+      const m = href.match(re);
+      if (m) {
+        set.add(m[1]);
+        const hint = symbolFromText(a.textContent ?? "");
+        if (hint && !symbolHints.has(m[1])) symbolHints.set(m[1], hint);
+        break;
+      }
+    }
+  });
+  return [...set].slice(0, MAX_SCAN);
+}
+function symbolFromText(t) {
+  const m = t.trim().match(/\$?([A-Za-z][A-Za-z0-9]{0,14})/);
+  return m ? m[1].toUpperCase() : null;
+}
+async function scanPage() {
+  if (scanning || collapsed) return;
+  const queue = collectMints().filter((m) => !pageScan.has(m));
+  if (queue.length === 0) {
+    updateScanList();
+    return;
+  }
+  scanning = true;
+  setScanStatus(`Scanning ${queue.length} coin${queue.length > 1 ? "s" : ""}\u2026`);
+  let i = 0;
+  const worker = async () => {
+    while (i < queue.length) {
+      const mint = queue[i++];
+      const res = await requestAnalysis(
+        mint,
+        /*lite*/
+        true
+      );
+      const hint = symbolHints.get(mint) ?? null;
+      pageScan.set(
+        mint,
+        res.ok ? {
+          address: mint,
+          symbol: res.analysis.identity.symbol ?? hint,
+          name: res.analysis.identity.name,
+          score: res.risk.riskScore,
+          signal: res.risk.signal,
+          topReason: res.risk.reasons[0]?.text ?? null,
+          insufficient: res.risk.insufficientData
+        } : { address: mint, symbol: hint, name: null, score: 0, signal: "NEUTRAL", topReason: null, insufficient: true }
+      );
+      updateScanList();
+    }
+  };
+  await Promise.all([worker(), worker()]);
+  scanning = false;
+  updateScanList();
+}
+function replicaSymbols() {
+  const counts = /* @__PURE__ */ new Map();
+  for (const r of pageScan.values()) {
+    if (!r.symbol) continue;
+    const k = r.symbol.trim().toUpperCase();
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
+}
+function setScanStatus(text) {
+  const el = shadow?.querySelector(".scan-status");
+  if (el) el.textContent = text;
+}
+function updateScanList() {
+  const list = shadow?.querySelector(".scanlist");
+  if (!list) return;
+  const replicas = replicaSymbols();
+  const rows = [...pageScan.values()].sort((a, b) => {
+    if (a.insufficient !== b.insufficient) return a.insufficient ? 1 : -1;
+    return b.score - a.score;
+  });
+  const replicaCount = rows.filter((r) => r.symbol && replicas.has(r.symbol.trim().toUpperCase())).length;
+  const avoid = rows.filter((r) => !r.insufficient && (r.signal === "AVOID" || r.signal === "HIGH_RISK")).length;
+  if (!scanning) {
+    const parts = [];
+    parts.push(rows.length ? `${rows.length} scanned` : "");
+    if (avoid) parts.push(`\u26A0 ${avoid} high-risk`);
+    if (replicaCount) parts.push(`\u{1F465} ${replicaCount} possible copycat${replicaCount > 1 ? "s" : ""}`);
+    setScanStatus(parts.filter(Boolean).join(" \xB7 ") || "No linked coins found on this page.");
+  }
+  if (rows.length === 0) {
+    list.innerHTML = `<div class="scan-empty">No token links detected here yet. Use the scan box above, or open a coin.</div>`;
+    return;
+  }
+  list.innerHTML = rows.map((r) => {
+    const meta = SIGNAL_META[r.signal];
+    const isReplica = r.symbol && replicas.has(r.symbol.trim().toUpperCase());
+    const label = r.insufficient ? "NO DATA" : `${r.score} ${meta.label}`;
+    const bg = r.insufficient ? "#3a3f4c" : meta.color;
+    const fg = r.insufficient ? "#e6e8ee" : meta.textColor;
+    const sym = r.symbol ?? short(r.address);
+    const reason = r.insufficient ? "Not enough data to assess" : isReplica ? "Shares a symbol with another coin here \u2014 possible copycat/rug" : r.topReason ?? "Lower observed risk \u2014 not a buy signal";
+    return `
+        <div class="scan-item" data-addr="${esc(r.address)}">
+          <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
+          <span class="si-main">
+            <span class="si-sym">${esc(sym)}${isReplica ? '<span class="replica">COPYCAT?</span>' : ""}</span>
+            <span class="si-reason">${esc(reason)}</span>
+          </span>
+        </div>`;
+  }).join("");
+  list.querySelectorAll(".scan-item").forEach((el) => {
+    el.addEventListener("click", () => {
+      const addr = el.getAttribute("data-addr");
+      if (addr) void analyze(addr, true);
+    });
   });
 }
 function extractAddress(raw) {
@@ -558,6 +726,7 @@ function render(analysis, risk, mock) {
 }
 function backToHome() {
   currentAddress = null;
+  view = "home";
   renderHome();
 }
 function fillPanel(panel, analysis, risk) {
@@ -582,18 +751,21 @@ function esc(s) {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 function tick() {
+  if (collapsed) return;
   if (location.href !== lastHref) {
     lastHref = location.href;
     currentAddress = null;
+    view = "none";
+    pageScan.clear();
+    symbolHints.clear();
     detect();
-  } else if (currentAddress === null && !collapsed) {
+  } else {
     detect();
   }
 }
 function boot() {
-  renderHome();
   detect();
-  setInterval(tick, 1e3);
+  setInterval(tick, 1500);
 }
 if (document.body) boot();
 else document.addEventListener("DOMContentLoaded", boot);

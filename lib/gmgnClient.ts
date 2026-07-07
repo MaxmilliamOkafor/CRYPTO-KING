@@ -66,9 +66,19 @@ export interface GmgnRaw {
   topBuyers: unknown | null;
 }
 
-/** Fetch all six GMGN endpoints. Works same-origin (content script) or cross-origin
- *  with credentials (background/popup). Each entry degrades to null on failure. */
-export async function fetchGmgnRaw(address: string): Promise<GmgnRaw> {
+/**
+ * Fetch GMGN endpoints. Works same-origin (content script) or cross-origin with
+ * credentials (background/popup). Each entry degrades to null on failure.
+ *
+ * `lite` = only the security endpoint (1 call instead of 6) — used when scanning
+ * many coins at once on a list page. The security object alone yields mint/freeze
+ * renounce status, honeypot flag, top-10 concentration, taxes and burn status,
+ * which is enough for a meaningful risk badge; the rest become honest data gaps.
+ */
+export async function fetchGmgnRaw(address: string, lite = false): Promise<GmgnRaw> {
+  if (lite) {
+    return { security: await call('security', address), tokenInfo: null, preview: null, feeDist: null, slippage: null, topBuyers: null };
+  }
   const [security, tokenInfo, preview, feeDist, slippage, topBuyers] = await Promise.all([
     call('security', address),
     call('tokenInfo', address),

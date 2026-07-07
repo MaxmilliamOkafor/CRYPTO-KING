@@ -17,7 +17,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://gmgn.ai/*", "https://pump.fun/*", "https://www.pump.fun/*"],
+      "matches": [
+        "https://gmgn.ai/*",
+        "https://pump.fun/*",
+        "https://www.pump.fun/*",
+        "https://dextools.io/*",
+        "https://www.dextools.io/*"
+      ],
       "js": ["content/content.js"],
       "run_at": "document_idle"
     }

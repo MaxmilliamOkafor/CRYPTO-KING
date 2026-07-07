@@ -17,9 +17,14 @@ The repo ships with a pre-built **`dist/`** folder running in **live mode** — 
 1. Open `chrome://extensions`
 2. Enable **Developer mode** (top right)
 3. Click **Load unpacked** → select the **`dist/`** folder — ⚠️ **NOT the repo root**. The root contains the TypeScript sources; Chrome can only run the bundled JavaScript in `dist/`. (Loading the root gives *"Could not load javascript 'content/content.js'"*.)
-4. Browse any token page on `gmgn.ai` (e.g. `https://gmgn.ai/sol/token/<ADDRESS>`) — the risk card appears top-right on the page itself with a badge, score, top risk reason and a **Details** panel. Click the toolbar icon for the full breakdown; the dashboard (history + P&L journal) fills up as you browse.
+4. Go to **gmgn.ai**, **pump.fun**, or **dextools.io**. A small **👑 crown button** sits in the bottom-right of the page — click it to open the CRYPTO-KING panel. It's a live, on-page assistant (not a separate tab):
+   - **On a token page** (e.g. `gmgn.ai/sol/token/<ADDRESS>`) it auto-scans and shows the badge, score, top risk reason and a **Details** breakdown.
+   - **On trending / new-pairs / any list page** it shows a **"Scan a token" box** — paste any Solana mint address (or a gmgn/pump/solscan link) and hit **Scan** for a live risk read, right there on the page. No tab switching.
+   - The **–** button collapses it back to the crown; click the crown to reopen.
 
-Any check that can't be answered live shows up under "Not checked (data unavailable)" rather than being guessed — e.g. metadata mutability stays unknown until you add a free Helius RPC key (see below). To demo with fixtures instead, set `MOCK_MODE = true` in `config.ts` and rebuild.
+The toolbar icon and the dashboard (history + manual P&L journal) are optional extras — the main experience is the on-page panel. Any check that can't be answered live shows under "Not checked (data unavailable)" rather than being guessed (e.g. metadata mutability needs a free Helius RPC key — see below). To demo with fixtures instead, set `MOCK_MODE = true` in `config.ts` and rebuild.
+
+> **Note on coverage:** on **gmgn.ai** you get the full picture (GMGN's own security data + on-chain RPC + pump.fun). On **pump.fun** and **dextools.io**, GMGN's Cloudflare-protected API only answers requests from gmgn.ai itself, so those pages fall back to the **authoritative on-chain checks via Solana RPC** (mint authority, freeze authority, Token-2022 fees, holder concentration) plus pump.fun data — the core Solana rug surface — and mark GMGN-only fields as unavailable.
 
 If you edit any source file (including `config.ts`), rebuild `dist/` and hit ↻ reload on the extension card:
 

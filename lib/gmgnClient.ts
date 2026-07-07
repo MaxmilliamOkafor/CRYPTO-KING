@@ -51,9 +51,24 @@ export interface GmgnData {
   behavior: BehaviorInfo | null;
 }
 
-export async function fetchGmgnData(address: string): Promise<GmgnData> {
-  if (MOCK_MODE) return mockGmgnData(address);
+/**
+ * The six raw GMGN envelope `data` objects, unwrapped but unparsed. This is
+ * the payload the content script fetches SAME-ORIGIN (carrying the page's
+ * Cloudflare/session cookies) and forwards to the background worker, which
+ * then calls parseGmgn(). Any endpoint that failed is null.
+ */
+export interface GmgnRaw {
+  security: unknown | null;
+  tokenInfo: unknown | null;
+  preview: unknown | null;
+  feeDist: unknown | null;
+  slippage: unknown | null;
+  topBuyers: unknown | null;
+}
 
+/** Fetch all six GMGN endpoints. Works same-origin (content script) or cross-origin
+ *  with credentials (background/popup). Each entry degrades to null on failure. */
+export async function fetchGmgnRaw(address: string): Promise<GmgnRaw> {
   const [security, tokenInfo, preview, feeDist, slippage, topBuyers] = await Promise.all([
     call('security', address),
     call('tokenInfo', address),
@@ -62,7 +77,17 @@ export async function fetchGmgnData(address: string): Promise<GmgnData> {
     call('recommendSlippage', address),
     call('topBuyers', address),
   ]);
+  return { security, tokenInfo, preview, feeDist, slippage, topBuyers };
+}
 
+export async function fetchGmgnData(address: string): Promise<GmgnData> {
+  if (MOCK_MODE) return mockGmgnData(address);
+  return parseGmgn(await fetchGmgnRaw(address));
+}
+
+/** Pure parse of raw GMGN data into the scorer's GmgnData slice. No I/O. */
+export function parseGmgn(raw: GmgnRaw): GmgnData {
+  const { security, tokenInfo, preview, feeDist, slippage, topBuyers } = raw;
   const out: GmgnData = { ...EMPTY };
 
   /* ── security: the core Solana risk object ── */
@@ -155,7 +180,12 @@ async function call(name: keyof typeof GMGN.endpoints, address: string): Promise
   if (!path) return null;
   const qs = new URLSearchParams(GMGN.commonParams).toString();
   const url = `${GMGN.baseUrl}${path.replace('{address}', address)}${qs ? `?${qs}` : ''}`;
-  const json = await fetchJson(url, { headers: GMGN.headers });
+  // credentials:'include' → carries gmgn.ai session/anti-bot cookies (essential
+  // same-origin from the content script; also used by the background fallback).
+  const json = await fetchJson(url, {
+    headers: { accept: 'application/json', ...GMGN.headers },
+    credentials: 'include',
+  });
   if (json === null || typeof json !== 'object') return null;
   const env = json as { code?: unknown; data?: unknown };
   if (env.code !== undefined && env.code !== 0 && env.code !== '0') return null; // GMGN error envelope

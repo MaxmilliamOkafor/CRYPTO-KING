@@ -16,7 +16,7 @@
 
 import { CACHE_TTL_MS, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter } from '../lib/deployerClient.ts';
-import { fetchGmgnData, type GmgnData } from '../lib/gmgnClient.ts';
+import { fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
@@ -54,7 +54,7 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
 async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse> {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
-      return analyzeToken(msg.address, msg.force === true);
+      return analyzeToken(msg.address, msg.force === true, msg.rawGmgn);
     case 'GET_RECENT': {
       const recent = await loadRecent();
       return { ok: true, recent };
@@ -67,7 +67,7 @@ async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse>
   }
 }
 
-async function analyzeToken(address: string, force: boolean): Promise<AnalyzeResponse> {
+async function analyzeToken(address: string, force: boolean, rawGmgn?: unknown): Promise<AnalyzeResponse> {
   if (!BASE58_RE.test(address)) {
     return { ok: false, error: 'Not a valid Solana address.' };
   }
@@ -80,16 +80,21 @@ async function analyzeToken(address: string, force: boolean): Promise<AnalyzeRes
   const pending = inFlight.get(address);
   if (pending) return pending;
 
-  const job = doAnalyze(address).finally(() => inFlight.delete(address));
+  const job = doAnalyze(address, rawGmgn).finally(() => inFlight.delete(address));
   inFlight.set(address, job);
   return job;
 }
 
-async function doAnalyze(address: string): Promise<AnalyzeResponse> {
+async function doAnalyze(address: string, rawGmgn?: unknown): Promise<AnalyzeResponse> {
   try {
+    // GMGN: prefer the raw payload the content script fetched same-origin (cookies
+    // apply, dodges Cloudflare); otherwise fetch it here (mock mode, or the popup
+    // which isn't running on gmgn.ai).
+    const gmgnPromise =
+      !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn as GmgnRaw)) : fetchGmgnData(address);
     // All adapters degrade to honest "unavailable" internally; Promise.all is safe.
     const [gmgn, solana, pumpfun, audit] = await Promise.all([
-      fetchGmgnData(address),
+      gmgnPromise,
       fetchSolanaData(address),
       fetchPumpfunData(address),
       rugcheckAdapter.fetchAudit(address),

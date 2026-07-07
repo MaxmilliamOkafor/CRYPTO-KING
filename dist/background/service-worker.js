@@ -427,8 +427,7 @@ function asString(v) {
 }
 
 // lib/gmgnClient.ts
-async function fetchGmgnData(address) {
-  if (MOCK_MODE) return mockGmgnData(address);
+async function fetchGmgnRaw(address) {
   const [security, tokenInfo, preview, feeDist, slippage, topBuyers] = await Promise.all([
     call("security", address),
     call("tokenInfo", address),
@@ -437,6 +436,14 @@ async function fetchGmgnData(address) {
     call("recommendSlippage", address),
     call("topBuyers", address)
   ]);
+  return { security, tokenInfo, preview, feeDist, slippage, topBuyers };
+}
+async function fetchGmgnData(address) {
+  if (MOCK_MODE) return mockGmgnData(address);
+  return parseGmgn(await fetchGmgnRaw(address));
+}
+function parseGmgn(raw) {
+  const { security, tokenInfo, preview, feeDist, slippage, topBuyers } = raw;
   const out = { ...EMPTY };
   if (security !== null) {
     out.mintRenounced = asBool(pick(security, ["renounced_mint", "security.renounced_mint"]));
@@ -508,7 +515,10 @@ async function call(name, address) {
   if (!path) return null;
   const qs = new URLSearchParams(GMGN.commonParams).toString();
   const url = `${GMGN.baseUrl}${path.replace("{address}", address)}${qs ? `?${qs}` : ""}`;
-  const json = await fetchJson(url, { headers: GMGN.headers });
+  const json = await fetchJson(url, {
+    headers: { accept: "application/json", ...GMGN.headers },
+    credentials: "include"
+  });
   if (json === null || typeof json !== "object") return null;
   const env = json;
   if (env.code !== void 0 && env.code !== 0 && env.code !== "0") return null;
@@ -968,7 +978,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function handle(msg) {
   switch (msg.type) {
     case "ANALYZE_TOKEN":
-      return analyzeToken(msg.address, msg.force === true);
+      return analyzeToken(msg.address, msg.force === true, msg.rawGmgn);
     case "GET_RECENT": {
       const recent = await loadRecent();
       return { ok: true, recent };
@@ -980,7 +990,7 @@ async function handle(msg) {
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
 }
-async function analyzeToken(address, force) {
+async function analyzeToken(address, force, rawGmgn) {
   if (!BASE58_RE.test(address)) {
     return { ok: false, error: "Not a valid Solana address." };
   }
@@ -990,14 +1000,15 @@ async function analyzeToken(address, force) {
   }
   const pending = inFlight.get(address);
   if (pending) return pending;
-  const job = doAnalyze(address).finally(() => inFlight.delete(address));
+  const job = doAnalyze(address, rawGmgn).finally(() => inFlight.delete(address));
   inFlight.set(address, job);
   return job;
 }
-async function doAnalyze(address) {
+async function doAnalyze(address, rawGmgn) {
   try {
+    const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : fetchGmgnData(address);
     const [gmgn, solana, pumpfun, audit] = await Promise.all([
-      fetchGmgnData(address),
+      gmgnPromise,
       fetchSolanaData(address),
       fetchPumpfunData(address),
       rugcheckAdapter.fetchAudit(address)

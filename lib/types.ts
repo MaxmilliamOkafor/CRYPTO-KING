@@ -192,7 +192,18 @@ export interface JournalEntry {
 
 /** Messages between content script / popup / dashboard and the background worker. */
 export type BgRequest =
-  | { type: 'ANALYZE_TOKEN'; address: string; force?: boolean }
+  | {
+      type: 'ANALYZE_TOKEN';
+      address: string;
+      force?: boolean;
+      /**
+       * Optional raw GMGN endpoint payloads fetched SAME-ORIGIN by the content
+       * script (so gmgn.ai's session/anti-bot cookies apply). When present the
+       * background parses these instead of fetching GMGN itself. Shape matches
+       * lib/gmgnClient.ts GmgnRaw; typed as unknown here to keep types.ts I/O-free.
+       */
+      rawGmgn?: unknown;
+    }
   | { type: 'GET_RECENT' }
   | { type: 'CLEAR_RECENT' };
 

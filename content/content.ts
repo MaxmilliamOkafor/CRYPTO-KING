@@ -3,8 +3,13 @@
  * (and pump.fun coin pages).
  *
  * Ground rules honored here:
- *  - NO network calls from the content script — everything goes through the
- *    background worker via chrome.runtime.sendMessage.
+ *  - All SCORING and non-GMGN network calls happen in the background worker.
+ *    The one deliberate exception: on gmgn.ai we fetch GMGN's own same-origin
+ *    endpoints from the page, because they sit behind Cloudflare and only
+ *    respond to requests carrying the page's session cookies — a background
+ *    fetch gets challenged. We fetch the raw JSON here and forward it to the
+ *    background, which does all parsing, merging and scoring. No keys, no
+ *    writes, no wallet access — strictly reads of data GMGN already served us.
  *  - The overlay lives inside a closed shadow root on a fixed-position host
  *    element appended to <body>, so host-page CSS can't leak in and we can't
  *    break GMGN's layout.
@@ -16,7 +21,8 @@
  * then DOM fallback (Solscan links near the token header).
  */
 
-import { DISCLAIMER, SIGNAL_META } from '../config.ts';
+import { DISCLAIMER, MOCK_MODE, SIGNAL_META } from '../config.ts';
+import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
 import type { AnalyzeResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
@@ -56,8 +62,26 @@ function detect(): void {
     return;
   }
   showLoading(address);
+  void analyze(address);
+}
+
+async function analyze(address: string): Promise<void> {
+  // On gmgn.ai (live mode), grab GMGN's same-origin JSON with the page's
+  // cookies and hand it to the background. Failures degrade to null → the
+  // background falls back to its own fetch, and unfetchable checks become
+  // honest "data unavailable" — never a faked score.
+  let rawGmgn: GmgnRaw | undefined;
+  if (!MOCK_MODE && location.hostname.endsWith('gmgn.ai')) {
+    try {
+      rawGmgn = await fetchGmgnRaw(address);
+    } catch {
+      rawGmgn = undefined;
+    }
+    if (address !== currentAddress) return; // navigated away while fetching
+  }
+
   chrome.runtime.sendMessage(
-    { type: 'ANALYZE_TOKEN', address },
+    { type: 'ANALYZE_TOKEN', address, rawGmgn },
     (res: AnalyzeResponse | undefined) => {
       if (chrome.runtime.lastError || !res) {
         showError('Risk data unavailable.');

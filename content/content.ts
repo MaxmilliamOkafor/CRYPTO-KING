@@ -21,9 +21,9 @@
  * then DOM fallback (Solscan links near the token header).
  */
 
-import { DISCLAIMER, MOCK_MODE, SIGNAL_META } from '../config.ts';
+import { DISCLAIMER, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
-import type { AnalyzeResponse, RiskResult, Signal, TokenAnalysis } from '../lib/types.ts';
+import type { AnalyzeResponse, FeedRow, LiveFeedResponse, RiskResult, Signal, TokenAnalysis } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -102,6 +102,7 @@ async function requestAnalysis(address: string, lite = false): Promise<AnalyzeRe
 
 /** Scan a single token and show its full card. */
 async function analyze(address: string, _manual = false): Promise<void> {
+  stopLiveFeed(); // we're leaving the home/live view
   currentAddress = address;
   showLoading(address);
   const res = await requestAnalysis(address, false);
@@ -206,6 +207,15 @@ const STYLES = `
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
   .scan-empty { color: #8a91a0; font-size: 11.5px; font-style: italic; padding: 4px; }
+  /* live feed */
+  .live-section { margin-bottom: 4px; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 0 0 rgba(255,77,77,.6); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,77,77,.6); } 70% { box-shadow: 0 0 0 6px rgba(255,77,77,0); } 100% { box-shadow: 0 0 0 0 rgba(255,77,77,0); } }
+  .live-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
+  .livelist { max-height: 300px; overflow-y: auto; margin: 0 -4px; }
+  .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
+  .safe-toggle input { accent-color: #2f6df6; }
+  .age { color: #6b7280; font-size: 10px; font-weight: 500; }
 `;
 
 function ensureHost(): ShadowRoot {
@@ -232,6 +242,7 @@ function wrapEl(): HTMLDivElement {
 function renderCollapsed(): void {
   const w = wrapEl();
   w.innerHTML = `<div class="fab" title="Open CRYPTO-KING risk scanner">👑</div>`;
+  stopLiveFeed(); // no polling while minimized
   w.querySelector('.fab')?.addEventListener('click', () => {
     collapsed = false;
     // Re-show whatever we last had: a scanned token, or the home scan box.
@@ -264,25 +275,38 @@ function cardBody(): HTMLDivElement {
   return w.querySelector('.body') as HTMLDivElement;
 }
 
-/** Home view: the always-available "scan any token" box. */
+/** Home view: the live auto-scanning feed + manual scan box + page-link scan. */
 function renderHome(): void {
   if (collapsed) return renderCollapsed();
   const body = cardBody();
   const onThisPage = addressFromUrl() ?? addressFromDom();
   body.innerHTML = `
-    <div class="home-hint">Paste a Solana token address (or a gmgn/pump/solscan link) to scan its risk — live, right here.</div>
-    <div class="scan-row">
-      <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
-      <button class="scan-btn">Scan</button>
+    <div class="live-section">
+      <div class="scan-head">
+        <span class="live-dot"></span>
+        <span class="t">Live new launches — auto-scanning</span>
+        <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
+      </div>
+      <div class="live-status">Starting live scan…</div>
+      <div class="livelist"></div>
     </div>
-    ${
-      onThisPage
-        ? `<div class="home-note">On this page: <a href="#" class="detected">${esc(short(onThisPage))}</a> — auto-scanning.</div>`
-        : ''
-    }
+
+    <div class="scan-section">
+      <div class="scan-head"><span class="t">Scan a specific coin</span></div>
+      <div class="scan-row">
+        <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
+        <button class="scan-btn">Scan</button>
+      </div>
+      ${
+        onThisPage
+          ? `<div class="home-note">On this page: <a href="#" class="detected">${esc(short(onThisPage))}</a></div>`
+          : ''
+      }
+    </div>
+
     <div class="scan-section">
       <div class="scan-head">
-        <span class="t">Coins on this page</span>
+        <span class="t">Coins linked on this page</span>
         <button class="rescan">↻ Rescan</button>
       </div>
       <div class="scan-status"></div>
@@ -312,6 +336,17 @@ function renderHome(): void {
     pageScan.clear();
     void scanPage();
   });
+  const safeToggle = body.querySelector<HTMLInputElement>('.safe-only');
+  if (safeToggle) {
+    safeToggle.checked = liveSafeOnly;
+    safeToggle.addEventListener('change', () => {
+      liveSafeOnly = safeToggle.checked;
+      updateLiveList();
+    });
+  }
+
+  updateLiveList();
+  startLiveFeed();
 
   updateScanList();
   void scanPage(); // auto-scan the coins visible on this page
@@ -474,6 +509,106 @@ function updateScanList(): void {
       if (addr) void analyze(addr, true);
     });
   });
+}
+
+/* ── Live feed: real-time auto-scan of the newest launches ─────────────── */
+
+let liveRows: FeedRow[] = [];
+let liveTimer: ReturnType<typeof setInterval> | null = null;
+let livePolling = false;
+let liveSafeOnly = false;
+
+function startLiveFeed(): void {
+  if (liveTimer) return; // already running
+  void pollLiveFeed();
+  liveTimer = setInterval(() => void pollLiveFeed(), LIVE_FEED.pollIntervalMs);
+}
+
+function stopLiveFeed(): void {
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
+}
+
+async function pollLiveFeed(): Promise<void> {
+  if (livePolling || collapsed || view !== 'home') return;
+  livePolling = true;
+  try {
+    const res = await new Promise<LiveFeedResponse | undefined>((resolve) => {
+      chrome.runtime.sendMessage({ type: 'GET_LIVE_FEED' }, (r: LiveFeedResponse | undefined) => resolve(r));
+    });
+    if (view !== 'home') return;
+    if (!res || !res.ok) {
+      setLiveStatus(res?.ok === false ? res.error : 'Live feed unavailable.');
+      return;
+    }
+    liveRows = res.feed;
+    updateLiveList();
+    const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === 'AVOID' || r.signal === 'HIGH_RISK')).length;
+    const lower = liveRows.filter((r) => !r.insufficientData && (r.signal === 'CONSIDER' || r.signal === 'NEUTRAL')).length;
+    setLiveStatus(
+      `🔴 live · ${liveRows.length} fresh coins · ⚠ ${worst} high-risk · ${lower} lower-risk` +
+        (res.source === 'mock' ? ' · MOCK' : ''),
+    );
+  } finally {
+    livePolling = false;
+  }
+}
+
+function setLiveStatus(text: string): void {
+  const el = shadow?.querySelector('.live-status');
+  if (el) el.textContent = text;
+}
+
+function updateLiveList(): void {
+  const list = shadow?.querySelector<HTMLDivElement>('.livelist');
+  if (!list) return;
+
+  let rows = [...liveRows];
+  if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== 'AVOID' && r.signal !== 'HIGH_RISK');
+
+  if (rows.length === 0) {
+    list.innerHTML = `<div class="scan-empty">${
+      liveSafeOnly ? 'No lower-risk fresh launches right now.' : 'Waiting for the first live results…'
+    }</div>`;
+    return;
+  }
+
+  list.innerHTML = rows
+    .map((r) => {
+      const meta = SIGNAL_META[r.signal];
+      const label = r.insufficientData ? 'NO DATA' : `${r.riskScore} ${meta.label}`;
+      const bg = r.insufficientData ? '#3a3f4c' : meta.color;
+      const fg = r.insufficientData ? '#e6e8ee' : meta.textColor;
+      const sym = r.symbol ?? short(r.address);
+      const reason = r.insufficientData
+        ? 'Not enough data yet'
+        : (r.topReason ?? 'Lower observed risk — not a buy signal');
+      return `
+        <div class="scan-item" data-addr="${esc(r.address)}">
+          <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
+          <span class="si-main">
+            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span></span>
+            <span class="si-reason">${esc(reason)}</span>
+          </span>
+        </div>`;
+    })
+    .join('');
+
+  list.querySelectorAll<HTMLElement>('.scan-item').forEach((el) => {
+    el.addEventListener('click', () => {
+      const addr = el.getAttribute('data-addr');
+      if (addr) void analyze(addr, true);
+    });
+  });
+}
+
+function ageShort(m: number | null): string {
+  if (m === null) return '';
+  if (m < 60) return `${Math.round(m)}m`;
+  if (m < 1440) return `${(m / 60).toFixed(1)}h`;
+  return `${(m / 1440).toFixed(0)}d`;
 }
 
 /** Pull a base58 mint out of raw input: a bare address, or a gmgn/pump/solscan URL. */

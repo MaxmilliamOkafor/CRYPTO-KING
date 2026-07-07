@@ -40,7 +40,26 @@ var PUMPFUN = {
   enabled: true,
   baseUrl: "https://frontend-api-v3.pump.fun",
   /** Single-coin object: creator, created_timestamp, complete, reserves, market_cap, socials, is_banned, token_program. */
-  coinEndpoint: "/coins/{address}"
+  coinEndpoint: "/coins/{address}",
+  /** Newest-coins list for the Live feed. sort=created_timestamp gives fresh launches first. */
+  listEndpoint: "/coins?offset={offset}&limit={limit}&sort=created_timestamp&order=DESC&includeNsfw=false"
+};
+var LIVE_FEED = {
+  enabled: true,
+  /** How many newest coins to pull from the source each poll. */
+  fetchCount: 50,
+  /**
+   * Max NEW coins to fully risk-scan per poll. Each scan makes several Solana
+   * RPC calls, so keep this modest on the public RPC (raise it once you add a
+   * Helius key — see SOLANA.rpcUrl). Already-scanned coins are served from cache.
+   */
+  scanBudgetPerPoll: 6,
+  /** Panel auto-refresh / poll interval in ms. */
+  pollIntervalMs: 15e3,
+  /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
+  maxAgeMinutes: 180,
+  /** Feed cache size. */
+  maxRows: 60
 };
 var SOLANA = {
   /**
@@ -653,6 +672,25 @@ async function fetchPumpfunData(address) {
     socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null
   };
 }
+var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+async function fetchPumpfunNewCoins(limit, offset = 0) {
+  if (MOCK_MODE || !PUMPFUN.enabled) return [];
+  const path = PUMPFUN.listEndpoint.replace("{offset}", String(offset)).replace("{limit}", String(limit));
+  const json = await fetchJson(`${PUMPFUN.baseUrl}${path}`);
+  const arr = Array.isArray(json) ? json : Array.isArray(json?.coins) ? json.coins : [];
+  const out = [];
+  for (const c of arr) {
+    const mint = asString(pick(c, ["mint", "address", "coin_mint"]));
+    if (!mint || !BASE58_RE.test(mint)) continue;
+    out.push({
+      mint,
+      symbol: asString(pick(c, ["symbol"])),
+      name: asString(pick(c, ["name"])),
+      createdMs: asNumber(pick(c, ["created_timestamp"]))
+    });
+  }
+  return out;
+}
 var usdToEur2 = (v) => v === null ? null : v * EUR_PER_USD;
 function asBoolLoose(v) {
   if (typeof v === "boolean") return v;
@@ -971,7 +1009,7 @@ async function fetchOwners(tokenAccounts) {
 
 // background/service-worker.ts
 var RECENT_KEY = "ck:recent";
-var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var cache = /* @__PURE__ */ new Map();
 var inFlight = /* @__PURE__ */ new Map();
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -989,12 +1027,59 @@ async function handle(msg) {
     case "CLEAR_RECENT":
       await chrome.storage.local.set({ [RECENT_KEY]: [] });
       return { ok: true, recent: [] };
+    case "GET_LIVE_FEED":
+      return getLiveFeed();
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
 }
+var feed = /* @__PURE__ */ new Map();
+async function getLiveFeed() {
+  if (!LIVE_FEED.enabled) return { ok: false, error: "Live feed disabled in config." };
+  const coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
+  if (coins.length === 0 && feed.size === 0) {
+    return {
+      ok: false,
+      error: MOCK_MODE ? "Live feed needs live mode (MOCK_MODE=false)." : "Live launch source unavailable right now."
+    };
+  }
+  const cutoff = Date.now() - LIVE_FEED.maxAgeMinutes * 6e4;
+  for (const [mint, row] of feed) {
+    if (row.ageMinutes !== null && row.scannedAt < cutoff && row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
+  }
+  let scannedThisPoll = 0;
+  for (const c of coins) {
+    const cached = cache.get(c.mint);
+    const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
+    if (!fresh) {
+      if (scannedThisPoll >= LIVE_FEED.scanBudgetPerPoll) continue;
+      await analyzeToken(c.mint, false);
+      scannedThisPoll++;
+    }
+    const entry = cache.get(c.mint);
+    if (!entry) continue;
+    feed.set(c.mint, {
+      address: c.mint,
+      symbol: entry.analysis.identity.symbol ?? c.symbol,
+      name: entry.analysis.identity.name ?? c.name,
+      ageMinutes: entry.analysis.identity.ageMinutes ?? (c.createdMs ? Math.max(0, (Date.now() - c.createdMs) / 6e4) : null),
+      marketCapEur: entry.analysis.market?.marketCapEur ?? null,
+      riskScore: entry.risk.riskScore,
+      signal: entry.risk.signal,
+      topReason: entry.risk.reasons[0]?.text ?? null,
+      insufficientData: entry.risk.insufficientData,
+      scannedAt: Date.now()
+    });
+  }
+  const rows = [...feed.values()].sort((a, b) => (a.ageMinutes ?? 1e9) - (b.ageMinutes ?? 1e9)).slice(0, LIVE_FEED.maxRows);
+  if (feed.size > LIVE_FEED.maxRows * 2) {
+    const keep = new Set(rows.map((r) => r.address));
+    for (const k of feed.keys()) if (!keep.has(k)) feed.delete(k);
+  }
+  return { ok: true, feed: rows, source: MOCK_MODE ? "mock" : "ok", scannedThisPoll };
+}
 async function analyzeToken(address, force, rawGmgn) {
-  if (!BASE58_RE.test(address)) {
+  if (!BASE58_RE2.test(address)) {
     return { ok: false, error: "Not a valid Solana address." };
   }
   const cached = cache.get(address);

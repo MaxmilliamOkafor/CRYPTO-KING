@@ -205,10 +205,29 @@ export type BgRequest =
       rawGmgn?: unknown;
     }
   | { type: 'GET_RECENT' }
-  | { type: 'CLEAR_RECENT' };
+  | { type: 'CLEAR_RECENT' }
+  | { type: 'GET_LIVE_FEED' };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; mock: boolean }
   | { ok: false; error: string };
 
 export type RecentResponse = { ok: true; recent: RecentToken[] } | { ok: false; error: string };
+
+/** One coin in the real-time Live feed. */
+export interface FeedRow {
+  address: string;
+  symbol: string | null;
+  name: string | null;
+  ageMinutes: number | null;
+  marketCapEur: number | null;
+  riskScore: number;
+  signal: Signal;
+  topReason: string | null;
+  insufficientData: boolean;
+  scannedAt: number;
+}
+
+export type LiveFeedResponse =
+  | { ok: true; feed: FeedRow[]; source: SourceStatus; scannedThisPoll: number }
+  | { ok: false; error: string };

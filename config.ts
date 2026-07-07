@@ -86,6 +86,30 @@ export const PUMPFUN = {
   baseUrl: 'https://frontend-api-v3.pump.fun',
   /** Single-coin object: creator, created_timestamp, complete, reserves, market_cap, socials, is_banned, token_program. */
   coinEndpoint: '/coins/{address}',
+  /** Newest-coins list for the Live feed. sort=created_timestamp gives fresh launches first. */
+  listEndpoint: '/coins?offset={offset}&limit={limit}&sort=created_timestamp&order=DESC&includeNsfw=false',
+};
+
+/**
+ * Live feed (real-time auto-scanner). Polls the newest launches and risk-scores
+ * each so you can spot lower-risk fresh coins fast. Tunables:
+ */
+export const LIVE_FEED = {
+  enabled: true,
+  /** How many newest coins to pull from the source each poll. */
+  fetchCount: 50,
+  /**
+   * Max NEW coins to fully risk-scan per poll. Each scan makes several Solana
+   * RPC calls, so keep this modest on the public RPC (raise it once you add a
+   * Helius key — see SOLANA.rpcUrl). Already-scanned coins are served from cache.
+   */
+  scanBudgetPerPoll: 6,
+  /** Panel auto-refresh / poll interval in ms. */
+  pollIntervalMs: 15_000,
+  /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
+  maxAgeMinutes: 180,
+  /** Feed cache size. */
+  maxRows: 60,
 };
 
 export const SOLANA = {

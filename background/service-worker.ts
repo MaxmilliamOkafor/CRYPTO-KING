@@ -14,16 +14,18 @@
  * Read-only by design: no keys, no wallets, no signing, no trading.
  */
 
-import { CACHE_TTL_MS, MOCK_MODE, RECENT_MAX } from '../config.ts';
+import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
-import { fetchPumpfunData, type PumpfunData } from '../lib/pumpfunClient.ts';
+import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
 import type {
   AnalyzeResponse,
   BgRequest,
+  FeedRow,
+  LiveFeedResponse,
   MarketInfo,
   MintInfo,
   RecentResponse,
@@ -51,7 +53,7 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
   return true; // async sendResponse
 });
 
-async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse> {
+async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse | LiveFeedResponse> {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
       return analyzeToken(msg.address, msg.force === true, msg.rawGmgn);
@@ -62,9 +64,72 @@ async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse>
     case 'CLEAR_RECENT':
       await chrome.storage.local.set({ [RECENT_KEY]: [] });
       return { ok: true, recent: [] };
+    case 'GET_LIVE_FEED':
+      return getLiveFeed();
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };
   }
+}
+
+/* ── Live feed: real-time auto-scan of the newest launches ─────────────── */
+
+const feed = new Map<string, FeedRow>();
+
+async function getLiveFeed(): Promise<LiveFeedResponse> {
+  if (!LIVE_FEED.enabled) return { ok: false, error: 'Live feed disabled in config.' };
+
+  const coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
+  if (coins.length === 0 && feed.size === 0) {
+    return {
+      ok: false,
+      error: MOCK_MODE ? 'Live feed needs live mode (MOCK_MODE=false).' : 'Live launch source unavailable right now.',
+    };
+  }
+
+  // Prune anything too old to still count as a fresh launch.
+  const cutoff = Date.now() - LIVE_FEED.maxAgeMinutes * 60_000;
+  for (const [mint, row] of feed) {
+    if (row.ageMinutes !== null && row.scannedAt < cutoff && row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
+  }
+
+  // Scan newest-first, but only a budget of NOT-yet-scanned coins per poll
+  // (each scan costs several RPC calls). Cached coins refresh for free.
+  let scannedThisPoll = 0;
+  for (const c of coins) {
+    const cached = cache.get(c.mint);
+    const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
+    if (!fresh) {
+      if (scannedThisPoll >= LIVE_FEED.scanBudgetPerPoll) continue;
+      await analyzeToken(c.mint, false); // populates cache
+      scannedThisPoll++;
+    }
+    const entry = cache.get(c.mint);
+    if (!entry) continue;
+    feed.set(c.mint, {
+      address: c.mint,
+      symbol: entry.analysis.identity.symbol ?? c.symbol,
+      name: entry.analysis.identity.name ?? c.name,
+      ageMinutes: entry.analysis.identity.ageMinutes ?? (c.createdMs ? Math.max(0, (Date.now() - c.createdMs) / 60_000) : null),
+      marketCapEur: entry.analysis.market?.marketCapEur ?? null,
+      riskScore: entry.risk.riskScore,
+      signal: entry.risk.signal,
+      topReason: entry.risk.reasons[0]?.text ?? null,
+      insufficientData: entry.risk.insufficientData,
+      scannedAt: Date.now(),
+    });
+  }
+
+  // Newest first, capped.
+  const rows = [...feed.values()]
+    .sort((a, b) => (a.ageMinutes ?? 1e9) - (b.ageMinutes ?? 1e9))
+    .slice(0, LIVE_FEED.maxRows);
+  // Keep the map bounded too.
+  if (feed.size > LIVE_FEED.maxRows * 2) {
+    const keep = new Set(rows.map((r) => r.address));
+    for (const k of feed.keys()) if (!keep.has(k)) feed.delete(k);
+  }
+
+  return { ok: true, feed: rows, source: MOCK_MODE ? 'mock' : 'ok', scannedThisPoll };
 }
 
 async function analyzeToken(address: string, force: boolean, rawGmgn?: unknown): Promise<AnalyzeResponse> {

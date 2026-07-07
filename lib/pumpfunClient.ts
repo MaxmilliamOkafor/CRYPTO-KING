@@ -80,6 +80,36 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
   };
 }
 
+/** A freshly-created coin from the pump.fun list feed (used by the Live scanner). */
+export interface PumpfunListItem {
+  mint: string;
+  symbol: string | null;
+  name: string | null;
+  createdMs: number | null;
+}
+
+const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+/** Newest launches from pump.fun (keyless). Returns [] on failure / mock mode. */
+export async function fetchPumpfunNewCoins(limit: number, offset = 0): Promise<PumpfunListItem[]> {
+  if (MOCK_MODE || !PUMPFUN.enabled) return [];
+  const path = PUMPFUN.listEndpoint.replace('{offset}', String(offset)).replace('{limit}', String(limit));
+  const json = await fetchJson(`${PUMPFUN.baseUrl}${path}`);
+  const arr = Array.isArray(json) ? json : Array.isArray((json as { coins?: unknown })?.coins) ? (json as { coins: unknown[] }).coins : [];
+  const out: PumpfunListItem[] = [];
+  for (const c of arr) {
+    const mint = asString(pick(c, ['mint', 'address', 'coin_mint']));
+    if (!mint || !BASE58_RE.test(mint)) continue;
+    out.push({
+      mint,
+      symbol: asString(pick(c, ['symbol'])),
+      name: asString(pick(c, ['name'])),
+      createdMs: asNumber(pick(c, ['created_timestamp'])),
+    });
+  }
+  return out;
+}
+
 const usdToEur = (v: number | null) => (v === null ? null : v * EUR_PER_USD);
 
 function asBoolLoose(v: unknown): boolean | null {

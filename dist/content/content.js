@@ -35,6 +35,23 @@ var GMGN = {
   /** Extra headers if GMGN requires them (keep empty unless needed). */
   headers: {}
 };
+var LIVE_FEED = {
+  enabled: true,
+  /** How many newest coins to pull from the source each poll. */
+  fetchCount: 50,
+  /**
+   * Max NEW coins to fully risk-scan per poll. Each scan makes several Solana
+   * RPC calls, so keep this modest on the public RPC (raise it once you add a
+   * Helius key — see SOLANA.rpcUrl). Already-scanned coins are served from cache.
+   */
+  scanBudgetPerPoll: 6,
+  /** Panel auto-refresh / poll interval in ms. */
+  pollIntervalMs: 15e3,
+  /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
+  maxAgeMinutes: 180,
+  /** Feed cache size. */
+  maxRows: 60
+};
 var RATE_LIMITS_MS = {
   default: 1100,
   "gmgn.ai": 400
@@ -339,6 +356,7 @@ async function requestAnalysis(address, lite = false) {
   });
 }
 async function analyze(address, _manual = false) {
+  stopLiveFeed();
   currentAddress = address;
   showLoading(address);
   const res = await requestAnalysis(address, false);
@@ -439,6 +457,15 @@ var STYLES = `
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
   .scan-empty { color: #8a91a0; font-size: 11.5px; font-style: italic; padding: 4px; }
+  /* live feed */
+  .live-section { margin-bottom: 4px; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 0 0 rgba(255,77,77,.6); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,77,77,.6); } 70% { box-shadow: 0 0 0 6px rgba(255,77,77,0); } 100% { box-shadow: 0 0 0 0 rgba(255,77,77,0); } }
+  .live-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
+  .livelist { max-height: 300px; overflow-y: auto; margin: 0 -4px; }
+  .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
+  .safe-toggle input { accent-color: #2f6df6; }
+  .age { color: #6b7280; font-size: 10px; font-weight: 500; }
 `;
 function ensureHost() {
   if (host && shadow && document.body.contains(host)) return shadow;
@@ -461,6 +488,7 @@ function wrapEl() {
 function renderCollapsed() {
   const w = wrapEl();
   w.innerHTML = `<div class="fab" title="Open CRYPTO-KING risk scanner">\u{1F451}</div>`;
+  stopLiveFeed();
   w.querySelector(".fab")?.addEventListener("click", () => {
     collapsed = false;
     if (currentAddress) {
@@ -494,15 +522,28 @@ function renderHome() {
   const body = cardBody();
   const onThisPage = addressFromUrl() ?? addressFromDom();
   body.innerHTML = `
-    <div class="home-hint">Paste a Solana token address (or a gmgn/pump/solscan link) to scan its risk \u2014 live, right here.</div>
-    <div class="scan-row">
-      <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
-      <button class="scan-btn">Scan</button>
+    <div class="live-section">
+      <div class="scan-head">
+        <span class="live-dot"></span>
+        <span class="t">Live new launches \u2014 auto-scanning</span>
+        <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
+      </div>
+      <div class="live-status">Starting live scan\u2026</div>
+      <div class="livelist"></div>
     </div>
-    ${onThisPage ? `<div class="home-note">On this page: <a href="#" class="detected">${esc(short(onThisPage))}</a> \u2014 auto-scanning.</div>` : ""}
+
+    <div class="scan-section">
+      <div class="scan-head"><span class="t">Scan a specific coin</span></div>
+      <div class="scan-row">
+        <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
+        <button class="scan-btn">Scan</button>
+      </div>
+      ${onThisPage ? `<div class="home-note">On this page: <a href="#" class="detected">${esc(short(onThisPage))}</a></div>` : ""}
+    </div>
+
     <div class="scan-section">
       <div class="scan-head">
-        <span class="t">Coins on this page</span>
+        <span class="t">Coins linked on this page</span>
         <button class="rescan">\u21BB Rescan</button>
       </div>
       <div class="scan-status"></div>
@@ -535,6 +576,16 @@ function renderHome() {
     pageScan.clear();
     void scanPage();
   });
+  const safeToggle = body.querySelector(".safe-only");
+  if (safeToggle) {
+    safeToggle.checked = liveSafeOnly;
+    safeToggle.addEventListener("change", () => {
+      liveSafeOnly = safeToggle.checked;
+      updateLiveList();
+    });
+  }
+  updateLiveList();
+  startLiveFeed();
   updateScanList();
   void scanPage();
 }
@@ -662,6 +713,86 @@ function updateScanList() {
       if (addr) void analyze(addr, true);
     });
   });
+}
+var liveRows = [];
+var liveTimer = null;
+var livePolling = false;
+var liveSafeOnly = false;
+function startLiveFeed() {
+  if (liveTimer) return;
+  void pollLiveFeed();
+  liveTimer = setInterval(() => void pollLiveFeed(), LIVE_FEED.pollIntervalMs);
+}
+function stopLiveFeed() {
+  if (liveTimer) {
+    clearInterval(liveTimer);
+    liveTimer = null;
+  }
+}
+async function pollLiveFeed() {
+  if (livePolling || collapsed || view !== "home") return;
+  livePolling = true;
+  try {
+    const res = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "GET_LIVE_FEED" }, (r) => resolve(r));
+    });
+    if (view !== "home") return;
+    if (!res || !res.ok) {
+      setLiveStatus(res?.ok === false ? res.error : "Live feed unavailable.");
+      return;
+    }
+    liveRows = res.feed;
+    updateLiveList();
+    const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === "AVOID" || r.signal === "HIGH_RISK")).length;
+    const lower = liveRows.filter((r) => !r.insufficientData && (r.signal === "CONSIDER" || r.signal === "NEUTRAL")).length;
+    setLiveStatus(
+      `\u{1F534} live \xB7 ${liveRows.length} fresh coins \xB7 \u26A0 ${worst} high-risk \xB7 ${lower} lower-risk` + (res.source === "mock" ? " \xB7 MOCK" : "")
+    );
+  } finally {
+    livePolling = false;
+  }
+}
+function setLiveStatus(text) {
+  const el = shadow?.querySelector(".live-status");
+  if (el) el.textContent = text;
+}
+function updateLiveList() {
+  const list = shadow?.querySelector(".livelist");
+  if (!list) return;
+  let rows = [...liveRows];
+  if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK");
+  if (rows.length === 0) {
+    list.innerHTML = `<div class="scan-empty">${liveSafeOnly ? "No lower-risk fresh launches right now." : "Waiting for the first live results\u2026"}</div>`;
+    return;
+  }
+  list.innerHTML = rows.map((r) => {
+    const meta = SIGNAL_META[r.signal];
+    const label = r.insufficientData ? "NO DATA" : `${r.riskScore} ${meta.label}`;
+    const bg = r.insufficientData ? "#3a3f4c" : meta.color;
+    const fg = r.insufficientData ? "#e6e8ee" : meta.textColor;
+    const sym = r.symbol ?? short(r.address);
+    const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? "Lower observed risk \u2014 not a buy signal";
+    return `
+        <div class="scan-item" data-addr="${esc(r.address)}">
+          <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
+          <span class="si-main">
+            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span></span>
+            <span class="si-reason">${esc(reason)}</span>
+          </span>
+        </div>`;
+  }).join("");
+  list.querySelectorAll(".scan-item").forEach((el) => {
+    el.addEventListener("click", () => {
+      const addr = el.getAttribute("data-addr");
+      if (addr) void analyze(addr, true);
+    });
+  });
+}
+function ageShort(m) {
+  if (m === null) return "";
+  if (m < 60) return `${Math.round(m)}m`;
+  if (m < 1440) return `${(m / 60).toFixed(1)}h`;
+  return `${(m / 1440).toFixed(0)}d`;
 }
 function extractAddress(raw) {
   const s = raw.trim();

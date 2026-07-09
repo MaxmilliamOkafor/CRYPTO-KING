@@ -21,9 +21,17 @@
  * then DOM fallback (Solscan links near the token header).
  */
 
-import { DISCLAIMER, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
+import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
-import type { AnalyzeResponse, FeedRow, LiveFeedResponse, RiskResult, Signal, TokenAnalysis } from '../lib/types.ts';
+import type {
+  AnalyzeResponse,
+  FeedRow,
+  LiveFeedResponse,
+  ResolvePairsResponse,
+  RiskResult,
+  Signal,
+  TokenAnalysis,
+} from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -645,6 +653,178 @@ function ageShort(m: number | null): string {
   return `${(m / 1440).toFixed(0)}d`;
 }
 
+/* ── Inline badges: risk chips injected into the site's own rows ────────
+ * The primary browsing experience: every Solana token link on the page gets a
+ * small colored `👑 score SIGNAL` chip appended inside it, scanned automatically
+ * as rows appear (the 1.5s tick sweeps new DOM — covers infinite scroll and
+ * live-updating lists). Clicking a chip opens the full breakdown in the panel.
+ * On dextools.io, links carry PAIR addresses; those are batch-resolved to base
+ * token mints via DexScreener in the background first.
+ */
+
+interface InlineResult {
+  score: number;
+  signal: Signal;
+  topReason: string | null;
+  insufficient: boolean;
+  unverified: boolean;
+}
+
+const inlineResults = new Map<string, InlineResult | 'pending'>();
+const badgeEls = new Map<string, Set<HTMLElement>>(); // mint → live badge elements
+const badgedLinks = new WeakSet<HTMLAnchorElement>();
+const pairCache = new Map<string, string | null>(); // pairAddr → mint (null = resolving/unknown)
+let inlineQueue: string[] = [];
+let inlineWorkers = 0;
+
+const MINT_HREF_RES = [
+  new RegExp(`/sol/token/(${BASE58})`),
+  new RegExp(`/coin/(${BASE58})`),
+  new RegExp(`solscan\\.io/token/(${BASE58})`),
+];
+const PAIR_HREF_RE = new RegExp(`/pair-explorer/(${BASE58})`);
+
+function sweepInlineBadges(): void {
+  if (!INLINE_BADGES.enabled || inlineResults.size >= INLINE_BADGES.maxPerPage) return;
+
+  const pendingPairs: Array<{ a: HTMLAnchorElement; pair: string }> = [];
+
+  document.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((a) => {
+    if (badgedLinks.has(a)) return;
+    const href = a.getAttribute('href') ?? '';
+
+    for (const re of MINT_HREF_RES) {
+      const m = href.match(re);
+      if (m) {
+        badgedLinks.add(a);
+        attachBadge(a, m[1]);
+        queueInlineScan(m[1]);
+        return;
+      }
+    }
+
+    // DEXTools: pair address links, Solana pages only.
+    if (location.hostname.endsWith('dextools.io') && location.pathname.includes('/solana/')) {
+      const pm = href.match(PAIR_HREF_RE);
+      if (pm) {
+        badgedLinks.add(a);
+        const known = pairCache.get(pm[1]);
+        if (known) {
+          attachBadge(a, known);
+          queueInlineScan(known);
+        } else if (known === undefined) {
+          pairCache.set(pm[1], null); // mark resolving
+          pendingPairs.push({ a, pair: pm[1] });
+        }
+      }
+    }
+  });
+
+  if (pendingPairs.length > 0) resolvePairs(pendingPairs);
+}
+
+function resolvePairs(pending: Array<{ a: HTMLAnchorElement; pair: string }>): void {
+  chrome.runtime.sendMessage(
+    { type: 'RESOLVE_PAIRS', pairAddresses: pending.map((p) => p.pair) },
+    (res: ResolvePairsResponse | undefined) => {
+      if (chrome.runtime.lastError || !res?.ok) return;
+      for (const { a, pair } of pending) {
+        const tok = res.tokens[pair];
+        if (!tok || !a.isConnected) continue;
+        pairCache.set(pair, tok.address);
+        attachBadge(a, tok.address);
+        queueInlineScan(tok.address);
+      }
+    },
+  );
+}
+
+/** Append the chip INSIDE the link (keeps table layouts intact). */
+function attachBadge(anchor: HTMLAnchorElement, mint: string): void {
+  const chip = document.createElement('span');
+  chip.setAttribute('data-ck-badge', mint);
+  chip.style.cssText =
+    'all:initial;display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 7px;' +
+    'border-radius:999px;font:700 10px/1.7 system-ui,sans-serif;letter-spacing:.02em;' +
+    'cursor:pointer;vertical-align:middle;white-space:nowrap;background:#3a3f4c;color:#e6e8ee;';
+  chip.textContent = '👑 …';
+  chip.title = 'CRYPTO-KING: scanning…';
+  chip.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    collapsed = false;
+    void analyze(mint, true); // full scan in the panel
+  });
+  anchor.appendChild(chip);
+
+  let set = badgeEls.get(mint);
+  if (!set) {
+    set = new Set();
+    badgeEls.set(mint, set);
+  }
+  set.add(chip);
+  paintBadges(mint); // paint immediately if a result already exists
+}
+
+function queueInlineScan(mint: string): void {
+  if (inlineResults.has(mint)) return;
+  inlineResults.set(mint, 'pending');
+  inlineQueue.push(mint);
+  pumpInlineQueue();
+}
+
+function pumpInlineQueue(): void {
+  while (inlineWorkers < INLINE_BADGES.scanConcurrency && inlineQueue.length > 0) {
+    const mint = inlineQueue.shift();
+    if (!mint) break;
+    inlineWorkers++;
+    void requestAnalysis(mint, /*lite*/ true)
+      .then((res) => {
+        inlineResults.set(
+          mint,
+          res.ok
+            ? {
+                score: res.risk.riskScore,
+                signal: res.risk.signal,
+                topReason: res.risk.reasons[0]?.text ?? null,
+                insufficient: res.risk.insufficientData,
+                unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === 'unknown',
+              }
+            : { score: 0, signal: 'NEUTRAL', topReason: null, insufficient: true, unverified: true },
+        );
+        paintBadges(mint);
+      })
+      .finally(() => {
+        inlineWorkers--;
+        pumpInlineQueue();
+      });
+  }
+}
+
+function paintBadges(mint: string): void {
+  const result = inlineResults.get(mint);
+  const els = badgeEls.get(mint);
+  if (!result || result === 'pending' || !els) return;
+  const meta = SIGNAL_META[result.signal];
+  const label = result.insufficient ? '👑 ?' : `👑 ${result.score} ${meta.label}${result.unverified ? '*' : ''}`;
+  const bg = result.insufficient ? '#3a3f4c' : meta.color;
+  const fg = result.insufficient ? '#e6e8ee' : meta.textColor;
+  const tip = result.insufficient
+    ? 'CRYPTO-KING: not enough data — click for details'
+    : `CRYPTO-KING: ${result.score}/100 ${meta.label}${result.unverified ? ' (holders/LP not verified yet)' : ''}` +
+      `${result.topReason ? ` — ${result.topReason}` : ''} · click for full breakdown`;
+  for (const el of els) {
+    if (!el.isConnected) {
+      els.delete(el);
+      continue;
+    }
+    el.textContent = label;
+    el.style.background = bg;
+    el.style.color = fg;
+    el.title = tip;
+  }
+}
+
 /** Pull a base58 mint out of raw input: a bare address, or a gmgn/pump/solscan URL. */
 function extractAddress(raw: string): string | null {
   const s = raw.trim();
@@ -759,19 +939,24 @@ function esc(s: string): string {
 }
 
 function tick(): void {
-  if (collapsed) return;
   if (location.href !== lastHref) {
     lastHref = location.href;
     currentAddress = null;
     view = 'none'; // new route → re-detect fresh (token page vs list page)
     pageScan.clear(); // coins differ per page
     symbolHints.clear();
-    detect();
-  } else {
+    inlineResults.clear(); // badges died with the old DOM; results re-serve from bg cache
+    badgeEls.clear();
+    inlineQueue = [];
+    if (!collapsed) detect();
+  } else if (!collapsed) {
     // Same route: retry detection so we catch a late-rendering token header or
     // newly loaded coins on an infinite-scroll list. detect() is idempotent.
     detect();
   }
+  // Inline badges sweep runs even while the panel is collapsed — that's the
+  // "see it in place while browsing" experience.
+  sweepInlineBadges();
 }
 
 // Show the assistant as soon as the page has a <body>, then keep watching the SPA.

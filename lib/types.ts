@@ -216,7 +216,9 @@ export type BgRequest =
     }
   | { type: 'GET_RECENT' }
   | { type: 'CLEAR_RECENT' }
-  | { type: 'GET_LIVE_FEED' };
+  | { type: 'GET_LIVE_FEED' }
+  /** Resolve DEX pair addresses → base token mints (DEXTools inline badges). */
+  | { type: 'RESOLVE_PAIRS'; pairAddresses: string[] };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; mock: boolean }
@@ -242,4 +244,8 @@ export interface FeedRow {
 
 export type LiveFeedResponse =
   | { ok: true; feed: FeedRow[]; source: SourceStatus; scannedThisPoll: number }
+  | { ok: false; error: string };
+
+export type ResolvePairsResponse =
+  | { ok: true; tokens: Record<string, { address: string; symbol: string | null }> }
   | { ok: false; error: string };

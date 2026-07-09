@@ -73,7 +73,9 @@ var LIVE_FEED = {
 var DEXSCREENER = {
   enabled: true,
   /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
-  latestProfilesUrl: "https://api.dexscreener.com/token-profiles/latest/v1"
+  latestProfilesUrl: "https://api.dexscreener.com/token-profiles/latest/v1",
+  /** Pair lookup — up to ~30 comma-joined pair addresses per call. */
+  pairsUrl: "https://api.dexscreener.com/latest/dex/pairs/solana/{pairs}"
 };
 var SOLANA = {
   /**
@@ -296,6 +298,24 @@ function asString(v) {
 
 // lib/dexscreenerClient.ts
 var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+async function fetchPairBaseTokens(pairAddresses) {
+  const out = {};
+  if (MOCK_MODE || !DEXSCREENER.enabled || pairAddresses.length === 0) return out;
+  for (let i = 0; i < pairAddresses.length; i += 30) {
+    const chunk = pairAddresses.slice(i, i + 30);
+    const json = await fetchJson(DEXSCREENER.pairsUrl.replace("{pairs}", chunk.join(",")));
+    const pairs = json?.pairs;
+    if (!Array.isArray(pairs)) continue;
+    for (const p of pairs) {
+      const pairAddr = asString(pick(p, ["pairAddress"]));
+      const base = asString(pick(p, ["baseToken.address"]));
+      if (pairAddr && base && BASE58_RE.test(base)) {
+        out[pairAddr] = { address: base, symbol: asString(pick(p, ["baseToken.symbol"])) };
+      }
+    }
+  }
+  return out;
+}
 async function fetchDexscreenerNewSolana(limit) {
   if (MOCK_MODE || !DEXSCREENER.enabled) return [];
   const json = await fetchJson(DEXSCREENER.latestProfilesUrl);
@@ -1124,6 +1144,10 @@ async function handle(msg) {
       return { ok: true, recent: [] };
     case "GET_LIVE_FEED":
       return getLiveFeed();
+    case "RESOLVE_PAIRS": {
+      const valid = msg.pairAddresses.filter((p) => BASE58_RE3.test(p)).slice(0, 90);
+      return { ok: true, tokens: await fetchPairBaseTokens(valid) };
+    }
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }

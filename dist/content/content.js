@@ -61,6 +61,13 @@ var LIVE_FEED = {
   notifyMaxScore: 39
   // CONSIDER / NEUTRAL territory
 };
+var INLINE_BADGES = {
+  enabled: true,
+  /** Max distinct mints badged per page (protects the RPC budget). */
+  maxPerPage: 80,
+  /** Parallel lite scans for inline badges (per tab; per-host rate limits still apply). */
+  scanConcurrency: 2
+};
 var RATE_LIMITS_MS = {
   default: 1100,
   "gmgn.ai": 400
@@ -835,6 +842,139 @@ function ageShort(m) {
   if (m < 1440) return `${(m / 60).toFixed(1)}h`;
   return `${(m / 1440).toFixed(0)}d`;
 }
+var inlineResults = /* @__PURE__ */ new Map();
+var badgeEls = /* @__PURE__ */ new Map();
+var badgedLinks = /* @__PURE__ */ new WeakSet();
+var pairCache = /* @__PURE__ */ new Map();
+var inlineQueue = [];
+var inlineWorkers = 0;
+var MINT_HREF_RES = [
+  new RegExp(`/sol/token/(${BASE58})`),
+  new RegExp(`/coin/(${BASE58})`),
+  new RegExp(`solscan\\.io/token/(${BASE58})`)
+];
+var PAIR_HREF_RE = new RegExp(`/pair-explorer/(${BASE58})`);
+function sweepInlineBadges() {
+  if (!INLINE_BADGES.enabled || inlineResults.size >= INLINE_BADGES.maxPerPage) return;
+  const pendingPairs = [];
+  document.querySelectorAll("a[href]").forEach((a) => {
+    if (badgedLinks.has(a)) return;
+    const href = a.getAttribute("href") ?? "";
+    for (const re of MINT_HREF_RES) {
+      const m = href.match(re);
+      if (m) {
+        badgedLinks.add(a);
+        attachBadge(a, m[1]);
+        queueInlineScan(m[1]);
+        return;
+      }
+    }
+    if (location.hostname.endsWith("dextools.io") && location.pathname.includes("/solana/")) {
+      const pm = href.match(PAIR_HREF_RE);
+      if (pm) {
+        badgedLinks.add(a);
+        const known = pairCache.get(pm[1]);
+        if (known) {
+          attachBadge(a, known);
+          queueInlineScan(known);
+        } else if (known === void 0) {
+          pairCache.set(pm[1], null);
+          pendingPairs.push({ a, pair: pm[1] });
+        }
+      }
+    }
+  });
+  if (pendingPairs.length > 0) resolvePairs(pendingPairs);
+}
+function resolvePairs(pending) {
+  chrome.runtime.sendMessage(
+    { type: "RESOLVE_PAIRS", pairAddresses: pending.map((p) => p.pair) },
+    (res) => {
+      if (chrome.runtime.lastError || !res?.ok) return;
+      for (const { a, pair } of pending) {
+        const tok = res.tokens[pair];
+        if (!tok || !a.isConnected) continue;
+        pairCache.set(pair, tok.address);
+        attachBadge(a, tok.address);
+        queueInlineScan(tok.address);
+      }
+    }
+  );
+}
+function attachBadge(anchor, mint) {
+  const chip = document.createElement("span");
+  chip.setAttribute("data-ck-badge", mint);
+  chip.style.cssText = "all:initial;display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 7px;border-radius:999px;font:700 10px/1.7 system-ui,sans-serif;letter-spacing:.02em;cursor:pointer;vertical-align:middle;white-space:nowrap;background:#3a3f4c;color:#e6e8ee;";
+  chip.textContent = "\u{1F451} \u2026";
+  chip.title = "CRYPTO-KING: scanning\u2026";
+  chip.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    collapsed = false;
+    void analyze(mint, true);
+  });
+  anchor.appendChild(chip);
+  let set = badgeEls.get(mint);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    badgeEls.set(mint, set);
+  }
+  set.add(chip);
+  paintBadges(mint);
+}
+function queueInlineScan(mint) {
+  if (inlineResults.has(mint)) return;
+  inlineResults.set(mint, "pending");
+  inlineQueue.push(mint);
+  pumpInlineQueue();
+}
+function pumpInlineQueue() {
+  while (inlineWorkers < INLINE_BADGES.scanConcurrency && inlineQueue.length > 0) {
+    const mint = inlineQueue.shift();
+    if (!mint) break;
+    inlineWorkers++;
+    void requestAnalysis(
+      mint,
+      /*lite*/
+      true
+    ).then((res) => {
+      inlineResults.set(
+        mint,
+        res.ok ? {
+          score: res.risk.riskScore,
+          signal: res.risk.signal,
+          topReason: res.risk.reasons[0]?.text ?? null,
+          insufficient: res.risk.insufficientData,
+          unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === "unknown"
+        } : { score: 0, signal: "NEUTRAL", topReason: null, insufficient: true, unverified: true }
+      );
+      paintBadges(mint);
+    }).finally(() => {
+      inlineWorkers--;
+      pumpInlineQueue();
+    });
+  }
+}
+function paintBadges(mint) {
+  const result = inlineResults.get(mint);
+  const els = badgeEls.get(mint);
+  if (!result || result === "pending" || !els) return;
+  const meta = SIGNAL_META[result.signal];
+  const label = result.insufficient ? "\u{1F451} ?" : `\u{1F451} ${result.score} ${meta.label}${result.unverified ? "*" : ""}`;
+  const bg = result.insufficient ? "#3a3f4c" : meta.color;
+  const fg = result.insufficient ? "#e6e8ee" : meta.textColor;
+  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: ${result.score}/100 ${meta.label}${result.unverified ? " (holders/LP not verified yet)" : ""}${result.topReason ? ` \u2014 ${result.topReason}` : ""} \xB7 click for full breakdown`;
+  for (const el of els) {
+    if (!el.isConnected) {
+      els.delete(el);
+      continue;
+    }
+    el.textContent = label;
+    el.style.background = bg;
+    el.style.color = fg;
+    el.title = tip;
+  }
+}
 function extractAddress(raw) {
   const s = raw.trim();
   if (BASE58_RE.test(s)) return s;
@@ -926,17 +1066,20 @@ function esc(s) {
   return s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
 function tick() {
-  if (collapsed) return;
   if (location.href !== lastHref) {
     lastHref = location.href;
     currentAddress = null;
     view = "none";
     pageScan.clear();
     symbolHints.clear();
-    detect();
-  } else {
+    inlineResults.clear();
+    badgeEls.clear();
+    inlineQueue = [];
+    if (!collapsed) detect();
+  } else if (!collapsed) {
     detect();
   }
+  sweepInlineBadges();
 }
 function boot() {
   detect();

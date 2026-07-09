@@ -122,13 +122,28 @@ export const LIVE_FEED = {
 
 /**
  * DexScreener — keyless, CORS-friendly public API. Used as a FALLBACK source of
- * fresh Solana token addresses for the Live feed when pump.fun is unreachable or
- * its response shape drifts, so the feed is never dependent on one endpoint.
+ * fresh Solana token addresses for the Live feed, and to resolve DEXTools pair
+ * addresses → base token mints for inline badges.
  */
 export const DEXSCREENER = {
   enabled: true,
   /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
   latestProfilesUrl: 'https://api.dexscreener.com/token-profiles/latest/v1',
+  /** Pair lookup — up to ~30 comma-joined pair addresses per call. */
+  pairsUrl: 'https://api.dexscreener.com/latest/dex/pairs/solana/{pairs}',
+};
+
+/**
+ * Inline badges: inject a small risk chip next to every Solana token link on
+ * the page itself (gmgn lists, pump.fun boards, dextools pair tables), scanned
+ * automatically as rows appear — see it in place while browsing.
+ */
+export const INLINE_BADGES = {
+  enabled: true,
+  /** Max distinct mints badged per page (protects the RPC budget). */
+  maxPerPage: 80,
+  /** Parallel lite scans for inline badges (per tab; per-host rate limits still apply). */
+  scanConcurrency: 2,
 };
 
 export const SOLANA = {

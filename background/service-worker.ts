@@ -16,7 +16,7 @@
 
 import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter } from '../lib/deployerClient.ts';
-import { fetchDexscreenerNewSolana } from '../lib/dexscreenerClient.ts';
+import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
@@ -31,6 +31,7 @@ import type {
   MintInfo,
   RecentResponse,
   RecentToken,
+  ResolvePairsResponse,
   RiskResult,
   TokenAnalysis,
 } from '../lib/types.ts';
@@ -56,7 +57,9 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
   return true; // async sendResponse
 });
 
-async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse | LiveFeedResponse> {
+async function handle(
+  msg: BgRequest,
+): Promise<AnalyzeResponse | RecentResponse | LiveFeedResponse | ResolvePairsResponse> {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
       return analyzeToken(msg.address, msg.force === true, msg.rawGmgn);
@@ -69,6 +72,10 @@ async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse 
       return { ok: true, recent: [] };
     case 'GET_LIVE_FEED':
       return getLiveFeed();
+    case 'RESOLVE_PAIRS': {
+      const valid = msg.pairAddresses.filter((p) => BASE58_RE.test(p)).slice(0, 90);
+      return { ok: true, tokens: await fetchPairBaseTokens(valid) };
+    }
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };
   }

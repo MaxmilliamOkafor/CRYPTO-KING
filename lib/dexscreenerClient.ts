@@ -12,6 +12,33 @@ import { asString, fetchJson, pick } from './http.ts';
 
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+/**
+ * Resolve DEX pair addresses → base token mints (for DEXTools inline badges,
+ * whose links carry pair addresses, not mints). Chunked ~30 per call; failures
+ * simply drop out of the returned map.
+ */
+export async function fetchPairBaseTokens(
+  pairAddresses: string[],
+): Promise<Record<string, { address: string; symbol: string | null }>> {
+  const out: Record<string, { address: string; symbol: string | null }> = {};
+  if (MOCK_MODE || !DEXSCREENER.enabled || pairAddresses.length === 0) return out;
+
+  for (let i = 0; i < pairAddresses.length; i += 30) {
+    const chunk = pairAddresses.slice(i, i + 30);
+    const json = await fetchJson(DEXSCREENER.pairsUrl.replace('{pairs}', chunk.join(',')));
+    const pairs = (json as { pairs?: unknown[] } | null)?.pairs;
+    if (!Array.isArray(pairs)) continue;
+    for (const p of pairs) {
+      const pairAddr = asString(pick(p, ['pairAddress']));
+      const base = asString(pick(p, ['baseToken.address']));
+      if (pairAddr && base && BASE58_RE.test(base)) {
+        out[pairAddr] = { address: base, symbol: asString(pick(p, ['baseToken.symbol'])) };
+      }
+    }
+  }
+  return out;
+}
+
 /** Fresh Solana token mint addresses from DexScreener's latest profiles. [] on failure. */
 export async function fetchDexscreenerNewSolana(limit: number): Promise<string[]> {
   if (MOCK_MODE || !DEXSCREENER.enabled) return [];

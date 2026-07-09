@@ -83,14 +83,55 @@ var RATE_LIMITS_MS = {
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
+var GEM_CRITERIA = {
+  /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
+  requireGraduated: true,
+  /** LP must be burned or locked. */
+  requireLpSecured: true,
+  /** No single non-LP wallet may hold more than this % of supply. */
+  maxLargestWalletPct: 10
+  /** Risk score must be at or below LIVE_FEED.notifyMaxScore, quality at or above LIVE_FEED.gemMinQuality. */
+};
 var SIGNAL_META = {
-  AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe risk factors observed." },
-  HIGH_RISK: { color: "#f76b15", textColor: "#ffffff", label: "HIGH RISK", blurb: "Multiple serious risk factors." },
-  WATCH: { color: "#ffb224", textColor: "#1b1b18", label: "WATCH", blurb: "Notable risk factors present." },
-  CONSIDER: { color: "#46a758", textColor: "#ffffff", label: "CONSIDER", blurb: "Fewer observed risks \u2014 NOT a buy signal." },
-  NEUTRAL: { color: "#64748b", textColor: "#ffffff", label: "NEUTRAL", blurb: "Low observed risk \u2260 safe." }
+  AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe red flags \u2014 likely scam/rug setup." },
+  HIGH_RISK: { color: "#f76b15", textColor: "#ffffff", label: "HIGH RISK", blurb: "Multiple serious red flags." },
+  WATCH: { color: "#ffb224", textColor: "#1b1b18", label: "RISKY", blurb: "Notable red flags \u2014 read them first." },
+  CONSIDER: { color: "#46a758", textColor: "#ffffff", label: "MILD RISK", blurb: "Some red flags found \u2014 not danger-free, not a buy call." },
+  NEUTRAL: { color: "#64748b", textColor: "#ffffff", label: "LOW RISK", blurb: "Few red flags found \u2014 still speculative, not safe." }
 };
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
+
+// lib/gemCriteria.ts
+function gemBackgroundCheck(a, risk, quality) {
+  const blockers = [];
+  if (risk.insufficientData || quality.insufficientData) {
+    blockers.push("Not enough data for a background check.");
+    return { gem: false, blockers };
+  }
+  if (risk.riskScore > LIVE_FEED.notifyMaxScore) {
+    blockers.push(`Risk score ${risk.riskScore} above the ${LIVE_FEED.notifyMaxScore} gate.`);
+  }
+  if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
+    blockers.push(`Quality ${quality.qualityScore} below the ${LIVE_FEED.gemMinQuality} gate.`);
+  }
+  if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
+    blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
+  }
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (GEM_CRITERIA.requireLpSecured && lp !== "burned" && lp !== "locked") {
+    blockers.push(lp === "unknown" ? "LP status not verified yet." : `LP not secured (${lp.replace("_", " ")}).`);
+  }
+  const largest = a.holders?.largestNonLpWalletPct ?? null;
+  if (largest === null) {
+    blockers.push("Holder distribution not verified yet.");
+  } else if (largest > GEM_CRITERIA.maxLargestWalletPct) {
+    blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+  if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
+    blockers.push("Creator's launch history not checked yet.");
+  }
+  return { gem: blockers.length === 0, blockers };
+}
 
 // mock/fixtures.ts
 var now = () => Date.now();
@@ -853,7 +894,7 @@ async function pollLiveFeed() {
 }
 var gemSeen = /* @__PURE__ */ new Set();
 function isGem(r) {
-  return !r.insufficientData && r.riskScore <= LIVE_FEED.notifyMaxScore && r.qualityScore !== null && r.qualityScore >= LIVE_FEED.gemMinQuality;
+  return r.gem;
 }
 function refreshGemAlerts() {
   const gems = liveRows.filter(isGem);
@@ -1160,9 +1201,12 @@ function fillPanel(panel, analysis, risk, quality) {
   const reasons = risk.reasons.slice(0, 6).map((r) => `<li><span class="pts bad">+${r.points}</span><span>${esc(r.text)}</span></li>`).join("");
   const mitigations = risk.mitigations.map((m) => `<li><span class="pts good">${m.points}</span><span>${esc(m.text)}</span></li>`).join("");
   const qualityItems = quality.reasons.slice(0, 6).map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`).join("");
+  const verdict = gemBackgroundCheck(analysis, risk, quality);
+  const gemSection = verdict.gem ? `<h4>\u{1F48E} Background check</h4><ul><li><span class="pts good">\u2713</span><span>PASSED \u2014 graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>` : `<h4>\u{1F48E} Background check \u2014 not passed</h4><ul>${verdict.blockers.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`).join("")}</ul>`;
   const gaps = risk.dataGaps.slice(0, 5).map((g) => `<li class="gap">${esc(g)}</li>`).join("");
   panel.innerHTML = `
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
+    ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ""}
     ${qualityItems ? `<h4>Quality signals (not a profit prediction)</h4><ul>${qualityItems}</ul>` : ""}
     ${gaps ? `<h4>Not checked (data unavailable)</h4><ul>${gaps}</ul>` : ""}

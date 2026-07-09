@@ -80,9 +80,19 @@ export function scoreQuality(a: TokenAnalysis, w: QWeights = QUALITY_WEIGHTS, l:
     }
   }
 
-  /* Launchpad graduation & survival */
+  /* Launchpad graduation, curve traction & community */
   if (a.launch?.bondingCurveComplete === true) {
     hit(w.graduated, 'Graduated its bonding curve — survived the launchpad.');
+  } else if (
+    a.launch?.bondingCurveComplete === false &&
+    a.market?.marketCapEur !== null &&
+    a.market?.marketCapEur !== undefined &&
+    a.market.marketCapEur >= l.curveTractionMinEur
+  ) {
+    hit(w.curveTraction, `Real buyer traction on the curve (€${Math.round(a.market.marketCapEur / 1000)}k cap).`);
+  }
+  if (a.launch?.replyCount !== null && a.launch?.replyCount !== undefined && a.launch.replyCount >= l.minReplies) {
+    hit(w.communityActivity, `Active launchpad community (${a.launch.replyCount} comments).`);
   }
   const age = a.identity.ageMinutes;
   if (age !== null) {

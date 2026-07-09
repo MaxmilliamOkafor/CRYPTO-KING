@@ -176,6 +176,13 @@ var WEIGHTS = {
   // still on the bonding curve — ultra-early, pre-AMM
   brandNewLaunch: 10,
   // launchpad coin younger than LIMITS.youngAgeMinutes — peak failure window
+  // Early-stage concentration: for coins STILL ON THE CURVE, whale thresholds
+  // are much lower — a wallet holding 5%+ of total supply minutes after launch
+  // is the dev/snipers, and they can dump at any second.
+  earlyWhaleWallet: 15,
+  // one non-curve wallet ≥ LIMITS.earlyWhalePct this early
+  earlyTopConcentration: 10,
+  // top-10 non-curve wallets ≥ LIMITS.earlyTop10Pct this early
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10,
   // age < LIMITS.youngAgeMinutes with abnormal volume
@@ -216,8 +223,12 @@ var LIMITS = {
   smartMoneyStrongWallets: 3,
   serialMinLaunches: 3,
   // serial-deployer factor needs at least this many prior coins…
-  serialDeadRatio: 0.7
+  serialDeadRatio: 0.7,
   // …with at least this share dead/abandoned
+  earlyWhalePct: 5,
+  // % of TOTAL supply in one non-curve wallet while still on the curve
+  earlyTop10Pct: 15
+  // % of TOTAL supply in top-10 non-curve wallets while on the curve
 };
 var QUALITY_WEIGHTS = {
   smartMoneyStrong: 20,
@@ -243,7 +254,11 @@ var QUALITY_WEIGHTS = {
   graduated: 10,
   // bonding curve completed — survived the launchpad
   survived7d: 10,
-  survived24h: 5
+  survived24h: 5,
+  curveTraction: 10,
+  // still on the curve but real buyers pushed mcap ≥ curveTractionMinEur
+  communityActivity: 5
+  // launchpad comment count ≥ minReplies
 };
 var QUALITY_LIMITS = {
   healthyTop10Pct: 30,
@@ -252,7 +267,18 @@ var QUALITY_LIMITS = {
   minLiquidityEur: 3e4,
   minLiqMcapRatio: 0.08,
   volMcapMin: 0.2,
-  volMcapMax: 8
+  volMcapMax: 8,
+  curveTractionMinEur: 2e4,
+  minReplies: 20
+};
+var GEM_CRITERIA = {
+  /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
+  requireGraduated: true,
+  /** LP must be burned or locked. */
+  requireLpSecured: true,
+  /** No single non-LP wallet may hold more than this % of supply. */
+  maxLargestWalletPct: 10
+  /** Risk score must be at or below LIVE_FEED.notifyMaxScore, quality at or above LIVE_FEED.gemMinQuality. */
 };
 var MITIGATION_CAP = 15;
 var SIGNAL_THRESHOLDS = [
@@ -554,6 +580,7 @@ async function fetchPumpfunData(address) {
       isToken2022: f.mint?.isToken2022 ?? null,
       creator: null,
       socials: f.socials,
+      replyCount: null,
       bondingCurveAccounts: []
     };
   }
@@ -576,7 +603,10 @@ async function fetchPumpfunData(address) {
     isBanned: asBoolLoose(pick(json, ["is_banned"])),
     isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
     creator: asString(pick(json, ["creator"])),
-    socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null,
+    // The coin object DID load, so absent links are KNOWLEDGE ("has no
+    // socials"), not a data gap — return the object with nulls, never null.
+    socials: { website, twitter, telegram, verified: null },
+    replyCount: asNumber(pick(json, ["reply_count"])),
     bondingCurveAccounts: [
       asString(pick(json, ["bonding_curve"])),
       asString(pick(json, ["associated_bonding_curve"])),
@@ -640,6 +670,7 @@ var EMPTY = {
   isToken2022: null,
   creator: null,
   socials: null,
+  replyCount: null,
   bondingCurveAccounts: []
 };
 
@@ -711,6 +742,38 @@ async function fetchDexscreenerNewSolana(limit) {
     if (out.length >= limit) break;
   }
   return out;
+}
+
+// lib/gemCriteria.ts
+function gemBackgroundCheck(a, risk, quality) {
+  const blockers = [];
+  if (risk.insufficientData || quality.insufficientData) {
+    blockers.push("Not enough data for a background check.");
+    return { gem: false, blockers };
+  }
+  if (risk.riskScore > LIVE_FEED.notifyMaxScore) {
+    blockers.push(`Risk score ${risk.riskScore} above the ${LIVE_FEED.notifyMaxScore} gate.`);
+  }
+  if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
+    blockers.push(`Quality ${quality.qualityScore} below the ${LIVE_FEED.gemMinQuality} gate.`);
+  }
+  if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
+    blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
+  }
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (GEM_CRITERIA.requireLpSecured && lp !== "burned" && lp !== "locked") {
+    blockers.push(lp === "unknown" ? "LP status not verified yet." : `LP not secured (${lp.replace("_", " ")}).`);
+  }
+  const largest = a.holders?.largestNonLpWalletPct ?? null;
+  if (largest === null) {
+    blockers.push("Holder distribution not verified yet.");
+  } else if (largest > GEM_CRITERIA.maxLargestWalletPct) {
+    blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+  if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
+    blockers.push("Creator's launch history not checked yet.");
+  }
+  return { gem: blockers.length === 0, blockers };
 }
 
 // lib/gmgnClient.ts
@@ -952,6 +1015,11 @@ function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
   }
   if (a.launch?.bondingCurveComplete === true) {
     hit(w.graduated, "Graduated its bonding curve \u2014 survived the launchpad.");
+  } else if (a.launch?.bondingCurveComplete === false && a.market?.marketCapEur !== null && a.market?.marketCapEur !== void 0 && a.market.marketCapEur >= l.curveTractionMinEur) {
+    hit(w.curveTraction, `Real buyer traction on the curve (\u20AC${Math.round(a.market.marketCapEur / 1e3)}k cap).`);
+  }
+  if (a.launch?.replyCount !== null && a.launch?.replyCount !== void 0 && a.launch.replyCount >= l.minReplies) {
+    hit(w.communityActivity, `Active launchpad community (${a.launch.replyCount} comments).`);
   }
   const age = a.identity.ageMinutes;
   if (age !== null) {
@@ -1101,6 +1169,16 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
         w.brandNewLaunch,
         `Brand-new launch (${Math.round(a.identity.ageMinutes)} min) \u2014 the peak rug/failure window.`
       );
+    }
+    if (launch.bondingCurveComplete === false && a.holders) {
+      const lw = a.holders.largestNonLpWalletPct;
+      if (lw !== null && lw >= l.earlyWhalePct) {
+        hit(w.earlyWhaleWallet, `One wallet already grabbed ${lw.toFixed(1)}% of total supply this early \u2014 dev/sniper dump risk.`);
+      }
+      const t10 = a.holders.top10Pct;
+      if (t10 !== null && t10 >= l.earlyTop10Pct) {
+        hit(w.earlyTopConcentration, `Top wallets already hold ${t10.toFixed(1)}% of supply this early.`);
+      }
     }
   }
   const b = a.behavior;
@@ -1405,6 +1483,7 @@ async function doLiveFeedSweep() {
     }
   }
   let scannedThisPoll = 0;
+  let fullUpgradesThisPoll = 0;
   for (const c of coins) {
     const cached = cache.get(c.mint);
     const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
@@ -1419,8 +1498,20 @@ async function doLiveFeedSweep() {
       );
       scannedThisPoll++;
     }
-    const entry = cache.get(c.mint);
+    let entry = cache.get(c.mint);
     if (!entry) continue;
+    if (entry.lite && fullUpgradesThisPoll < 2 && !entry.risk.insufficientData && entry.risk.riskScore <= LIVE_FEED.notifyMaxScore && entry.analysis.launch?.bondingCurveComplete !== false) {
+      fullUpgradesThisPoll++;
+      await analyzeToken(
+        c.mint,
+        false,
+        void 0,
+        /*lite*/
+        false
+      );
+      entry = cache.get(c.mint) ?? entry;
+    }
+    const verdict = entry.lite ? { gem: false, blockers: ["Full background check pending."] } : gemBackgroundCheck(entry.analysis, entry.risk, entry.quality);
     const row = {
       address: c.mint,
       symbol: entry.analysis.identity.symbol ?? c.symbol,
@@ -1431,6 +1522,7 @@ async function doLiveFeedSweep() {
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
+      gem: verdict.gem,
       insufficientData: entry.risk.insufficientData,
       unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()
@@ -1447,18 +1539,16 @@ async function doLiveFeedSweep() {
 }
 function maybeNotifyLowRisk(row, risk) {
   if (!LIVE_FEED.notifyLowRisk || MOCK_MODE) return;
-  if (row.insufficientData || risk.riskScore > LIVE_FEED.notifyMaxScore) return;
+  if (!row.gem) return;
   if (notified.has(row.address)) return;
-  const mintChecked = risk.dataGaps.every((g) => !/mint data unavailable/i.test(g));
-  if (!mintChecked) return;
   notified.add(row.address);
   if (notified.size > 500) notified.clear();
   const sym = row.symbol ?? `${row.address.slice(0, 4)}\u2026${row.address.slice(-4)}`;
   chrome.notifications.create(`ck-${row.address}`, {
     type: "basic",
     iconUrl: "icons/icon128.png",
-    title: `\u{1F451} ${sym} \u2014 score ${risk.riskScore} (${risk.signal})`,
-    message: `Fresh launch, lower observed risk (\u2260 safe${row.unverified ? "; holders/LP unverified" : ""}). ${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ""}Click to open on GMGN.`
+    title: `\u{1F48E} ${sym} \u2014 passed background check (risk ${risk.riskScore}, quality ${row.qualityScore ?? "?"})`,
+    message: "Graduated, LP secured, no whale wallet, creator screened. Still speculative \u2014 research it yourself. Click to open on GMGN."
   });
 }
 chrome.notifications?.onClicked.addListener((id) => {
@@ -1578,7 +1668,8 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
     launch: pumpfun.status === "ok" ? {
       platform: "pumpfun",
       bondingCurveComplete: pumpfun.bondingCurveComplete,
-      bannedOnPlatform: pumpfun.isBanned
+      bannedOnPlatform: pumpfun.isBanned,
+      replyCount: pumpfun.replyCount
     } : null,
     sources,
     fetchedAt: Date.now()

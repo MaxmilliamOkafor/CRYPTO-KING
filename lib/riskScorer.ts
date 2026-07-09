@@ -181,6 +181,19 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
         `Brand-new launch (${Math.round(a.identity.ageMinutes)} min) — the peak rug/failure window.`,
       );
     }
+    // Early-stage concentration: while the coin is STILL ON THE CURVE, whale
+    // thresholds are much lower — supply grabbed this early is dev/snipers who
+    // can dump at any second (curve accounts are already excluded upstream).
+    if (launch.bondingCurveComplete === false && a.holders) {
+      const lw = a.holders.largestNonLpWalletPct;
+      if (lw !== null && lw >= l.earlyWhalePct) {
+        hit(w.earlyWhaleWallet, `One wallet already grabbed ${lw.toFixed(1)}% of total supply this early — dev/sniper dump risk.`);
+      }
+      const t10 = a.holders.top10Pct;
+      if (t10 !== null && t10 >= l.earlyTop10Pct) {
+        hit(w.earlyTopConcentration, `Top wallets already hold ${t10.toFixed(1)}% of supply this early.`);
+      }
+    }
   }
 
   /* ── Age & behavior ────────────────────────────────────────────────── */

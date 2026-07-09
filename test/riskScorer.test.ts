@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
 import { FIXTURE_AVOID, FIXTURE_NEUTRAL, FIXTURE_WATCH } from '../mock/fixtures.ts';
@@ -162,22 +163,38 @@ test('Token-2022 very-high fee outranks the high-fee tier (replaces, not additiv
   assert.equal(r.reasons.length, 1);
 });
 
-test('launchpad factors: bonding curve + brand-new age score 20 → CONSIDER', () => {
+test('launchpad factors: curve + brand-new + early top-wallet concentration → 30', () => {
   const fresh: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
   fresh.identity = { ...fresh.identity, ageMinutes: 4 };
-  fresh.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false };
+  fresh.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false, replyCount: null };
   fresh.socials = null; // mute mitigations for exact arithmetic
   fresh.smartMoney = null;
   const r = scoreToken(fresh);
-  assert.equal(r.riskScore, 20); // +10 bonding curve, +10 brand-new
+  // +10 bonding curve, +10 brand-new, +10 early top-10 concentration (24% ≥ 15% while on curve)
+  assert.equal(r.riskScore, 30);
   assert.equal(r.signal, 'CONSIDER');
   assert.ok(r.reasons.some((x) => /bonding curve/i.test(x.text)));
   assert.ok(r.reasons.some((x) => /Brand-new launch/.test(x.text)));
+  assert.ok(r.reasons.some((x) => /already hold/.test(x.text)));
+});
+
+test('early whale wallet (≥5% on the curve) fires; same wallet is fine after graduation', () => {
+  const early: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  early.identity = { ...early.identity, ageMinutes: 200 }; // not brand-new: isolate the whale factor
+  early.socials = null;
+  early.smartMoney = null;
+  early.holders = { ...early.holders!, largestNonLpWalletPct: 8, top10Pct: 12 };
+  early.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false, replyCount: null };
+  const onCurve = scoreToken(early);
+  assert.ok(onCurve.reasons.some((x) => /dev\/sniper dump risk/.test(x.text)));
+  const graduated = structuredClone(early);
+  graduated.launch = { platform: 'pumpfun', bondingCurveComplete: true, bannedOnPlatform: false, replyCount: null };
+  assert.ok(!scoreToken(graduated).reasons.some((x) => /dev\/sniper dump risk/.test(x.text)));
 });
 
 test('platform-banned coins take +30 and cannot look clean', () => {
   const banned: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
-  banned.launch = { platform: 'pumpfun', bondingCurveComplete: true, bannedOnPlatform: true };
+  banned.launch = { platform: 'pumpfun', bondingCurveComplete: true, bannedOnPlatform: true, replyCount: null };
   banned.socials = null;
   banned.smartMoney = null;
   const r = scoreToken(banned);
@@ -243,6 +260,37 @@ test('quality reports insufficientData when nothing was fetchable', () => {
   const q = scoreQuality(empty);
   assert.equal(q.insufficientData, true);
   assert.equal(q.qualityScore, 0);
+});
+
+/* ── 💎 gem background check ───────────────────────────────────────────── */
+
+test('gem check: QUOKKA passes every gate', () => {
+  const v = gemBackgroundCheck(FIXTURE_NEUTRAL, scoreToken(FIXTURE_NEUTRAL), scoreQuality(FIXTURE_NEUTRAL));
+  assert.equal(v.gem, true);
+  assert.equal(v.blockers.length, 0);
+});
+
+test('gem check: a coin still on the bonding curve is NEVER a gem (dev can dump)', () => {
+  const onCurve: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  onCurve.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false, replyCount: 50 };
+  onCurve.deployer = { ...onCurve.deployer!, priorLaunches: 0, priorDeadLaunches: 0 };
+  const v = gemBackgroundCheck(onCurve, scoreToken(onCurve), scoreQuality(onCurve));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.some((b) => /bonding curve/.test(b)));
+});
+
+test('gem check: a whale wallet (>10%) blocks gem grade even when everything else is clean', () => {
+  const whale: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  whale.holders = { ...whale.holders!, largestNonLpWalletPct: 22 };
+  const v = gemBackgroundCheck(whale, scoreToken(whale), scoreQuality(whale));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.some((b) => /22\.0%/.test(b)));
+});
+
+test('gem check: RUGKING is blocked on multiple gates', () => {
+  const v = gemBackgroundCheck(FIXTURE_AVOID, scoreToken(FIXTURE_AVOID), scoreQuality(FIXTURE_AVOID));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.length >= 3); // risk gate, LP not secured, whale wallet
 });
 
 console.log(`\n${passed} tests passed.`);

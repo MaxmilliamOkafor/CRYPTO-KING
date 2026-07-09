@@ -132,6 +132,8 @@ export interface LaunchInfo {
   bondingCurveComplete: boolean | null;
   /** true = banned/flagged on its own launch platform. */
   bannedOnPlatform: boolean | null;
+  /** Platform comment count — crude community-traction signal. */
+  replyCount: number | null;
 }
 
 export interface SmartMoneyInfo {
@@ -264,6 +266,8 @@ export interface FeedRow {
   topReason: string | null;
   /** Positive-signal score (0–100), null when too little data to say anything. */
   qualityScore: number | null;
+  /** true = passed the FULL 💎 background check (lib/gemCriteria.ts) on verified data. */
+  gem: boolean;
   insufficientData: boolean;
   /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
   unverified: boolean;

@@ -17,6 +17,7 @@
 import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
+import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
@@ -124,10 +125,12 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
   }
 
   // Scan newest-first with a per-poll budget of not-yet-scanned coins. Feed
-  // scans are LITE (mint-authority check only, 1 RPC call) so a full budget
-  // fits inside the poll interval on the public RPC; opening a coin upgrades
-  // it to a full scan. Cached coins refresh for free.
+  // scans are LITE so the sweep fits the poll interval on the public RPC.
+  // Promising lite results get auto-upgraded to FULL background checks
+  // (bounded per poll) — the 💎 gem verdict is only ever computed on full,
+  // verified data.
   let scannedThisPoll = 0;
+  let fullUpgradesThisPoll = 0;
   for (const c of coins) {
     const cached = cache.get(c.mint);
     const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
@@ -136,8 +139,28 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       await analyzeToken(c.mint, false, undefined, /*lite*/ true);
       scannedThisPoll++;
     }
-    const entry = cache.get(c.mint);
+    let entry = cache.get(c.mint);
     if (!entry) continue;
+
+    // Auto-upgrade: graduated + low-risk + some quality on the lite pass →
+    // run the full background check now so a real gem can actually surface.
+    if (
+      entry.lite &&
+      fullUpgradesThisPoll < 2 &&
+      !entry.risk.insufficientData &&
+      entry.risk.riskScore <= LIVE_FEED.notifyMaxScore &&
+      entry.analysis.launch?.bondingCurveComplete !== false
+    ) {
+      fullUpgradesThisPoll++;
+      await analyzeToken(c.mint, false, undefined, /*lite*/ false);
+      entry = cache.get(c.mint) ?? entry;
+    }
+
+    // Gem verdict strictly requires full-scan data (never lite).
+    const verdict = entry.lite
+      ? { gem: false, blockers: ['Full background check pending.'] }
+      : gemBackgroundCheck(entry.analysis, entry.risk, entry.quality);
+
     const row: FeedRow = {
       address: c.mint,
       symbol: entry.analysis.identity.symbol ?? c.symbol,
@@ -149,6 +172,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
+      gem: verdict.gem,
       insufficientData: entry.risk.insufficientData,
       unverified:
         entry.analysis.holders === null ||
@@ -174,17 +198,14 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
 }
 
 /**
- * Desktop notification when a fresh launch scans lower-risk — so the user
- * doesn't have to watch the panel. Requires the on-chain authority checks to
- * have actually run (never notify on insufficient data), fires once per mint,
- * and the copy stays risk-framed: "lower observed risk", never "buy".
+ * Desktop notification ONLY for coins that passed the FULL 💎 background check
+ * (graduated, LP secured, no whale wallet, creator history screened). Fires
+ * once per mint; copy stays risk-framed — "passed checks", never "buy".
  */
 function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
   if (!LIVE_FEED.notifyLowRisk || MOCK_MODE) return;
-  if (row.insufficientData || risk.riskScore > LIVE_FEED.notifyMaxScore) return;
+  if (!row.gem) return;
   if (notified.has(row.address)) return;
-  const mintChecked = risk.dataGaps.every((g) => !/mint data unavailable/i.test(g));
-  if (!mintChecked) return;
   notified.add(row.address);
   if (notified.size > 500) notified.clear(); // bounded memory; duplicate ping is harmless
 
@@ -192,10 +213,9 @@ function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
   chrome.notifications.create(`ck-${row.address}`, {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
-    title: `👑 ${sym} — score ${risk.riskScore} (${risk.signal})`,
+    title: `💎 ${sym} — passed background check (risk ${risk.riskScore}, quality ${row.qualityScore ?? '?'})`,
     message:
-      `Fresh launch, lower observed risk (≠ safe${row.unverified ? '; holders/LP unverified' : ''}). ` +
-      `${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ''}Click to open on GMGN.`,
+      'Graduated, LP secured, no whale wallet, creator screened. Still speculative — research it yourself. Click to open on GMGN.',
   });
 }
 
@@ -388,6 +408,7 @@ function mergeSources(
             platform: 'pumpfun',
             bondingCurveComplete: pumpfun.bondingCurveComplete,
             bannedOnPlatform: pumpfun.isBanned,
+            replyCount: pumpfun.replyCount,
           }
         : null,
     sources,

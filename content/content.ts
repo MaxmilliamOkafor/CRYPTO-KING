@@ -22,6 +22,7 @@
  */
 
 import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
+import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
 import type {
   AnalyzeResponse,
@@ -630,13 +631,10 @@ async function pollLiveFeed(): Promise<void> {
 
 const gemSeen = new Set<string>();
 
+/** Gem status comes from the background's FULL background check — never
+ *  recomputed here from partial data (that's how a rug got highlighted once). */
 function isGem(r: FeedRow): boolean {
-  return (
-    !r.insufficientData &&
-    r.riskScore <= LIVE_FEED.notifyMaxScore &&
-    r.qualityScore !== null &&
-    r.qualityScore >= LIVE_FEED.gemMinQuality
-  );
+  return r.gem;
 }
 
 function refreshGemAlerts(): void {
@@ -1031,6 +1029,12 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
     .slice(0, 6)
     .map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`)
     .join('');
+  const verdict = gemBackgroundCheck(analysis, risk, quality);
+  const gemSection = verdict.gem
+    ? `<h4>💎 Background check</h4><ul><li><span class="pts good">✓</span><span>PASSED — graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>`
+    : `<h4>💎 Background check — not passed</h4><ul>${verdict.blockers
+        .map((b) => `<li><span class="pts bad">✗</span><span>${esc(b)}</span></li>`)
+        .join('')}</ul>`;
   const gaps = risk.dataGaps
     .slice(0, 5)
     .map((g) => `<li class="gap">${esc(g)}</li>`)
@@ -1038,6 +1042,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
 
   panel.innerHTML = `
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
+    ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ''}
     ${qualityItems ? `<h4>Quality signals (not a profit prediction)</h4><ul>${qualityItems}</ul>` : ''}
     ${gaps ? `<h4>Not checked (data unavailable)</h4><ul>${gaps}</ul>` : ''}

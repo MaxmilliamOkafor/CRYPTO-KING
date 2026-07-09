@@ -245,6 +245,11 @@ export const WEIGHTS = {
   platformBanned: 30, // banned/flagged on its own launch platform
   bondingCurveActive: 10, // still on the bonding curve — ultra-early, pre-AMM
   brandNewLaunch: 10, // launchpad coin younger than LIMITS.youngAgeMinutes — peak failure window
+  // Early-stage concentration: for coins STILL ON THE CURVE, whale thresholds
+  // are much lower — a wallet holding 5%+ of total supply minutes after launch
+  // is the dev/snipers, and they can dump at any second.
+  earlyWhaleWallet: 15, // one non-curve wallet ≥ LIMITS.earlyWhalePct this early
+  earlyTopConcentration: 10, // top-10 non-curve wallets ≥ LIMITS.earlyTop10Pct this early
 
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10, // age < LIMITS.youngAgeMinutes with abnormal volume
@@ -280,6 +285,8 @@ export const LIMITS = {
   smartMoneyStrongWallets: 3,
   serialMinLaunches: 3, // serial-deployer factor needs at least this many prior coins…
   serialDeadRatio: 0.7, // …with at least this share dead/abandoned
+  earlyWhalePct: 5, // % of TOTAL supply in one non-curve wallet while still on the curve
+  earlyTop10Pct: 15, // % of TOTAL supply in top-10 non-curve wallets while on the curve
 } as const;
 
 /* ─────────────────────── Quality/momentum model ───────────────────────────
@@ -304,6 +311,8 @@ export const QUALITY_WEIGHTS = {
   graduated: 10, // bonding curve completed — survived the launchpad
   survived7d: 10,
   survived24h: 5,
+  curveTraction: 10, // still on the curve but real buyers pushed mcap ≥ curveTractionMinEur
+  communityActivity: 5, // launchpad comment count ≥ minReplies
 } as const;
 
 export const QUALITY_LIMITS = {
@@ -314,6 +323,23 @@ export const QUALITY_LIMITS = {
   minLiqMcapRatio: 0.08,
   volMcapMin: 0.2,
   volMcapMax: 8,
+  curveTractionMinEur: 20_000,
+  minReplies: 20,
+} as const;
+
+/* ─────────────────────── 💎 gem background check ──────────────────────────
+ * A coin only earns the gold gem highlight after a FULL background check
+ * passes every gate below. Rationale: the gem must never point at a coin
+ * whose dev can still nuke it in one transaction.
+ */
+export const GEM_CRITERIA = {
+  /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
+  requireGraduated: true,
+  /** LP must be burned or locked. */
+  requireLpSecured: true,
+  /** No single non-LP wallet may hold more than this % of supply. */
+  maxLargestWalletPct: 10,
+  /** Risk score must be at or below LIVE_FEED.notifyMaxScore, quality at or above LIVE_FEED.gemMinQuality. */
 } as const;
 
 /** Total mitigation is capped at this many points (applied as a floor of -15). */
@@ -328,13 +354,17 @@ export const SIGNAL_THRESHOLDS: Array<{ min: number; signal: Signal }> = [
   { min: 0, signal: 'NEUTRAL' },
 ];
 
-/** UI metadata per signal. IMPORTANT: lower observed risk ≠ safe — keep that framing. */
+/**
+ * UI metadata per signal — labels are plain English about DANGER LEVEL only.
+ * (Internal Signal ids are unchanged; only display text differs.)
+ * IMPORTANT: lower observed risk ≠ safe — keep that framing everywhere.
+ */
 export const SIGNAL_META: Record<Signal, { color: string; textColor: string; label: string; blurb: string }> = {
-  AVOID: { color: '#e5484d', textColor: '#ffffff', label: 'AVOID', blurb: 'Severe risk factors observed.' },
-  HIGH_RISK: { color: '#f76b15', textColor: '#ffffff', label: 'HIGH RISK', blurb: 'Multiple serious risk factors.' },
-  WATCH: { color: '#ffb224', textColor: '#1b1b18', label: 'WATCH', blurb: 'Notable risk factors present.' },
-  CONSIDER: { color: '#46a758', textColor: '#ffffff', label: 'CONSIDER', blurb: 'Fewer observed risks — NOT a buy signal.' },
-  NEUTRAL: { color: '#64748b', textColor: '#ffffff', label: 'NEUTRAL', blurb: 'Low observed risk ≠ safe.' },
+  AVOID: { color: '#e5484d', textColor: '#ffffff', label: 'AVOID', blurb: 'Severe red flags — likely scam/rug setup.' },
+  HIGH_RISK: { color: '#f76b15', textColor: '#ffffff', label: 'HIGH RISK', blurb: 'Multiple serious red flags.' },
+  WATCH: { color: '#ffb224', textColor: '#1b1b18', label: 'RISKY', blurb: 'Notable red flags — read them first.' },
+  CONSIDER: { color: '#46a758', textColor: '#ffffff', label: 'MILD RISK', blurb: 'Some red flags found — not danger-free, not a buy call.' },
+  NEUTRAL: { color: '#64748b', textColor: '#ffffff', label: 'LOW RISK', blurb: 'Few red flags found — still speculative, not safe.' },
 };
 
 /** Mandatory disclaimer — rendered in overlay details, popup footer, dashboard, README. */

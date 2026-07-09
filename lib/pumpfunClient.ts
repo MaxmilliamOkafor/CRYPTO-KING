@@ -30,6 +30,8 @@ export interface PumpfunData {
   isToken2022: boolean | null;
   creator: string | null;
   socials: SocialInfo | null;
+  /** pump.fun comment count — crude but genuinely varying community-traction signal. */
+  replyCount: number | null;
   /** Bonding-curve accounts — excluded from holder-concentration math in lite scans. */
   bondingCurveAccounts: string[];
 }
@@ -50,6 +52,7 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
       isToken2022: f.mint?.isToken2022 ?? null,
       creator: null,
       socials: f.socials,
+      replyCount: null,
       bondingCurveAccounts: [],
     };
   }
@@ -76,10 +79,10 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
     isBanned: asBoolLoose(pick(json, ['is_banned'])),
     isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
     creator: asString(pick(json, ['creator'])),
-    socials:
-      website || twitter || telegram
-        ? { website, twitter, telegram, verified: null }
-        : null,
+    // The coin object DID load, so absent links are KNOWLEDGE ("has no
+    // socials"), not a data gap — return the object with nulls, never null.
+    socials: { website, twitter, telegram, verified: null },
+    replyCount: asNumber(pick(json, ['reply_count'])),
     bondingCurveAccounts: [
       asString(pick(json, ['bonding_curve'])),
       asString(pick(json, ['associated_bonding_curve'])),
@@ -175,5 +178,6 @@ const EMPTY: PumpfunData = {
   isToken2022: null,
   creator: null,
   socials: null,
+  replyCount: null,
   bondingCurveAccounts: [],
 };

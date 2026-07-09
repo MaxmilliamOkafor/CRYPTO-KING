@@ -209,6 +209,11 @@ export const WEIGHTS = {
   microMcapUnlockedLp: 15, // mcap < LIMITS.microMcapEur AND LP not secured
   mcapSpikeNoOrganicVolume: 10,
 
+  // Launch-platform reality (applies when the launchpad is identified)
+  platformBanned: 30, // banned/flagged on its own launch platform
+  bondingCurveActive: 10, // still on the bonding curve — ultra-early, pre-AMM
+  brandNewLaunch: 10, // launchpad coin younger than LIMITS.youngAgeMinutes — peak failure window
+
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10, // age < LIMITS.youngAgeMinutes with abnormal volume
   deployerLinkedSelling: 15,

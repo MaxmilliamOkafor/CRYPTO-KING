@@ -72,6 +72,7 @@ export const FIXTURE_AVOID: TokenAnalysis = {
   deployer: { priorRugs: 0, fundingSource: 'cex' },
   socials: { website: null, twitter: null, telegram: null, verified: null }, // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: 'mock', solana: 'mock', pumpfun: 'mock', rugcheck: 'mock', deployer: 'mock' },
   fetchedAt: now(),
 };
@@ -132,6 +133,7 @@ export const FIXTURE_WATCH: TokenAnalysis = {
   deployer: { priorRugs: 0, fundingSource: 'cex' },
   socials: { website: 'https://wifcat.example', twitter: 'https://x.com/wifcat', telegram: null, verified: false }, // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: 'mock', solana: 'mock', pumpfun: 'mock', rugcheck: 'mock', deployer: 'mock' },
   fetchedAt: now(),
 };
@@ -196,6 +198,7 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     verified: true, // -5
   },
   smartMoney: { accumulating: true, exiting: false, walletCount: 6 }, // -10 (strong)
+  launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: 'mock', solana: 'mock', pumpfun: 'mock', rugcheck: 'mock', deployer: 'mock' },
   fetchedAt: now(),
 };

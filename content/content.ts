@@ -217,6 +217,10 @@ const STYLES = `
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
+  .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
+  .copy:hover { color: #fff; background: #2a2f3e; }
+  .copy.copied { color: #6fd08c; }
+  .uv { background: #1f2a3f; color: #8fb3ff; border: 1px solid #2e4a7a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
 `;
 
 function ensureHost(): ShadowRoot {
@@ -285,7 +289,7 @@ function renderHome(): void {
     <div class="live-section">
       <div class="scan-head">
         <span class="live-dot"></span>
-        <span class="t">Live new launches — auto-scanning</span>
+        <span class="t">Live Solana launches — auto-scanning</span>
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
       </div>
       <div class="live-status">Starting live scan…</div>
@@ -293,7 +297,7 @@ function renderHome(): void {
     </div>
 
     <div class="scan-section">
-      <div class="scan-head"><span class="t">Scan a specific coin</span></div>
+      <div class="scan-head"><span class="t">Scan a specific coin (Solana only)</span></div>
       <div class="scan-row">
         <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
         <button class="scan-btn">Scan</button>
@@ -500,16 +504,12 @@ function updateScanList(): void {
             <span class="si-sym">${esc(sym)}${isReplica ? '<span class="replica">COPYCAT?</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
         </div>`;
     })
     .join('');
 
-  list.querySelectorAll<HTMLElement>('.scan-item').forEach((el) => {
-    el.addEventListener('click', () => {
-      const addr = el.getAttribute('data-addr');
-      if (addr) void analyze(addr, true);
-    });
-  });
+  wireRowHandlers(list);
 }
 
 /* ── Live feed: real-time auto-scan of the newest launches ─────────────── */
@@ -585,24 +585,57 @@ function updateLiveList(): void {
       const sym = r.symbol ?? short(r.address);
       const reason = r.insufficientData
         ? 'Not enough data yet'
-        : (r.topReason ?? 'Lower observed risk — not a buy signal');
+        : (r.topReason ??
+          (r.unverified
+            ? 'Early checks clean — holders/LP not verified yet (click for full scan)'
+            : 'No risk factors triggered — still not a buy signal'));
       return `
         <div class="scan-item" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span></span>
+            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span>${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
         </div>`;
     })
     .join('');
 
+  wireRowHandlers(list);
+}
+
+/** Row click = full scan; ⧉ = one-click copy of the mint address. */
+function wireRowHandlers(list: HTMLElement): void {
   list.querySelectorAll<HTMLElement>('.scan-item').forEach((el) => {
     el.addEventListener('click', () => {
       const addr = el.getAttribute('data-addr');
       if (addr) void analyze(addr, true);
     });
   });
+  list.querySelectorAll<HTMLButtonElement>('.copy').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      copyToClipboard(btn.getAttribute('data-copy') ?? '', btn);
+    });
+  });
+}
+
+function copyToClipboard(text: string, btn: HTMLButtonElement): void {
+  if (!text) return;
+  void navigator.clipboard
+    .writeText(text)
+    .then(() => {
+      const prev = btn.textContent;
+      btn.textContent = '✓';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = prev;
+        btn.classList.remove('copied');
+      }, 1200);
+    })
+    .catch(() => {
+      btn.textContent = '✕';
+    });
 }
 
 function ageShort(m: number | null): string {
@@ -659,6 +692,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
       <span class="score">${risk.riskScore}</span>
       <span class="sym" title="${esc(analysis.identity.address)}">${esc(sym)}</span>
       ${mock ? '<span class="mock">MOCK</span>' : ''}
+      <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">⧉</button>
     </div>
     <div class="top-reason">${esc(topReason)}</div>
     <div class="row">
@@ -669,6 +703,8 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
     <button class="back-btn" style="margin-top:10px">← Scan another token</button>`;
 
   body.querySelector('.back-btn')?.addEventListener('click', backToHome);
+  const copyBtn = body.querySelector<HTMLButtonElement>('.copy');
+  copyBtn?.addEventListener('click', () => copyToClipboard(analysis.identity.address, copyBtn));
 
   const panel = body.querySelector<HTMLDivElement>('.panel');
   const btn = body.querySelector<HTMLButtonElement>('.details-btn');

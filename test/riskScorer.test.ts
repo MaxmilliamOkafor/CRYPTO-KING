@@ -157,4 +157,31 @@ test('Token-2022 very-high fee outranks the high-fee tier (replaces, not additiv
   assert.equal(r.reasons.length, 1);
 });
 
+test('launchpad factors: bonding curve + brand-new age score 20 → CONSIDER', () => {
+  const fresh: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  fresh.identity = { ...fresh.identity, ageMinutes: 4 };
+  fresh.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false };
+  fresh.socials = null; // mute mitigations for exact arithmetic
+  fresh.smartMoney = null;
+  const r = scoreToken(fresh);
+  assert.equal(r.riskScore, 20); // +10 bonding curve, +10 brand-new
+  assert.equal(r.signal, 'CONSIDER');
+  assert.ok(r.reasons.some((x) => /bonding curve/i.test(x.text)));
+  assert.ok(r.reasons.some((x) => /Brand-new launch/.test(x.text)));
+});
+
+test('platform-banned coins take +30 and cannot look clean', () => {
+  const banned: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  banned.launch = { platform: 'pumpfun', bondingCurveComplete: true, bannedOnPlatform: true };
+  banned.socials = null;
+  banned.smartMoney = null;
+  const r = scoreToken(banned);
+  assert.equal(r.riskScore, 30);
+  assert.ok(r.reasons.some((x) => /Banned/.test(x.text)));
+});
+
+test('launch factors never fire when the launchpad is unknown (fixtures unchanged)', () => {
+  assert.equal(scoreToken(FIXTURE_NEUTRAL).riskScore, 0); // launch: null → no launchpad points
+});
+
 console.log(`\n${passed} tests passed.`);

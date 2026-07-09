@@ -125,6 +125,8 @@ var FIXTURE_AVOID = {
   socials: { website: null, twitter: null, telegram: null, verified: null },
   // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -175,6 +177,8 @@ var FIXTURE_WATCH = {
   socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
   // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -228,6 +232,8 @@ var FIXTURE_NEUTRAL = {
   },
   smartMoney: { accumulating: true, exiting: false, walletCount: 6 },
   // -10 (strong)
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -477,6 +483,10 @@ var STYLES = `
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
+  .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
+  .copy:hover { color: #fff; background: #2a2f3e; }
+  .copy.copied { color: #6fd08c; }
+  .uv { background: #1f2a3f; color: #8fb3ff; border: 1px solid #2e4a7a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
 `;
 function ensureHost() {
   if (host && shadow && document.body.contains(host)) return shadow;
@@ -536,7 +546,7 @@ function renderHome() {
     <div class="live-section">
       <div class="scan-head">
         <span class="live-dot"></span>
-        <span class="t">Live new launches \u2014 auto-scanning</span>
+        <span class="t">Live Solana launches \u2014 auto-scanning</span>
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
       </div>
       <div class="live-status">Starting live scan\u2026</div>
@@ -544,7 +554,7 @@ function renderHome() {
     </div>
 
     <div class="scan-section">
-      <div class="scan-head"><span class="t">Scan a specific coin</span></div>
+      <div class="scan-head"><span class="t">Scan a specific coin (Solana only)</span></div>
       <div class="scan-row">
         <input type="text" class="scan-input" placeholder="Token mint address or link" spellcheck="false" />
         <button class="scan-btn">Scan</button>
@@ -716,14 +726,10 @@ function updateScanList() {
             <span class="si-sym">${esc(sym)}${isReplica ? '<span class="replica">COPYCAT?</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
         </div>`;
   }).join("");
-  list.querySelectorAll(".scan-item").forEach((el) => {
-    el.addEventListener("click", () => {
-      const addr = el.getAttribute("data-addr");
-      if (addr) void analyze(addr, true);
-    });
-  });
+  wireRowHandlers(list);
 }
 var liveRows = [];
 var liveTimer = null;
@@ -782,21 +788,45 @@ function updateLiveList() {
     const bg = r.insufficientData ? "#3a3f4c" : meta.color;
     const fg = r.insufficientData ? "#e6e8ee" : meta.textColor;
     const sym = r.symbol ?? short(r.address);
-    const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? "Lower observed risk \u2014 not a buy signal";
+    const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? (r.unverified ? "Early checks clean \u2014 holders/LP not verified yet (click for full scan)" : "No risk factors triggered \u2014 still not a buy signal");
     return `
         <div class="scan-item" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span></span>
+            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span>${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
         </div>`;
   }).join("");
+  wireRowHandlers(list);
+}
+function wireRowHandlers(list) {
   list.querySelectorAll(".scan-item").forEach((el) => {
     el.addEventListener("click", () => {
       const addr = el.getAttribute("data-addr");
       if (addr) void analyze(addr, true);
     });
+  });
+  list.querySelectorAll(".copy").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      copyToClipboard(btn.getAttribute("data-copy") ?? "", btn);
+    });
+  });
+}
+function copyToClipboard(text, btn) {
+  if (!text) return;
+  void navigator.clipboard.writeText(text).then(() => {
+    const prev = btn.textContent;
+    btn.textContent = "\u2713";
+    btn.classList.add("copied");
+    setTimeout(() => {
+      btn.textContent = prev;
+      btn.classList.remove("copied");
+    }, 1200);
+  }).catch(() => {
+    btn.textContent = "\u2715";
   });
 }
 function ageShort(m) {
@@ -847,6 +877,7 @@ function render(analysis, risk, mock) {
       <span class="score">${risk.riskScore}</span>
       <span class="sym" title="${esc(analysis.identity.address)}">${esc(sym)}</span>
       ${mock ? '<span class="mock">MOCK</span>' : ""}
+      <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">\u29C9</button>
     </div>
     <div class="top-reason">${esc(topReason)}</div>
     <div class="row">
@@ -856,6 +887,8 @@ function render(analysis, risk, mock) {
     <div class="panel" hidden></div>
     <button class="back-btn" style="margin-top:10px">\u2190 Scan another token</button>`;
   body.querySelector(".back-btn")?.addEventListener("click", backToHome);
+  const copyBtn = body.querySelector(".copy");
+  copyBtn?.addEventListener("click", () => copyToClipboard(analysis.identity.address, copyBtn));
   const panel = body.querySelector(".panel");
   const btn = body.querySelector(".details-btn");
   btn?.addEventListener("click", () => {

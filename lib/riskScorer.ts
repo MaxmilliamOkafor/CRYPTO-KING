@@ -146,6 +146,23 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
     }
   }
 
+  /* ── Launch-platform reality (pump.fun etc.) ───────────────────────── */
+  const launch = a.launch;
+  if (launch) {
+    if (launch.bannedOnPlatform === true) {
+      hit(w.platformBanned, 'Banned/flagged on its own launch platform.');
+    }
+    if (launch.bondingCurveComplete === false) {
+      hit(w.bondingCurveActive, 'Still on the launch bonding curve — ultra-early, most such coins fail.');
+    }
+    if (a.identity.ageMinutes !== null && a.identity.ageMinutes < l.youngAgeMinutes) {
+      hit(
+        w.brandNewLaunch,
+        `Brand-new launch (${Math.round(a.identity.ageMinutes)} min) — the peak rug/failure window.`,
+      );
+    }
+  }
+
   /* ── Age & behavior ────────────────────────────────────────────────── */
   const b = a.behavior;
   if (b) {

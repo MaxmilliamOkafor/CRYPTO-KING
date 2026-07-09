@@ -139,6 +139,10 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       insufficientData: entry.risk.insufficientData,
+      unverified:
+        entry.analysis.holders === null ||
+        !entry.analysis.market ||
+        entry.analysis.market.lpStatus === 'unknown',
       scannedAt: Date.now(),
     };
     feed.set(c.mint, row);
@@ -178,7 +182,9 @@ function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
     title: `👑 ${sym} — score ${risk.riskScore} (${risk.signal})`,
-    message: `Fresh launch, lower observed risk (≠ safe). ${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ''}Click to open on GMGN.`,
+    message:
+      `Fresh launch, lower observed risk (≠ safe${row.unverified ? '; holders/LP unverified' : ''}). ` +
+      `${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ''}Click to open on GMGN.`,
   });
 }
 
@@ -222,11 +228,13 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
         : lite && !MOCK_MODE
           ? Promise.resolve(emptyGmgnData())
           : fetchGmgnData(address);
-    // All adapters degrade to honest "unavailable" internally; Promise.all is safe.
-    const [gmgn, solana, pumpfun, audit] = await Promise.all([
+    // pump.fun goes first: its bonding-curve accounts feed the lite holder scan
+    // (excluded from concentration math so the curve doesn't read as a whale).
+    const pumpfun = await fetchPumpfunData(address);
+    // Remaining adapters degrade to honest "unavailable" internally; Promise.all is safe.
+    const [gmgn, solana, audit] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite),
-      fetchPumpfunData(address),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts),
       rugcheckAdapter.fetchAudit(address),
     ]);
     const deployerHist = await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
@@ -351,6 +359,16 @@ function mergeSources(
     deployer,
     socials: gmgn.socials ?? pumpfun.socials,
     smartMoney: gmgn.smartMoney,
+    // Only attest launch-platform facts from a live pump.fun response — the
+    // mock path stays null so the fixture walkthrough arithmetic holds exactly.
+    launch:
+      pumpfun.status === 'ok'
+        ? {
+            platform: 'pumpfun',
+            bondingCurveComplete: pumpfun.bondingCurveComplete,
+            bannedOnPlatform: pumpfun.isBanned,
+          }
+        : null,
     sources,
     fetchedAt: Date.now(),
   };

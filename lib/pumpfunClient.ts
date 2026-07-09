@@ -30,6 +30,8 @@ export interface PumpfunData {
   isToken2022: boolean | null;
   creator: string | null;
   socials: SocialInfo | null;
+  /** Bonding-curve accounts — excluded from holder-concentration math in lite scans. */
+  bondingCurveAccounts: string[];
 }
 
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -48,6 +50,7 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
       isToken2022: f.mint?.isToken2022 ?? null,
       creator: null,
       socials: f.socials,
+      bondingCurveAccounts: [],
     };
   }
 
@@ -77,6 +80,11 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
       website || twitter || telegram
         ? { website, twitter, telegram, verified: null }
         : null,
+    bondingCurveAccounts: [
+      asString(pick(json, ['bonding_curve'])),
+      asString(pick(json, ['associated_bonding_curve'])),
+      asString(pick(json, ['pool_address'])),
+    ].filter((s): s is string => s !== null),
   };
 }
 
@@ -130,4 +138,5 @@ const EMPTY: PumpfunData = {
   isToken2022: null,
   creator: null,
   socials: null,
+  bondingCurveAccounts: [],
 };

@@ -27,20 +27,26 @@ export interface SolanaData {
 }
 
 /**
- * `lite` = mint account only (1 RPC call instead of 4). Used by the Live feed's
- * bulk scans: mint/freeze authority is the highest-weight rug check, and holder
- * math is deferred (honest data gap) until the user opens the coin — a full
- * scan then upgrades the cached result.
+ * `lite` = 3 RPC calls instead of 4+: mint account (mint/freeze authority — the
+ * top rug check) plus supply + largest accounts for holder concentration. The
+ * owner-resolution call is skipped; instead `excludeTokenAccounts` (the
+ * launchpad's bonding-curve accounts, known from pump.fun) are excluded by
+ * address. Used by the Live feed's bulk scans; opening a coin runs the full
+ * scan, which upgrades the cached result.
  */
-export async function fetchSolanaData(address: string, lite = false): Promise<SolanaData> {
+export async function fetchSolanaData(
+  address: string,
+  lite = false,
+  excludeTokenAccounts: string[] = [],
+): Promise<SolanaData> {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, status: 'mock' };
   }
 
   if (lite) {
-    const mint = await fetchMintInfo(address);
-    return { mint, holders: null, status: mint ? 'partial' : 'unavailable' };
+    const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts)]);
+    return { mint, holders, status: mint ? 'partial' : 'unavailable' };
   }
 
   const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address)]);
@@ -129,6 +135,38 @@ async function fetchHolderInfo(address: string): Promise<HolderInfo | null> {
     top10Pct: pct(realHolders.slice(0, 10)),
     largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
     bundledLaunchPct: null, // needs block-0..2 funding-graph analysis; honest "unknown" for now
+  };
+}
+
+/**
+ * Lite holder concentration: supply + largest accounts only (2 RPC calls).
+ * Excludes the given token accounts by ADDRESS (bonding-curve vaults) instead
+ * of resolving owners. Caveat: unknown AMM vaults are NOT excluded here, so
+ * concentration can read high for migrated coins — the full scan refines it.
+ */
+async function fetchHolderInfoLite(address: string, excludeTokenAccounts: string[]): Promise<HolderInfo | null> {
+  const [supplyRes, largestRes] = await Promise.all([
+    rpcCall(SOLANA.rpcUrl, 'getTokenSupply', [address, { commitment: 'confirmed' }]),
+    rpcCall(SOLANA.rpcUrl, 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
+  ]);
+
+  const supply = asNumber((supplyRes as { value?: { uiAmount?: unknown } } | null)?.value?.uiAmount);
+  const excluded = new Set(excludeTokenAccounts);
+  const accounts = ((largestRes as { value?: Array<{ address?: string; uiAmount?: unknown }> } | null)?.value ?? [])
+    .map((a) => ({ address: a.address ?? '', amount: asNumber(a.uiAmount) ?? 0 }))
+    .filter((a) => a.address && a.amount > 0 && !excluded.has(a.address));
+
+  if (supply === null || supply <= 0 || accounts.length === 0) return null;
+
+  const pct = (slice: Array<{ amount: number }>) =>
+    Math.min(100, (slice.reduce((s, a) => s + a.amount, 0) / supply) * 100);
+
+  return {
+    holderCount: null,
+    top5Pct: pct(accounts.slice(0, 5)),
+    top10Pct: pct(accounts.slice(0, 10)),
+    largestNonLpWalletPct: pct(accounts.slice(0, 1)),
+    bundledLaunchPct: null,
   };
 }
 

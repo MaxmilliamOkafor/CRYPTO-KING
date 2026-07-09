@@ -147,6 +147,13 @@ var WEIGHTS = {
   microMcapUnlockedLp: 15,
   // mcap < LIMITS.microMcapEur AND LP not secured
   mcapSpikeNoOrganicVolume: 10,
+  // Launch-platform reality (applies when the launchpad is identified)
+  platformBanned: 30,
+  // banned/flagged on its own launch platform
+  bondingCurveActive: 10,
+  // still on the bonding curve — ultra-early, pre-AMM
+  brandNewLaunch: 10,
+  // launchpad coin younger than LIMITS.youngAgeMinutes — peak failure window
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10,
   // age < LIMITS.youngAgeMinutes with abnormal volume
@@ -356,6 +363,8 @@ var FIXTURE_AVOID = {
   socials: { website: null, twitter: null, telegram: null, verified: null },
   // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -406,6 +415,8 @@ var FIXTURE_WATCH = {
   socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
   // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -459,6 +470,8 @@ var FIXTURE_NEUTRAL = {
   },
   smartMoney: { accumulating: true, exiting: false, walletCount: 6 },
   // -10 (strong)
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -685,7 +698,8 @@ async function fetchPumpfunData(address) {
       isBanned: false,
       isToken2022: f.mint?.isToken2022 ?? null,
       creator: null,
-      socials: f.socials
+      socials: f.socials,
+      bondingCurveAccounts: []
     };
   }
   if (!PUMPFUN.enabled) return { ...EMPTY2, status: "disabled" };
@@ -707,7 +721,12 @@ async function fetchPumpfunData(address) {
     isBanned: asBoolLoose(pick(json, ["is_banned"])),
     isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
     creator: asString(pick(json, ["creator"])),
-    socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null
+    socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null,
+    bondingCurveAccounts: [
+      asString(pick(json, ["bonding_curve"])),
+      asString(pick(json, ["associated_bonding_curve"])),
+      asString(pick(json, ["pool_address"]))
+    ].filter((s) => s !== null)
   };
 }
 var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -746,7 +765,8 @@ var EMPTY2 = {
   isBanned: null,
   isToken2022: null,
   creator: null,
-  socials: null
+  socials: null,
+  bondingCurveAccounts: []
 };
 
 // lib/riskScorer.ts
@@ -853,6 +873,21 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
       hit(
         w.bundledLaunch,
         `${h.bundledLaunchPct.toFixed(0)}% of supply was bundled/sniped at launch by wallets funded from one source.`
+      );
+    }
+  }
+  const launch = a.launch;
+  if (launch) {
+    if (launch.bannedOnPlatform === true) {
+      hit(w.platformBanned, "Banned/flagged on its own launch platform.");
+    }
+    if (launch.bondingCurveComplete === false) {
+      hit(w.bondingCurveActive, "Still on the launch bonding curve \u2014 ultra-early, most such coins fail.");
+    }
+    if (a.identity.ageMinutes !== null && a.identity.ageMinutes < l.youngAgeMinutes) {
+      hit(
+        w.brandNewLaunch,
+        `Brand-new launch (${Math.round(a.identity.ageMinutes)} min) \u2014 the peak rug/failure window.`
       );
     }
   }
@@ -965,14 +1000,14 @@ var rugcheckAdapter = {
 
 // lib/solanaClient.ts
 var TOKEN_2022_PROGRAM2 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchSolanaData(address, lite = false) {
+async function fetchSolanaData(address, lite = false, excludeTokenAccounts = []) {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, status: "mock" };
   }
   if (lite) {
-    const mint2 = await fetchMintInfo(address);
-    return { mint: mint2, holders: null, status: mint2 ? "partial" : "unavailable" };
+    const [mint2, holders2] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts)]);
+    return { mint: mint2, holders: holders2, status: mint2 ? "partial" : "unavailable" };
   }
   const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address)]);
   const status = mint && holders ? "ok" : mint || holders ? "partial" : "unavailable";
@@ -1038,6 +1073,24 @@ async function fetchHolderInfo(address) {
     largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
     bundledLaunchPct: null
     // needs block-0..2 funding-graph analysis; honest "unknown" for now
+  };
+}
+async function fetchHolderInfoLite(address, excludeTokenAccounts) {
+  const [supplyRes, largestRes] = await Promise.all([
+    rpcCall(SOLANA.rpcUrl, "getTokenSupply", [address, { commitment: "confirmed" }]),
+    rpcCall(SOLANA.rpcUrl, "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
+  ]);
+  const supply = asNumber(supplyRes?.value?.uiAmount);
+  const excluded = new Set(excludeTokenAccounts);
+  const accounts = (largestRes?.value ?? []).map((a) => ({ address: a.address ?? "", amount: asNumber(a.uiAmount) ?? 0 })).filter((a) => a.address && a.amount > 0 && !excluded.has(a.address));
+  if (supply === null || supply <= 0 || accounts.length === 0) return null;
+  const pct = (slice) => Math.min(100, slice.reduce((s, a) => s + a.amount, 0) / supply * 100);
+  return {
+    holderCount: null,
+    top5Pct: pct(accounts.slice(0, 5)),
+    top10Pct: pct(accounts.slice(0, 10)),
+    largestNonLpWalletPct: pct(accounts.slice(0, 1)),
+    bundledLaunchPct: null
   };
 }
 async function fetchOwners(tokenAccounts) {
@@ -1132,6 +1185,7 @@ async function doLiveFeedSweep() {
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       insufficientData: entry.risk.insufficientData,
+      unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()
     };
     feed.set(c.mint, row);
@@ -1157,7 +1211,7 @@ function maybeNotifyLowRisk(row, risk) {
     type: "basic",
     iconUrl: "icons/icon128.png",
     title: `\u{1F451} ${sym} \u2014 score ${risk.riskScore} (${risk.signal})`,
-    message: `Fresh launch, lower observed risk (\u2260 safe). ${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ""}Click to open on GMGN.`
+    message: `Fresh launch, lower observed risk (\u2260 safe${row.unverified ? "; holders/LP unverified" : ""}). ${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ""}Click to open on GMGN.`
   });
 }
 chrome.notifications?.onClicked.addListener((id) => {
@@ -1183,10 +1237,10 @@ async function analyzeToken(address, force, rawGmgn, lite = false) {
 async function doAnalyze(address, rawGmgn, lite = false) {
   try {
     const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : lite && !MOCK_MODE ? Promise.resolve(emptyGmgnData()) : fetchGmgnData(address);
-    const [gmgn, solana, pumpfun, audit] = await Promise.all([
+    const pumpfun = await fetchPumpfunData(address);
+    const [gmgn, solana, audit] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite),
-      fetchPumpfunData(address),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts),
       rugcheckAdapter.fetchAudit(address)
     ]);
     const deployerHist = await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
@@ -1266,6 +1320,13 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
     deployer,
     socials: gmgn.socials ?? pumpfun.socials,
     smartMoney: gmgn.smartMoney,
+    // Only attest launch-platform facts from a live pump.fun response — the
+    // mock path stays null so the fixture walkthrough arithmetic holds exactly.
+    launch: pumpfun.status === "ok" ? {
+      platform: "pumpfun",
+      bondingCurveComplete: pumpfun.bondingCurveComplete,
+      bannedOnPlatform: pumpfun.isBanned
+    } : null,
     sources,
     fetchedAt: Date.now()
   };

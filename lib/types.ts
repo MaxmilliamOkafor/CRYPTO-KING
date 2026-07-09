@@ -112,6 +112,15 @@ export interface SocialInfo {
   verified: boolean | null;
 }
 
+/** Launch-platform facts (pump.fun today; other launchpads pluggable). */
+export interface LaunchInfo {
+  platform: 'pumpfun' | null;
+  /** false = still on the bonding curve — ultra-early, pre-AMM. */
+  bondingCurveComplete: boolean | null;
+  /** true = banned/flagged on its own launch platform. */
+  bannedOnPlatform: boolean | null;
+}
+
 export interface SmartMoneyInfo {
   /** Known smart-money/KOL wallets currently accumulating (GMGN data). */
   accumulating: boolean | null;
@@ -133,6 +142,7 @@ export interface TokenAnalysis {
   deployer: DeployerInfo | null;
   socials: SocialInfo | null;
   smartMoney: SmartMoneyInfo | null;
+  launch: LaunchInfo | null;
   sources: {
     gmgn: SourceStatus;
     solana: SourceStatus;
@@ -225,6 +235,8 @@ export interface FeedRow {
   signal: Signal;
   topReason: string | null;
   insufficientData: boolean;
+  /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
+  unverified: boolean;
   scannedAt: number;
 }
 

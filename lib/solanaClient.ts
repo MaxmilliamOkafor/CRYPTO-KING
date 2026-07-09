@@ -13,7 +13,7 @@
  * MOCK_MODE returns fixture slices; no network calls.
  */
 
-import { MOCK_MODE, SOLANA } from '../config.ts';
+import { MOCK_MODE, SMART_MONEY_WALLETS, SOLANA } from '../config.ts';
 import { fixtureForAddress } from '../mock/fixtures.ts';
 import { asNumber, rpcCall } from './http.ts';
 import type { HolderInfo, MintInfo } from './types.ts';
@@ -155,12 +155,26 @@ async function fetchHolderInfo(address: string): Promise<HolderInfo | null> {
   const pct = (slice: Array<{ amount: number }>) =>
     Math.min(100, (slice.reduce((s, a) => s + a.amount, 0) / supply) * 100);
 
+  // The user's tracked smart-money wallets: % of supply they hold among the
+  // top accounts. Limited to the top-20 visible accounts — an honest floor.
+  const smartSet = new Set(SMART_MONEY_WALLETS);
+  const smartMoneyPct =
+    smartSet.size === 0
+      ? null
+      : Math.min(
+          100,
+          (accounts.reduce((s, a, i) => (owners[i] !== null && smartSet.has(owners[i] as string) ? s + a.amount : s), 0) /
+            supply) *
+            100,
+        );
+
   return {
     holderCount: null, // plain RPC has no cheap holder count; GMGN fills this in when live
     top5Pct: pct(realHolders.slice(0, 5)),
     top10Pct: pct(realHolders.slice(0, 10)),
     largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
     bundledLaunchPct: null, // needs block-0..2 funding-graph analysis; honest "unknown" for now
+    smartMoneyPct,
   };
 }
 
@@ -193,6 +207,7 @@ async function fetchHolderInfoLite(address: string, excludeTokenAccounts: string
     top10Pct: pct(accounts.slice(0, 10)),
     largestNonLpWalletPct: pct(accounts.slice(0, 1)),
     bundledLaunchPct: null,
+    smartMoneyPct: null, // needs owner resolution — full scans only
   };
 }
 

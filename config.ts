@@ -184,6 +184,28 @@ export const SOLANA = {
   ],
 };
 
+/**
+ * Smart-money wallets YOU track (KOLs, proven snipers…). Full scans compute
+ * what % of supply the top holders owned by these wallets control, feeding the
+ * quality score. Edit freely — addresses only, base58.
+ */
+export const SMART_MONEY_WALLETS: string[] = [];
+
+/**
+ * Narrative keyword table — matched against token name/symbol, shown as an
+ * INFORMATIONAL tag only (e.g. "Narrative: AI"). Deliberately worth ZERO
+ * points: naming a coin after a trend is free, and copycat scammers do exactly
+ * that. Edit the lists to track what's currently running.
+ */
+export const TRENDING_NARRATIVES: Record<string, string[]> = {
+  AI: ['ai', 'gpt', 'agent', 'neural', 'grok'],
+  Dog: ['dog', 'doge', 'shib', 'inu', 'wif', 'pup'],
+  Cat: ['cat', 'kitty', 'meow'],
+  Political: ['trump', 'maga', 'biden', 'election', 'president'],
+  Celebrity: ['elon', 'musk', 'kanye', 'drake'],
+  Frog: ['pepe', 'frog', 'toad'],
+};
+
 export const RUGCHECK = {
   /** Optional pluggable adapter — OFF by default; the API spec may drift. */
   enabled: false,
@@ -313,6 +335,9 @@ export const QUALITY_WEIGHTS = {
   survived24h: 5,
   curveTraction: 10, // still on the curve but real buyers pushed mcap ≥ curveTractionMinEur
   communityActivity: 5, // launchpad comment count ≥ minReplies
+  smartWalletStrong: 20, // YOUR tracked wallets hold ≥ smartWalletStrongPct of supply
+  smartWalletLight: 10, // …or ≥ smartWalletLightPct
+  provenDeployer: 10, // creator's prior launches mostly graduated (track record)
 } as const;
 
 export const QUALITY_LIMITS = {
@@ -325,6 +350,10 @@ export const QUALITY_LIMITS = {
   volMcapMax: 8,
   curveTractionMinEur: 20_000,
   minReplies: 20,
+  smartWalletStrongPct: 15,
+  smartWalletLightPct: 5,
+  minGraduationRate: 0.5, // provenDeployer needs ≥ this share of prior launches graduated…
+  minLaunchesForProven: 2, // …across at least this many prior launches
 } as const;
 
 /* ─────────────────────── 💎 gem background check ──────────────────────────

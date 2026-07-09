@@ -9,6 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
+import { matchNarratives } from '../lib/narratives.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
 import { FIXTURE_AVOID, FIXTURE_NEUTRAL, FIXTURE_WATCH } from '../mock/fixtures.ts';
@@ -106,8 +107,8 @@ test('score clamps at 100 when everything is on fire', () => {
     abnormalEarlyVolume: true,
   };
   worst.identity = { ...worst.identity, ageMinutes: 5 };
-  worst.deployer = { priorRugs: 3, fundingSource: 'known_rugger', priorLaunches: null, priorDeadLaunches: null };
-  worst.holders = { holderCount: 900, top5Pct: 91, top10Pct: 95, largestNonLpWalletPct: 55, bundledLaunchPct: 60 };
+  worst.deployer = { priorRugs: 3, fundingSource: 'known_rugger', priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null };
+  worst.holders = { holderCount: 900, top5Pct: 91, top10Pct: 95, largestNonLpWalletPct: 55, bundledLaunchPct: 60, smartMoneyPct: null };
   const r = scoreToken(worst);
   assert.equal(r.riskScore, 100);
   assert.equal(r.signal, 'AVOID');
@@ -229,7 +230,7 @@ test('serial deployer: many prior dead launches triggers +15', () => {
   const serial: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
   serial.socials = null;
   serial.smartMoney = null;
-  serial.deployer = { priorRugs: null, fundingSource: 'unknown', priorLaunches: 8, priorDeadLaunches: 7 };
+  serial.deployer = { priorRugs: null, fundingSource: 'unknown', priorLaunches: 8, priorDeadLaunches: 7, graduatedLaunches: 1 };
   const r = scoreToken(serial);
   assert.equal(r.riskScore, 15);
   assert.ok(r.reasons.some((x) => /Serial launcher/.test(x.text)));
@@ -260,6 +261,34 @@ test('quality reports insufficientData when nothing was fetchable', () => {
   const q = scoreQuality(empty);
   assert.equal(q.insufficientData, true);
   assert.equal(q.qualityScore, 0);
+});
+
+test('tracked smart-money wallets add quality (no double count with GMGN flow)', () => {
+  const t: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  t.smartMoney = { accumulating: false, exiting: false, walletCount: 0 }; // GMGN axis silent
+  t.holders = { ...t.holders!, smartMoneyPct: 18 };
+  const q = scoreQuality(t);
+  assert.ok(q.reasons.some((x) => /Your tracked wallets hold 18\.0%/.test(x.text)));
+  // With GMGN accumulating, tracked-wallet points must NOT stack:
+  const both: TokenAnalysis = structuredClone(t);
+  both.smartMoney = { accumulating: true, exiting: false, walletCount: 6 };
+  const q2 = scoreQuality(both);
+  assert.ok(!q2.reasons.some((x) => /tracked wallets/.test(x.text)));
+});
+
+test('proven deployer track record adds quality; poor record does not', () => {
+  const proven: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  proven.deployer = { ...proven.deployer!, priorLaunches: 4, priorDeadLaunches: 1, graduatedLaunches: 3 };
+  assert.ok(scoreQuality(proven).reasons.some((x) => /3\/4 prior launches graduated/.test(x.text)));
+  const poor: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  poor.deployer = { ...poor.deployer!, priorLaunches: 4, priorDeadLaunches: 3, graduatedLaunches: 1 };
+  assert.ok(!scoreQuality(poor).reasons.some((x) => /prior launches graduated/.test(x.text)));
+});
+
+test('narrative matcher tags name/symbol hits; informational only', () => {
+  assert.deepEqual(matchNarratives('Grok Agent Coin', 'GAI'), ['AI']);
+  assert.deepEqual(matchNarratives('quokka', 'QUOKKA'), []);
+  assert.ok(matchNarratives('TrumpWifHat', 'TWH').includes('Political'));
 });
 
 /* ── 💎 gem background check ───────────────────────────────────────────── */

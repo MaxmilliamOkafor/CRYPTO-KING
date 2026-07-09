@@ -250,6 +250,7 @@ const STYLES = `
   .sort-toggle:hover { border-color: #7aa2ff; }
   .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
   .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
+  .ntag { background: #221a33; color: #b79bff; border: 1px solid #45348a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; }
   .quality-line { color: #9fd8b1; font-size: 11.5px; margin: -2px 0 8px; }
   .quality-line .muted { color: #8a91a0; font-size: 10px; }
   .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
@@ -333,6 +334,8 @@ function renderHome(): void {
       <div class="live-controls">
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
         <label class="safe-toggle"><input type="checkbox" class="low-cap" /> low caps only</label>
+        <label class="safe-toggle"><input type="checkbox" class="fresh-only" /> fresh &lt;1h</label>
+        <label class="safe-toggle"><input type="checkbox" class="grad-only" /> graduated</label>
         <button class="sort-toggle" title="Toggle between newest-first and best quality−risk first">Sort: newest</button>
       </div>
       <div class="live-status">Starting live scan…</div>
@@ -397,6 +400,22 @@ function renderHome(): void {
     lowCapToggle.checked = liveLowCapOnly;
     lowCapToggle.addEventListener('change', () => {
       liveLowCapOnly = lowCapToggle.checked;
+      updateLiveList();
+    });
+  }
+  const freshToggle = body.querySelector<HTMLInputElement>('.fresh-only');
+  if (freshToggle) {
+    freshToggle.checked = liveFreshOnly;
+    freshToggle.addEventListener('change', () => {
+      liveFreshOnly = freshToggle.checked;
+      updateLiveList();
+    });
+  }
+  const gradToggle = body.querySelector<HTMLInputElement>('.grad-only');
+  if (gradToggle) {
+    gradToggle.checked = liveGraduatedOnly;
+    gradToggle.addEventListener('change', () => {
+      liveGraduatedOnly = gradToggle.checked;
       updateLiveList();
     });
   }
@@ -579,6 +598,8 @@ let liveTimer: ReturnType<typeof setInterval> | null = null;
 let livePolling = false;
 let liveSafeOnly = false;
 let liveLowCapOnly = false;
+let liveFreshOnly = false;
+let liveGraduatedOnly = false;
 let liveSortBest = false;
 
 function startLiveFeed(): void {
@@ -669,6 +690,8 @@ function updateLiveList(): void {
   if (liveLowCapOnly) {
     rows = rows.filter((r) => (r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur) || isGem(r));
   }
+  if (liveFreshOnly) rows = rows.filter((r) => r.ageMinutes !== null && r.ageMinutes < 60);
+  if (liveGraduatedOnly) rows = rows.filter((r) => r.graduated === true);
   if (liveSortBest) {
     // 🏆 composite: strongest observed quality minus risk first. A ranking aid
     // for research — NOT a profit prediction.
@@ -704,6 +727,7 @@ function updateLiveList(): void {
               <span class="age">${esc(ageShort(r.ageMinutes))}</span>
               ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ''}
               ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals — not a profit prediction">Q${r.qualityScore}</span>` : ''}
+              ${r.narratives.length > 0 ? `<span class="ntag" title="Narrative tag — informational only, scammers ride trends too">${esc(r.narratives.slice(0, 2).join('·'))}</span>` : ''}
               ${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
@@ -775,6 +799,7 @@ interface InlineResult {
   score: number;
   signal: Signal;
   topReason: string | null;
+  quality: number | null;
   insufficient: boolean;
   unverified: boolean;
 }
@@ -896,10 +921,11 @@ function pumpInlineQueue(): void {
                 score: res.risk.riskScore,
                 signal: res.risk.signal,
                 topReason: res.risk.reasons[0]?.text ?? null,
+                quality: res.quality.insufficientData ? null : res.quality.qualityScore,
                 insufficient: res.risk.insufficientData,
                 unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === 'unknown',
               }
-            : { score: 0, signal: 'NEUTRAL', topReason: null, insufficient: true, unverified: true },
+            : { score: 0, signal: 'NEUTRAL', topReason: null, quality: null, insufficient: true, unverified: true },
         );
         paintBadges(mint);
       })
@@ -920,7 +946,9 @@ function paintBadges(mint: string): void {
   const fg = result.insufficient ? '#e6e8ee' : meta.textColor;
   const tip = result.insufficient
     ? 'CRYPTO-KING: not enough data — click for details'
-    : `CRYPTO-KING: ${result.score}/100 ${meta.label}${result.unverified ? ' (holders/LP not verified yet)' : ''}` +
+    : `CRYPTO-KING: risk ${result.score}/100 ${meta.label}` +
+      `${result.quality !== null ? ` · quality ${result.quality}/100` : ''}` +
+      `${result.unverified ? ' (holders/LP not verified yet)' : ''}` +
       `${result.topReason ? ` — ${result.topReason}` : ''} · click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {

@@ -57,6 +57,7 @@ export const FIXTURE_AVOID: TokenAnalysis = {
     top10Pct: 72, // +15
     largestNonLpWalletPct: 18,
     bundledLaunchPct: 10,
+    smartMoneyPct: null,
   },
   market: {
     priceEur: 0.00031,
@@ -73,10 +74,11 @@ export const FIXTURE_AVOID: TokenAnalysis = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false,
   },
-  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: { website: null, twitter: null, telegram: null, verified: null }, // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: 'mock', solana: 'mock', pumpfun: 'mock', rugcheck: 'mock', deployer: 'mock' },
   fetchedAt: now(),
 };
@@ -122,6 +124,7 @@ export const FIXTURE_WATCH: TokenAnalysis = {
     top10Pct: 65, // +15
     largestNonLpWalletPct: 11,
     bundledLaunchPct: 9,
+    smartMoneyPct: null,
   },
   market: {
     priceEur: 0.0014,
@@ -138,10 +141,11 @@ export const FIXTURE_WATCH: TokenAnalysis = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: true,
   },
-  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: { website: 'https://wifcat.example', twitter: 'https://x.com/wifcat', telegram: null, verified: false }, // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: 'mock', solana: 'mock', pumpfun: 'mock', rugcheck: 'mock', deployer: 'mock' },
   fetchedAt: now(),
 };
@@ -186,6 +190,7 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     top10Pct: 24,
     largestNonLpWalletPct: 4.5,
     bundledLaunchPct: 2,
+    smartMoneyPct: null,
   },
   market: {
     priceEur: 0.021,
@@ -202,7 +207,7 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false,
   },
-  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: {
     website: 'https://quokka.example',
     twitter: 'https://x.com/quokka',
@@ -211,6 +216,7 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
   },
   smartMoney: { accumulating: true, exiting: false, walletCount: 6 }, // -10 (strong)
   launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: 'mock', solana: 'mock', pumpfun: 'mock', rugcheck: 'mock', deployer: 'mock' },
   fetchedAt: now(),
 };

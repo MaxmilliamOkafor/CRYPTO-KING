@@ -18,6 +18,7 @@ import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
+import { matchNarratives } from '../lib/narratives.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
@@ -173,6 +174,8 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       topReason: entry.risk.reasons[0]?.text ?? null,
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
       gem: verdict.gem,
+      graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
+      narratives: entry.analysis.narratives,
       insufficientData: entry.risk.insufficientData,
       unverified:
         entry.analysis.holders === null ||
@@ -345,6 +348,7 @@ function mergeSources(
           top10Pct: solana.holders?.top10Pct ?? gmgn.top10Pct,
           largestNonLpWalletPct: solana.holders?.largestNonLpWalletPct ?? null,
           bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct,
+          smartMoneyPct: solana.holders?.smartMoneyPct ?? null,
         }
       : null;
 
@@ -384,15 +388,18 @@ function mergeSources(
         }
       : null);
 
+  const symbol = gmgn.symbol ?? pumpfun.symbol;
+  const name = gmgn.name ?? pumpfun.name;
   return {
     identity: {
       address,
-      symbol: gmgn.symbol ?? pumpfun.symbol,
-      name: gmgn.name ?? pumpfun.name,
+      symbol,
+      name,
       chain: 'sol',
       ageMinutes: gmgn.ageMinutes ?? pumpfun.ageMinutes,
       logoUri: null,
     },
+    narratives: matchNarratives(name, symbol),
     mint,
     holders,
     market,

@@ -164,7 +164,8 @@ var FIXTURE_AVOID = {
     top10Pct: 72,
     // +15
     largestNonLpWalletPct: 18,
-    bundledLaunchPct: 10
+    bundledLaunchPct: 10,
+    smartMoneyPct: null
   },
   market: {
     priceEur: 31e-5,
@@ -182,12 +183,13 @@ var FIXTURE_AVOID = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false
   },
-  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: { website: null, twitter: null, telegram: null, verified: null },
   // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null,
   // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -220,7 +222,8 @@ var FIXTURE_WATCH = {
     top10Pct: 65,
     // +15
     largestNonLpWalletPct: 11,
-    bundledLaunchPct: 9
+    bundledLaunchPct: 9,
+    smartMoneyPct: null
   },
   market: {
     priceEur: 14e-4,
@@ -238,12 +241,13 @@ var FIXTURE_WATCH = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: true
   },
-  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
   // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null,
   // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -274,7 +278,8 @@ var FIXTURE_NEUTRAL = {
     top5Pct: 15,
     top10Pct: 24,
     largestNonLpWalletPct: 4.5,
-    bundledLaunchPct: 2
+    bundledLaunchPct: 2,
+    smartMoneyPct: null
   },
   market: {
     priceEur: 0.021,
@@ -291,7 +296,7 @@ var FIXTURE_NEUTRAL = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false
   },
-  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: {
     website: "https://quokka.example",
     twitter: "https://x.com/quokka",
@@ -303,6 +308,7 @@ var FIXTURE_NEUTRAL = {
   // -10 (strong)
   launch: null,
   // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -575,6 +581,7 @@ var STYLES = `
   .sort-toggle:hover { border-color: #7aa2ff; }
   .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
   .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
+  .ntag { background: #221a33; color: #b79bff; border: 1px solid #45348a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; }
   .quality-line { color: #9fd8b1; font-size: 11.5px; margin: -2px 0 8px; }
   .quality-line .muted { color: #8a91a0; font-size: 10px; }
   .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
@@ -648,6 +655,8 @@ function renderHome() {
       <div class="live-controls">
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
         <label class="safe-toggle"><input type="checkbox" class="low-cap" /> low caps only</label>
+        <label class="safe-toggle"><input type="checkbox" class="fresh-only" /> fresh &lt;1h</label>
+        <label class="safe-toggle"><input type="checkbox" class="grad-only" /> graduated</label>
         <button class="sort-toggle" title="Toggle between newest-first and best quality\u2212risk first">Sort: newest</button>
       </div>
       <div class="live-status">Starting live scan\u2026</div>
@@ -711,6 +720,22 @@ function renderHome() {
     lowCapToggle.checked = liveLowCapOnly;
     lowCapToggle.addEventListener("change", () => {
       liveLowCapOnly = lowCapToggle.checked;
+      updateLiveList();
+    });
+  }
+  const freshToggle = body.querySelector(".fresh-only");
+  if (freshToggle) {
+    freshToggle.checked = liveFreshOnly;
+    freshToggle.addEventListener("change", () => {
+      liveFreshOnly = freshToggle.checked;
+      updateLiveList();
+    });
+  }
+  const gradToggle = body.querySelector(".grad-only");
+  if (gradToggle) {
+    gradToggle.checked = liveGraduatedOnly;
+    gradToggle.addEventListener("change", () => {
+      liveGraduatedOnly = gradToggle.checked;
       updateLiveList();
     });
   }
@@ -854,6 +879,8 @@ var liveTimer = null;
 var livePolling = false;
 var liveSafeOnly = false;
 var liveLowCapOnly = false;
+var liveFreshOnly = false;
+var liveGraduatedOnly = false;
 var liveSortBest = false;
 function startLiveFeed() {
   if (liveTimer) return;
@@ -922,6 +949,8 @@ function updateLiveList() {
   if (liveLowCapOnly) {
     rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur || isGem(r));
   }
+  if (liveFreshOnly) rows = rows.filter((r) => r.ageMinutes !== null && r.ageMinutes < 60);
+  if (liveGraduatedOnly) rows = rows.filter((r) => r.graduated === true);
   if (liveSortBest) {
     rows.sort((a, b) => (b.qualityScore ?? 0) - b.riskScore - ((a.qualityScore ?? 0) - a.riskScore));
   }
@@ -945,6 +974,7 @@ function updateLiveList() {
               <span class="age">${esc(ageShort(r.ageMinutes))}</span>
               ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ""}
               ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals \u2014 not a profit prediction">Q${r.qualityScore}</span>` : ""}
+              ${r.narratives.length > 0 ? `<span class="ntag" title="Narrative tag \u2014 informational only, scammers ride trends too">${esc(r.narratives.slice(0, 2).join("\xB7"))}</span>` : ""}
               ${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
@@ -1094,9 +1124,10 @@ function pumpInlineQueue() {
           score: res.risk.riskScore,
           signal: res.risk.signal,
           topReason: res.risk.reasons[0]?.text ?? null,
+          quality: res.quality.insufficientData ? null : res.quality.qualityScore,
           insufficient: res.risk.insufficientData,
           unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === "unknown"
-        } : { score: 0, signal: "NEUTRAL", topReason: null, insufficient: true, unverified: true }
+        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, insufficient: true, unverified: true }
       );
       paintBadges(mint);
     }).finally(() => {
@@ -1113,7 +1144,7 @@ function paintBadges(mint) {
   const label = result.insufficient ? "\u{1F451} ?" : `\u{1F451} ${result.score} ${meta.label}${result.unverified ? "*" : ""}`;
   const bg = result.insufficient ? "#3a3f4c" : meta.color;
   const fg = result.insufficient ? "#e6e8ee" : meta.textColor;
-  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: ${result.score}/100 ${meta.label}${result.unverified ? " (holders/LP not verified yet)" : ""}${result.topReason ? ` \u2014 ${result.topReason}` : ""} \xB7 click for full breakdown`;
+  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: risk ${result.score}/100 ${meta.label}${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " (holders/LP not verified yet)" : ""}${result.topReason ? ` \u2014 ${result.topReason}` : ""} \xB7 click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
       els.delete(el);

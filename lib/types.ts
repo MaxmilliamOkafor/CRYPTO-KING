@@ -74,6 +74,8 @@ export interface HolderInfo {
   largestNonLpWalletPct: number | null;
   /** % of supply bought in blocks 0–2 by wallets funded from a single source ("bundled"/sniped launch). */
   bundledLaunchPct: number | null;
+  /** % of supply held by the user's configured SMART_MONEY_WALLETS (full scans only). */
+  smartMoneyPct: number | null;
 }
 
 export interface SellSimulation {
@@ -115,6 +117,8 @@ export interface DeployerInfo {
   priorLaunches: number | null;
   /** Of those, how many are dead/abandoned (never graduated, negligible mcap). */
   priorDeadLaunches: number | null;
+  /** Of those, how many graduated their bonding curve (creator track record). */
+  graduatedLaunches: number | null;
 }
 
 export interface SocialInfo {
@@ -158,6 +162,8 @@ export interface TokenAnalysis {
   socials: SocialInfo | null;
   smartMoney: SmartMoneyInfo | null;
   launch: LaunchInfo | null;
+  /** Matched narrative tags (informational only — never scored; see config.TRENDING_NARRATIVES). */
+  narratives: string[];
   sources: {
     gmgn: SourceStatus;
     solana: SourceStatus;
@@ -268,6 +274,10 @@ export interface FeedRow {
   qualityScore: number | null;
   /** true = passed the FULL 💎 background check (lib/gemCriteria.ts) on verified data. */
   gem: boolean;
+  /** true = graduated off its bonding curve; null = unknown/not a launchpad coin. */
+  graduated: boolean | null;
+  /** Informational narrative tags (never scored). */
+  narratives: string[];
   insufficientData: boolean;
   /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
   unverified: boolean;

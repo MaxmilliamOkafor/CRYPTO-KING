@@ -118,6 +118,15 @@ var SOLANA = {
     // system program (used as burn dest by some tools)
   ]
 };
+var SMART_MONEY_WALLETS = [];
+var TRENDING_NARRATIVES = {
+  AI: ["ai", "gpt", "agent", "neural", "grok"],
+  Dog: ["dog", "doge", "shib", "inu", "wif", "pup"],
+  Cat: ["cat", "kitty", "meow"],
+  Political: ["trump", "maga", "biden", "election", "president"],
+  Celebrity: ["elon", "musk", "kanye", "drake"],
+  Frog: ["pepe", "frog", "toad"]
+};
 var RUGCHECK = {
   /** Optional pluggable adapter — OFF by default; the API spec may drift. */
   enabled: false,
@@ -257,8 +266,14 @@ var QUALITY_WEIGHTS = {
   survived24h: 5,
   curveTraction: 10,
   // still on the curve but real buyers pushed mcap ≥ curveTractionMinEur
-  communityActivity: 5
+  communityActivity: 5,
   // launchpad comment count ≥ minReplies
+  smartWalletStrong: 20,
+  // YOUR tracked wallets hold ≥ smartWalletStrongPct of supply
+  smartWalletLight: 10,
+  // …or ≥ smartWalletLightPct
+  provenDeployer: 10
+  // creator's prior launches mostly graduated (track record)
 };
 var QUALITY_LIMITS = {
   healthyTop10Pct: 30,
@@ -269,7 +284,13 @@ var QUALITY_LIMITS = {
   volMcapMin: 0.2,
   volMcapMax: 8,
   curveTractionMinEur: 2e4,
-  minReplies: 20
+  minReplies: 20,
+  smartWalletStrongPct: 15,
+  smartWalletLightPct: 5,
+  minGraduationRate: 0.5,
+  // provenDeployer needs ≥ this share of prior launches graduated…
+  minLaunchesForProven: 2
+  // …across at least this many prior launches
 };
 var GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
@@ -320,7 +341,8 @@ var FIXTURE_AVOID = {
     top10Pct: 72,
     // +15
     largestNonLpWalletPct: 18,
-    bundledLaunchPct: 10
+    bundledLaunchPct: 10,
+    smartMoneyPct: null
   },
   market: {
     priceEur: 31e-5,
@@ -338,12 +360,13 @@ var FIXTURE_AVOID = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false
   },
-  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: { website: null, twitter: null, telegram: null, verified: null },
   // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null,
   // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -376,7 +399,8 @@ var FIXTURE_WATCH = {
     top10Pct: 65,
     // +15
     largestNonLpWalletPct: 11,
-    bundledLaunchPct: 9
+    bundledLaunchPct: 9,
+    smartMoneyPct: null
   },
   market: {
     priceEur: 14e-4,
@@ -394,12 +418,13 @@ var FIXTURE_WATCH = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: true
   },
-  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
   // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null,
   // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -430,7 +455,8 @@ var FIXTURE_NEUTRAL = {
     top5Pct: 15,
     top10Pct: 24,
     largestNonLpWalletPct: 4.5,
-    bundledLaunchPct: 2
+    bundledLaunchPct: 2,
+    smartMoneyPct: null
   },
   market: {
     priceEur: 0.021,
@@ -447,7 +473,7 @@ var FIXTURE_NEUTRAL = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false
   },
-  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null },
   socials: {
     website: "https://quokka.example",
     twitter: "https://x.com/quokka",
@@ -459,6 +485,7 @@ var FIXTURE_NEUTRAL = {
   // -10 (strong)
   launch: null,
   // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  narratives: [],
   sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
   fetchedAt: now()
 };
@@ -679,7 +706,13 @@ var nullDeployerAdapter = {
   async fetchDeployerHistory() {
     return {
       status: "disabled",
-      deployer: { priorRugs: null, fundingSource: "unknown", priorLaunches: null, priorDeadLaunches: null }
+      deployer: {
+        priorRugs: null,
+        fundingSource: "unknown",
+        priorLaunches: null,
+        priorDeadLaunches: null,
+        graduatedLaunches: null
+      }
     };
   }
 };
@@ -693,6 +726,7 @@ var pumpfunDeployerAdapter = {
     const dead = prior.filter(
       (c) => c.complete === false && (c.usdMarketCap ?? 0) < 1e4 && c.createdMs !== null && c.createdMs < dayAgo
     );
+    const graduated = prior.filter((c) => c.complete === true);
     return {
       status: "ok",
       deployer: {
@@ -700,7 +734,8 @@ var pumpfunDeployerAdapter = {
         // we never claim "rug" from launch records alone
         fundingSource: "unknown",
         priorLaunches: prior.length,
-        priorDeadLaunches: dead.length
+        priorDeadLaunches: dead.length,
+        graduatedLaunches: graduated.length
       }
     };
   }
@@ -774,6 +809,17 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push("Creator's launch history not checked yet.");
   }
   return { gem: blockers.length === 0, blockers };
+}
+
+// lib/narratives.ts
+function matchNarratives(name, symbol, table = TRENDING_NARRATIVES) {
+  const haystack = `${name ?? ""} ${symbol ?? ""}`.toLowerCase();
+  if (haystack.trim() === "") return [];
+  const out = [];
+  for (const [narrative, keywords] of Object.entries(table)) {
+    if (keywords.some((kw) => haystack.includes(kw.toLowerCase()))) out.push(narrative);
+  }
+  return out;
 }
 
 // lib/gmgnClient.ts
@@ -975,12 +1021,23 @@ function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
     return { qualityScore: 0, reasons, insufficientData: true };
   }
   const sm = a.smartMoney;
+  const trackedPct = a.holders?.smartMoneyPct ?? null;
   if (sm?.accumulating === true && sm.exiting !== true) {
     const strong = sm.walletCount !== null && sm.walletCount >= 3;
     hit(
       strong ? w.smartMoneyStrong : w.smartMoneyLight,
       `Smart-money wallets accumulating${sm.walletCount ? ` (${sm.walletCount})` : ""}.`
     );
+  } else if (trackedPct !== null && trackedPct >= l.smartWalletLightPct) {
+    const strong = trackedPct >= l.smartWalletStrongPct;
+    hit(
+      strong ? w.smartWalletStrong : w.smartWalletLight,
+      `Your tracked wallets hold ${trackedPct.toFixed(1)}% of supply.`
+    );
+  }
+  const d = a.deployer;
+  if (d?.priorLaunches !== null && d?.priorLaunches !== void 0 && d.graduatedLaunches !== null && d.priorLaunches >= l.minLaunchesForProven && d.graduatedLaunches / d.priorLaunches >= l.minGraduationRate) {
+    hit(w.provenDeployer, `Creator track record: ${d.graduatedLaunches}/${d.priorLaunches} prior launches graduated.`);
   }
   const s = a.socials;
   if (s?.verified === true) hit(w.verifiedSocials, "Verified website/Twitter/Telegram.");
@@ -1385,14 +1442,20 @@ async function fetchHolderInfo(address) {
     return owner === null || !excluded.has(owner);
   });
   const pct = (slice) => Math.min(100, slice.reduce((s, a) => s + a.amount, 0) / supply * 100);
+  const smartSet = new Set(SMART_MONEY_WALLETS);
+  const smartMoneyPct = smartSet.size === 0 ? null : Math.min(
+    100,
+    accounts.reduce((s, a, i) => owners[i] !== null && smartSet.has(owners[i]) ? s + a.amount : s, 0) / supply * 100
+  );
   return {
     holderCount: null,
     // plain RPC has no cheap holder count; GMGN fills this in when live
     top5Pct: pct(realHolders.slice(0, 5)),
     top10Pct: pct(realHolders.slice(0, 10)),
     largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
-    bundledLaunchPct: null
+    bundledLaunchPct: null,
     // needs block-0..2 funding-graph analysis; honest "unknown" for now
+    smartMoneyPct
   };
 }
 async function fetchHolderInfoLite(address, excludeTokenAccounts) {
@@ -1410,7 +1473,9 @@ async function fetchHolderInfoLite(address, excludeTokenAccounts) {
     top5Pct: pct(accounts.slice(0, 5)),
     top10Pct: pct(accounts.slice(0, 10)),
     largestNonLpWalletPct: pct(accounts.slice(0, 1)),
-    bundledLaunchPct: null
+    bundledLaunchPct: null,
+    smartMoneyPct: null
+    // needs owner resolution — full scans only
   };
 }
 async function fetchOwners(tokenAccounts) {
@@ -1523,6 +1588,8 @@ async function doLiveFeedSweep() {
       topReason: entry.risk.reasons[0]?.text ?? null,
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
       gem: verdict.gem,
+      graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
+      narratives: entry.analysis.narratives,
       insufficientData: entry.risk.insufficientData,
       unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()
@@ -1627,7 +1694,8 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
     top5Pct: solana.holders?.top5Pct ?? null,
     top10Pct: solana.holders?.top10Pct ?? gmgn.top10Pct,
     largestNonLpWalletPct: solana.holders?.largestNonLpWalletPct ?? null,
-    bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct
+    bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct,
+    smartMoneyPct: solana.holders?.smartMoneyPct ?? null
   } : null;
   const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== "unknown" ? gmgn.lpStatus : auditLpStatus ?? gmgn.lpStatus ?? "unknown";
   const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
@@ -1647,15 +1715,18 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
     deployerLinkedSelling: null,
     abnormalEarlyVolume: null
   } : null);
+  const symbol = gmgn.symbol ?? pumpfun.symbol;
+  const name = gmgn.name ?? pumpfun.name;
   return {
     identity: {
       address,
-      symbol: gmgn.symbol ?? pumpfun.symbol,
-      name: gmgn.name ?? pumpfun.name,
+      symbol,
+      name,
       chain: "sol",
       ageMinutes: gmgn.ageMinutes ?? pumpfun.ageMinutes,
       logoUri: null
     },
+    narratives: matchNarratives(name, symbol),
     mint,
     holders,
     market,

@@ -29,14 +29,34 @@ export function scoreQuality(a: TokenAnalysis, w: QWeights = QUALITY_WEIGHTS, l:
     return { qualityScore: 0, reasons, insufficientData: true };
   }
 
-  /* Smart money (GMGN) */
+  /* Smart money — GMGN flow data first; else the user's own tracked wallets
+     (config.SMART_MONEY_WALLETS holdings). One axis, never double-counted. */
   const sm = a.smartMoney;
+  const trackedPct = a.holders?.smartMoneyPct ?? null;
   if (sm?.accumulating === true && sm.exiting !== true) {
     const strong = sm.walletCount !== null && sm.walletCount >= 3;
     hit(
       strong ? w.smartMoneyStrong : w.smartMoneyLight,
       `Smart-money wallets accumulating${sm.walletCount ? ` (${sm.walletCount})` : ''}.`,
     );
+  } else if (trackedPct !== null && trackedPct >= l.smartWalletLightPct) {
+    const strong = trackedPct >= l.smartWalletStrongPct;
+    hit(
+      strong ? w.smartWalletStrong : w.smartWalletLight,
+      `Your tracked wallets hold ${trackedPct.toFixed(1)}% of supply.`,
+    );
+  }
+
+  /* Creator track record (launchpad records) */
+  const d = a.deployer;
+  if (
+    d?.priorLaunches !== null &&
+    d?.priorLaunches !== undefined &&
+    d.graduatedLaunches !== null &&
+    d.priorLaunches >= l.minLaunchesForProven &&
+    d.graduatedLaunches / d.priorLaunches >= l.minGraduationRate
+  ) {
+    hit(w.provenDeployer, `Creator track record: ${d.graduatedLaunches}/${d.priorLaunches} prior launches graduated.`);
   }
 
   /* Socials */

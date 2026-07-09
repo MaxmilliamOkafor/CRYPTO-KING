@@ -32,7 +32,13 @@ export const nullDeployerAdapter: DeployerAdapter = {
   async fetchDeployerHistory(): Promise<DeployerHistory> {
     return {
       status: 'disabled',
-      deployer: { priorRugs: null, fundingSource: 'unknown', priorLaunches: null, priorDeadLaunches: null },
+      deployer: {
+        priorRugs: null,
+        fundingSource: 'unknown',
+        priorLaunches: null,
+        priorDeadLaunches: null,
+        graduatedLaunches: null,
+      },
     };
   },
 };
@@ -59,6 +65,7 @@ export const pumpfunDeployerAdapter: DeployerAdapter = {
         c.createdMs !== null &&
         c.createdMs < dayAgo,
     );
+    const graduated = prior.filter((c) => c.complete === true);
 
     return {
       status: 'ok',
@@ -67,6 +74,7 @@ export const pumpfunDeployerAdapter: DeployerAdapter = {
         fundingSource: 'unknown',
         priorLaunches: prior.length,
         priorDeadLaunches: dead.length,
+        graduatedLaunches: graduated.length,
       },
     };
   },

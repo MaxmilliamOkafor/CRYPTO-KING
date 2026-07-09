@@ -71,7 +71,8 @@ var LIVE_FEED = {
   notifyLowRisk: true,
   notifyMaxScore: 39,
   // CONSIDER / NEUTRAL territory
-  /** "Low caps only" feed filter threshold (early-stage hunting ground). */
+  /** "Low caps only" feed filter threshold (early-stage hunting ground).
+   *  💎 gem-grade coins stay visible even above this cap. */
   lowCapMaxEur: 1e5,
   /**
    * 💎 gem-alert threshold: a feed coin pulses gold when risk ≤ notifyMaxScore

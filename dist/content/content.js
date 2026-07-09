@@ -60,7 +60,8 @@ var LIVE_FEED = {
   notifyLowRisk: true,
   notifyMaxScore: 39,
   // CONSIDER / NEUTRAL territory
-  /** "Low caps only" feed filter threshold (early-stage hunting ground). */
+  /** "Low caps only" feed filter threshold (early-stage hunting ground).
+   *  💎 gem-grade coins stay visible even above this cap. */
   lowCapMaxEur: 1e5,
   /**
    * 💎 gem-alert threshold: a feed coin pulses gold when risk ≤ notifyMaxScore
@@ -877,7 +878,9 @@ function updateLiveList() {
   if (!list) return;
   let rows = [...liveRows];
   if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK");
-  if (liveLowCapOnly) rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur);
+  if (liveLowCapOnly) {
+    rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur || isGem(r));
+  }
   if (liveSortBest) {
     rows.sort((a, b) => (b.qualityScore ?? 0) - b.riskScore - ((a.qualityScore ?? 0) - a.riskScore));
   }

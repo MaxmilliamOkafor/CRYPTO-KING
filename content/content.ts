@@ -666,7 +666,11 @@ function updateLiveList(): void {
 
   let rows = [...liveRows];
   if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== 'AVOID' && r.signal !== 'HIGH_RISK');
-  if (liveLowCapOnly) rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur);
+  // "Low caps only" keeps 💎 gem-grade coins visible even above the cap —
+  // a strong candidate shouldn't vanish just because it already grew.
+  if (liveLowCapOnly) {
+    rows = rows.filter((r) => (r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur) || isGem(r));
+  }
   if (liveSortBest) {
     // 🏆 composite: strongest observed quality minus risk first. A ranking aid
     // for research — NOT a profit prediction.

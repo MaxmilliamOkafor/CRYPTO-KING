@@ -8,6 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
 import { FIXTURE_AVOID, FIXTURE_NEUTRAL, FIXTURE_WATCH } from '../mock/fixtures.ts';
 import type { TokenAnalysis } from '../lib/types.ts';
@@ -85,6 +86,10 @@ test('score clamps at 100 when everything is on fire', () => {
     isToken2022: true,
     transferFeeBps: 2500,
     feeAuthorityActive: true,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false,
   };
   worst.market = {
     ...worst.market!,
@@ -100,7 +105,7 @@ test('score clamps at 100 when everything is on fire', () => {
     abnormalEarlyVolume: true,
   };
   worst.identity = { ...worst.identity, ageMinutes: 5 };
-  worst.deployer = { priorRugs: 3, fundingSource: 'known_rugger' };
+  worst.deployer = { priorRugs: 3, fundingSource: 'known_rugger', priorLaunches: null, priorDeadLaunches: null };
   worst.holders = { holderCount: 900, top5Pct: 91, top10Pct: 95, largestNonLpWalletPct: 55, bundledLaunchPct: 60 };
   const r = scoreToken(worst);
   assert.equal(r.riskScore, 100);
@@ -182,6 +187,62 @@ test('platform-banned coins take +30 and cannot look clean', () => {
 
 test('launch factors never fire when the launchpad is unknown (fixtures unchanged)', () => {
   assert.equal(scoreToken(FIXTURE_NEUTRAL).riskScore, 0); // launch: null → no launchpad points
+});
+
+test('Token-2022 trap extensions (permanent delegate / hook / frozen / soulbound) max out risk', () => {
+  const trap: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  trap.socials = null;
+  trap.smartMoney = null;
+  trap.mint = {
+    ...trap.mint!,
+    isToken2022: true,
+    permanentDelegateActive: true, // +30
+    transferHookActive: true, // +20
+    defaultAccountFrozen: true, // +25
+    nonTransferable: true, // +30
+  };
+  const r = scoreToken(trap);
+  assert.equal(r.riskScore, 100); // 105 clamped
+  assert.equal(r.signal, 'AVOID');
+  assert.ok(r.reasons.some((x) => /seize tokens/i.test(x.text)));
+  assert.ok(r.reasons.some((x) => /NON-TRANSFERABLE/i.test(x.text)));
+});
+
+test('serial deployer: many prior dead launches triggers +15', () => {
+  const serial: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  serial.socials = null;
+  serial.smartMoney = null;
+  serial.deployer = { priorRugs: null, fundingSource: 'unknown', priorLaunches: 8, priorDeadLaunches: 7 };
+  const r = scoreToken(serial);
+  assert.equal(r.riskScore, 15);
+  assert.ok(r.reasons.some((x) => /Serial launcher/.test(x.text)));
+});
+
+/* ── Quality scorer (the positive axis) ────────────────────────────────── */
+
+test('QUOKKA quality: clean + smart money + burned LP + healthy holders → 100', () => {
+  const q = scoreQuality(FIXTURE_NEUTRAL);
+  assert.equal(q.qualityScore, 100); // 20+10+5+15+10+10+10+10+5+5 = 100 exactly
+  assert.equal(q.insufficientData, false);
+  assert.ok(q.reasons.some((x) => /Smart-money/.test(x.text)));
+  assert.ok(q.reasons.some((x) => /LP burned/.test(x.text)));
+});
+
+test('RUGKING quality stays low (20) — bad coins cannot fake quality', () => {
+  const q = scoreQuality(FIXTURE_AVOID);
+  assert.equal(q.qualityScore, 20); // holders 3100 (+5), liq depth 20% (+10), organic volume (+5)
+});
+
+test('quality reports insufficientData when nothing was fetchable', () => {
+  const empty: TokenAnalysis = {
+    ...structuredClone(FIXTURE_NEUTRAL),
+    mint: null,
+    market: null,
+    holders: null,
+  };
+  const q = scoreQuality(empty);
+  assert.equal(q.insufficientData, true);
+  assert.equal(q.qualityScore, 0);
 });
 
 console.log(`\n${passed} tests passed.`);

@@ -27,6 +27,7 @@ import type {
   AnalyzeResponse,
   FeedRow,
   LiveFeedResponse,
+  QualityResult,
   ResolvePairsResponse,
   RiskResult,
   Signal,
@@ -120,7 +121,7 @@ async function analyze(address: string, _manual = false): Promise<void> {
     showError(res.error);
     return;
   }
-  render(res.analysis, res.risk, res.mock);
+  render(res.analysis, res.risk, res.quality, res.mock);
 }
 
 /* ── Persistent on-page assistant (shadow DOM) ─────────────────────────── */
@@ -193,12 +194,30 @@ const STYLES = `
   .muted { color: #9aa1af; }
   /* collapsed floating button */
   .fab {
+    position: relative;
     width: 46px; height: 46px; border-radius: 50%;
     background: linear-gradient(135deg,#2f6df6,#1b3fae); color: #fff;
     box-shadow: 0 8px 24px rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center;
     font-size: 22px; cursor: pointer; border: 1px solid #3a5bd0;
   }
   .fab:hover { filter: brightness(1.1); }
+  @keyframes gemPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,200,60,.65); }
+    50% { box-shadow: 0 0 14px 5px rgba(255,200,60,.25); }
+  }
+  .fab.gem-alert { border-color: #ffc83c; animation: gemPulse 1.2s infinite; }
+  .fab-badge {
+    position: absolute; top: -4px; right: -4px;
+    min-width: 18px; height: 18px; border-radius: 999px;
+    background: #ffc83c; color: #1b1b18; font: 800 11px/18px system-ui, sans-serif;
+    text-align: center; padding: 0 4px; border: 1px solid #b8860b;
+  }
+  .scan-item.gem {
+    border: 1px solid #b8860b; border-radius: 8px;
+    background: linear-gradient(90deg, #251f0e, #1a1d24);
+    animation: gemPulse 1.8s infinite;
+  }
+  .scan-item.gem:hover { background: linear-gradient(90deg, #2c2510, #1e222b); }
   /* page scan list */
   .scan-section { margin-top: 12px; border-top: 1px solid #2c303a; padding-top: 10px; }
   .scan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -225,6 +244,13 @@ const STYLES = `
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
+  .live-controls { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; flex-wrap: wrap; }
+  .sort-toggle { color: #7aa2ff; font-size: 10.5px; padding: 1px 6px; border: 1px solid #2c303a; border-radius: 6px; }
+  .sort-toggle:hover { border-color: #7aa2ff; }
+  .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
+  .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
+  .quality-line { color: #9fd8b1; font-size: 11.5px; margin: -2px 0 8px; }
+  .quality-line .muted { color: #8a91a0; font-size: 10px; }
   .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
   .copy:hover { color: #fff; background: #2a2f3e; }
   .copy.copied { color: #6fd08c; }
@@ -251,11 +277,15 @@ function wrapEl(): HTMLDivElement {
   return root.querySelector('.wrap') as HTMLDivElement;
 }
 
-/** Render the collapsed crown button. */
+/** Render the collapsed crown button. Live polling KEEPS running while
+ *  minimized so the crown can pulse gold when a 💎 candidate appears. */
 function renderCollapsed(): void {
   const w = wrapEl();
-  w.innerHTML = `<div class="fab" title="Open CRYPTO-KING risk scanner">👑</div>`;
-  stopLiveFeed(); // no polling while minimized
+  w.innerHTML = `
+    <div class="fab" title="Open CRYPTO-KING risk scanner">👑
+      <span class="fab-badge" hidden>0</span>
+    </div>`;
+  refreshGemAlerts();
   w.querySelector('.fab')?.addEventListener('click', () => {
     collapsed = false;
     // Re-show whatever we last had: a scanned token, or the home scan box.
@@ -298,7 +328,11 @@ function renderHome(): void {
       <div class="scan-head">
         <span class="live-dot"></span>
         <span class="t">Live Solana launches — auto-scanning</span>
+      </div>
+      <div class="live-controls">
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
+        <label class="safe-toggle"><input type="checkbox" class="low-cap" /> low caps only</label>
+        <button class="sort-toggle" title="Toggle between newest-first and best quality−risk first">Sort: newest</button>
       </div>
       <div class="live-status">Starting live scan…</div>
       <div class="livelist"></div>
@@ -354,6 +388,23 @@ function renderHome(): void {
     safeToggle.checked = liveSafeOnly;
     safeToggle.addEventListener('change', () => {
       liveSafeOnly = safeToggle.checked;
+      updateLiveList();
+    });
+  }
+  const lowCapToggle = body.querySelector<HTMLInputElement>('.low-cap');
+  if (lowCapToggle) {
+    lowCapToggle.checked = liveLowCapOnly;
+    lowCapToggle.addEventListener('change', () => {
+      liveLowCapOnly = lowCapToggle.checked;
+      updateLiveList();
+    });
+  }
+  const sortToggle = body.querySelector<HTMLButtonElement>('.sort-toggle');
+  if (sortToggle) {
+    sortToggle.textContent = liveSortBest ? 'Sort: 🏆 best' : 'Sort: newest';
+    sortToggle.addEventListener('click', () => {
+      liveSortBest = !liveSortBest;
+      sortToggle.textContent = liveSortBest ? 'Sort: 🏆 best' : 'Sort: newest';
       updateLiveList();
     });
   }
@@ -526,6 +577,8 @@ let liveRows: FeedRow[] = [];
 let liveTimer: ReturnType<typeof setInterval> | null = null;
 let livePolling = false;
 let liveSafeOnly = false;
+let liveLowCapOnly = false;
+let liveSortBest = false;
 
 function startLiveFeed(): void {
   if (liveTimer) return; // already running
@@ -541,7 +594,8 @@ function stopLiveFeed(): void {
 }
 
 async function pollLiveFeed(): Promise<void> {
-  if (livePolling || collapsed || view !== 'home') return;
+  // Keeps polling while COLLAPSED too — the crown pulses gold on 💎 candidates.
+  if (livePolling || view !== 'home') return;
   livePolling = true;
   try {
     const res = await new Promise<LiveFeedResponse | undefined>((resolve) => {
@@ -549,20 +603,56 @@ async function pollLiveFeed(): Promise<void> {
     });
     if (view !== 'home') return;
     if (!res || !res.ok) {
-      setLiveStatus(res?.ok === false ? res.error : 'Live feed unavailable.');
+      if (!collapsed) setLiveStatus(res?.ok === false ? res.error : 'Live feed unavailable.');
       return;
     }
     liveRows = res.feed;
-    updateLiveList();
-    const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === 'AVOID' || r.signal === 'HIGH_RISK')).length;
-    const lower = liveRows.filter((r) => !r.insufficientData && (r.signal === 'CONSIDER' || r.signal === 'NEUTRAL')).length;
-    setLiveStatus(
-      `🔴 live · ${liveRows.length} fresh coins · ⚠ ${worst} high-risk · ${lower} lower-risk` +
-        (res.source === 'mock' ? ' · MOCK' : ''),
-    );
+    if (!collapsed) {
+      updateLiveList();
+      const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === 'AVOID' || r.signal === 'HIGH_RISK')).length;
+      const gems = liveRows.filter(isGem).length;
+      setLiveStatus(
+        `🔴 live · ${liveRows.length} fresh coins · ⚠ ${worst} high-risk · 💎 ${gems} candidates` +
+          (res.source === 'mock' ? ' · MOCK' : ''),
+      );
+    }
+    refreshGemAlerts();
   } finally {
     livePolling = false;
   }
+}
+
+/* ── 💎 gem alerts: eye-catching pulse for research candidates ──────────
+ * "Gem" = low observed risk AND real quality signals — worth the user's OWN
+ * research, never a buy signal. Rows pulse gold in the feed; when the panel is
+ * collapsed the crown pulses with an unseen-count bubble so nothing is missed.
+ */
+
+const gemSeen = new Set<string>();
+
+function isGem(r: FeedRow): boolean {
+  return (
+    !r.insufficientData &&
+    r.riskScore <= LIVE_FEED.notifyMaxScore &&
+    r.qualityScore !== null &&
+    r.qualityScore >= LIVE_FEED.gemMinQuality
+  );
+}
+
+function refreshGemAlerts(): void {
+  const gems = liveRows.filter(isGem);
+  if (!collapsed && view === 'home') {
+    // Panel visible → the pulsing rows themselves are the alert; mark as seen.
+    for (const g of gems) gemSeen.add(g.address);
+  }
+  const fab = shadow?.querySelector<HTMLElement>('.fab');
+  const badge = shadow?.querySelector<HTMLElement>('.fab-badge');
+  if (!fab || !badge) return;
+  const unseen = gems.filter((g) => !gemSeen.has(g.address)).length;
+  fab.classList.toggle('gem-alert', unseen > 0);
+  badge.hidden = unseen === 0;
+  badge.textContent = String(unseen);
+  fab.title = unseen > 0 ? `CRYPTO-KING: ${unseen} 💎 candidate${unseen > 1 ? 's' : ''} — click to review` : 'Open CRYPTO-KING risk scanner';
 }
 
 function setLiveStatus(text: string): void {
@@ -576,10 +666,16 @@ function updateLiveList(): void {
 
   let rows = [...liveRows];
   if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== 'AVOID' && r.signal !== 'HIGH_RISK');
+  if (liveLowCapOnly) rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur);
+  if (liveSortBest) {
+    // 🏆 composite: strongest observed quality minus risk first. A ranking aid
+    // for research — NOT a profit prediction.
+    rows.sort((a, b) => (b.qualityScore ?? 0) - b.riskScore - ((a.qualityScore ?? 0) - a.riskScore));
+  }
 
   if (rows.length === 0) {
     list.innerHTML = `<div class="scan-empty">${
-      liveSafeOnly ? 'No lower-risk fresh launches right now.' : 'Waiting for the first live results…'
+      liveSafeOnly || liveLowCapOnly ? 'No fresh launches match the filters right now.' : 'Waiting for the first live results…'
     }</div>`;
     return;
   }
@@ -597,11 +693,16 @@ function updateLiveList(): void {
           (r.unverified
             ? 'Early checks clean — holders/LP not verified yet (click for full scan)'
             : 'No risk factors triggered — still not a buy signal'));
+      const gem = isGem(r);
       return `
-        <div class="scan-item" data-addr="${esc(r.address)}">
+        <div class="scan-item${gem ? ' gem' : ''}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span>${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ''}</span>
+            <span class="si-sym">${gem ? '💎 ' : ''}${esc(sym)}
+              <span class="age">${esc(ageShort(r.ageMinutes))}</span>
+              ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ''}
+              ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals — not a profit prediction">Q${r.qualityScore}</span>` : ''}
+              ${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
@@ -610,6 +711,12 @@ function updateLiveList(): void {
     .join('');
 
   wireRowHandlers(list);
+}
+
+function eurShort(v: number): string {
+  if (v >= 1_000_000) return `€${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `€${(v / 1_000).toFixed(0)}k`;
+  return `€${v.toFixed(0)}`;
 }
 
 /** Row click = full scan; ⧉ = one-click copy of the mint address. */
@@ -855,7 +962,7 @@ function showError(message: string): void {
   body.querySelector('.back-btn')?.addEventListener('click', backToHome);
 }
 
-function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void {
+function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResult, mock: boolean): void {
   if (collapsed) return;
   if (risk.insufficientData) {
     showError('Not enough data to assess this token.');
@@ -865,6 +972,9 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
   const meta = SIGNAL_META[risk.signal];
   const topReason = risk.reasons[0]?.text ?? 'No individual risk factors triggered — low observed risk ≠ safe.';
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
+  const qualityLine = quality.insufficientData
+    ? ''
+    : `<div class="quality-line">Quality signals: <b>${quality.qualityScore}/100</b> <span class="muted">(observed positives — not a profit prediction)</span></div>`;
 
   body.innerHTML = `
     <div class="head">
@@ -875,6 +985,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
       <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">⧉</button>
     </div>
     <div class="top-reason">${esc(topReason)}</div>
+    ${qualityLine}
     <div class="row">
       <button class="details-btn">Details ▾</button>
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
@@ -893,7 +1004,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
     const open = !panel.hidden;
     panel.hidden = open;
     if (btn) btn.textContent = open ? 'Details ▾' : 'Details ▴';
-    if (!open && panel.childElementCount === 0) fillPanel(panel, analysis, risk);
+    if (!open && panel.childElementCount === 0) fillPanel(panel, analysis, risk, quality);
   });
 }
 
@@ -903,7 +1014,7 @@ function backToHome(): void {
   renderHome();
 }
 
-function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskResult): void {
+function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskResult, quality: QualityResult): void {
   const addr = analysis.identity.address;
   const reasons = risk.reasons
     .slice(0, 6)
@@ -911,6 +1022,10 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
     .join('');
   const mitigations = risk.mitigations
     .map((m) => `<li><span class="pts good">${m.points}</span><span>${esc(m.text)}</span></li>`)
+    .join('');
+  const qualityItems = quality.reasons
+    .slice(0, 6)
+    .map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`)
     .join('');
   const gaps = risk.dataGaps
     .slice(0, 5)
@@ -920,6 +1035,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
   panel.innerHTML = `
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ''}
+    ${qualityItems ? `<h4>Quality signals (not a profit prediction)</h4><ul>${qualityItems}</ul>` : ''}
     ${gaps ? `<h4>Not checked (data unavailable)</h4><ul>${gaps}</ul>` : ''}
     <div class="links">
       <a href="https://solscan.io/token/${addr}" target="_blank" rel="noreferrer">Solscan ↗</a>

@@ -42,7 +42,9 @@ var PUMPFUN = {
   /** Single-coin object: creator, created_timestamp, complete, reserves, market_cap, socials, is_banned, token_program. */
   coinEndpoint: "/coins/{address}",
   /** Newest-coins list for the Live feed. sort=created_timestamp gives fresh launches first. */
-  listEndpoint: "/coins?offset={offset}&limit={limit}&sort=created_timestamp&order=DESC&includeNsfw=false"
+  listEndpoint: "/coins?offset={offset}&limit={limit}&sort=created_timestamp&order=DESC&includeNsfw=false",
+  /** Coins previously created by a wallet — powers the serial-deployer check. Unverified path; degrades to null. */
+  creatorCoinsEndpoint: "/coins/user-created-coins/{creator}?offset=0&limit=20&includeNsfw=true"
 };
 var LIVE_FEED = {
   enabled: true,
@@ -67,8 +69,16 @@ var LIVE_FEED = {
    * observed risk ≠ safe" — informational, never a buy signal.
    */
   notifyLowRisk: true,
-  notifyMaxScore: 39
+  notifyMaxScore: 39,
   // CONSIDER / NEUTRAL territory
+  /** "Low caps only" feed filter threshold (early-stage hunting ground). */
+  lowCapMaxEur: 1e5,
+  /**
+   * 💎 gem-alert threshold: a feed coin pulses gold when risk ≤ notifyMaxScore
+   * AND quality ≥ gemMinQuality. An attention aid for candidates worth YOUR
+   * research — emphatically not a buy signal.
+   */
+  gemMinQuality: 30
 };
 var DEXSCREENER = {
   enabled: true,
@@ -134,6 +144,15 @@ var WEIGHTS = {
   // LP neither burned nor locked
   sellSimulationFailed: 30,
   // sell fails / honeypot flag / slippage > LIMITS.sellSlippageMaxPct
+  // Token-2022 trap extensions — the current generation of rug tricks
+  permanentDelegate: 30,
+  // delegate can SEIZE tokens from any holder wallet
+  nonTransferable: 30,
+  // soulbound — you cannot sell at all
+  defaultAccountFrozen: 25,
+  // new holder accounts start frozen
+  transferHook: 20,
+  // transfers run dev code that can block sells
   // Holder concentration (medium-high)
   top10Concentrated: 15,
   // top 10 > LIMITS.top10Pct (LP/burn excluded)
@@ -159,6 +178,8 @@ var WEIGHTS = {
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10,
   // age < LIMITS.youngAgeMinutes with abnormal volume
+  serialDeployer: 15,
+  // creator launched many coins, most dead (see LIMITS.serial*)
   deployerLinkedSelling: 15,
   deployerPriorRugs: 20,
   // deployer wallet linked to ≥1 prior rug
@@ -191,7 +212,46 @@ var LIMITS = {
   thinLiqMcapEur: 5e5,
   microMcapEur: 5e4,
   youngAgeMinutes: 30,
-  smartMoneyStrongWallets: 3
+  smartMoneyStrongWallets: 3,
+  serialMinLaunches: 3,
+  // serial-deployer factor needs at least this many prior coins…
+  serialDeadRatio: 0.7
+  // …with at least this share dead/abandoned
+};
+var QUALITY_WEIGHTS = {
+  smartMoneyStrong: 20,
+  // ≥ LIMITS.smartMoneyStrongWallets smart wallets accumulating
+  smartMoneyLight: 10,
+  verifiedSocials: 10,
+  fullSocialPresence: 5,
+  // website + twitter + telegram all present
+  lpBurned: 15,
+  lpLocked: 10,
+  authoritiesRevoked: 10,
+  // BOTH mint and freeze authority revoked
+  healthyDistribution: 10,
+  // top-10 holders ≤ QUALITY_LIMITS.healthyTop10Pct
+  holderBaseLarge: 10,
+  // ≥ QUALITY_LIMITS.largeHolderCount holders
+  holderBase: 5,
+  // ≥ QUALITY_LIMITS.minHolderCount holders
+  liquidityDepth: 10,
+  // liq ≥ minLiquidityEur AND liq/mcap ≥ minLiqMcapRatio
+  organicVolume: 5,
+  // vol24h/mcap inside a sane band
+  graduated: 10,
+  // bonding curve completed — survived the launchpad
+  survived7d: 10,
+  survived24h: 5
+};
+var QUALITY_LIMITS = {
+  healthyTop10Pct: 30,
+  minHolderCount: 1e3,
+  largeHolderCount: 1e4,
+  minLiquidityEur: 3e4,
+  minLiqMcapRatio: 0.08,
+  volMcapMin: 0.2,
+  volMcapMax: 8
 };
 var MITIGATION_CAP = 15;
 var SIGNAL_THRESHOLDS = [
@@ -202,15 +262,196 @@ var SIGNAL_THRESHOLDS = [
   { min: 0, signal: "NEUTRAL" }
 ];
 
-// lib/deployerClient.ts
-var nullDeployerAdapter = {
-  async fetchDeployerHistory() {
-    return {
-      status: "disabled",
-      deployer: { priorRugs: null, fundingSource: "unknown" }
-    };
-  }
+// mock/fixtures.ts
+var now = () => Date.now();
+var FIXTURE_AVOID = {
+  identity: {
+    address: "RugKing111111111111111111111111111111111111",
+    symbol: "RUGKING",
+    name: "Rug King (mock)",
+    chain: "sol",
+    ageMinutes: 95,
+    logoUri: null
+  },
+  mint: {
+    mintAuthorityActive: true,
+    // +25
+    freezeAuthorityActive: true,
+    // +20
+    metadataMutable: false,
+    isToken2022: false,
+    transferFeeBps: null,
+    feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false
+  },
+  holders: {
+    holderCount: 3100,
+    top5Pct: 68,
+    top10Pct: 72,
+    // +15
+    largestNonLpWalletPct: 18,
+    bundledLaunchPct: 10
+  },
+  market: {
+    priceEur: 31e-5,
+    marketCapEur: 3e5,
+    liquidityEur: 6e4,
+    volume24hEur: 41e4,
+    lpStatus: "deployer_held",
+    // +20
+    sellSimulation: { ok: true, slippagePct: 12 }
+  },
+  behavior: {
+    volumeSpikeFlatPrice: false,
+    manySmallBuysOneHugeSell: false,
+    mcapSpikeNoOrganicVolume: false,
+    deployerLinkedSelling: false,
+    abnormalEarlyVolume: false
+  },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  socials: { website: null, twitter: null, telegram: null, verified: null },
+  // +10 no socials
+  smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
+  fetchedAt: now()
 };
+var FIXTURE_WATCH = {
+  identity: {
+    address: "WifCat22222222222222222222222222222222222222",
+    symbol: "WIFCAT",
+    name: "Wif Cat (mock)",
+    chain: "sol",
+    ageMinutes: 22,
+    // +10 with abnormalEarlyVolume
+    logoUri: null
+  },
+  mint: {
+    mintAuthorityActive: false,
+    freezeAuthorityActive: false,
+    metadataMutable: true,
+    // +5
+    isToken2022: false,
+    transferFeeBps: null,
+    feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false
+  },
+  holders: {
+    holderCount: 5400,
+    top5Pct: 58,
+    top10Pct: 65,
+    // +15
+    largestNonLpWalletPct: 11,
+    bundledLaunchPct: 9
+  },
+  market: {
+    priceEur: 14e-4,
+    marketCapEur: 72e4,
+    // +10 with thin liquidity below
+    liquidityEur: 38e3,
+    volume24hEur: 95e4,
+    lpStatus: "burned",
+    sellSimulation: { ok: true, slippagePct: 6 }
+  },
+  behavior: {
+    volumeSpikeFlatPrice: false,
+    manySmallBuysOneHugeSell: false,
+    mcapSpikeNoOrganicVolume: false,
+    deployerLinkedSelling: false,
+    abnormalEarlyVolume: true
+  },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
+  // +5
+  smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
+  fetchedAt: now()
+};
+var FIXTURE_NEUTRAL = {
+  identity: {
+    address: "Quokka33333333333333333333333333333333333333",
+    symbol: "QUOKKA",
+    name: "Quokka (mock)",
+    chain: "sol",
+    ageMinutes: 4320,
+    // 3 days
+    logoUri: null
+  },
+  mint: {
+    mintAuthorityActive: false,
+    freezeAuthorityActive: false,
+    metadataMutable: false,
+    isToken2022: false,
+    transferFeeBps: null,
+    feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false
+  },
+  holders: {
+    holderCount: 18200,
+    top5Pct: 15,
+    top10Pct: 24,
+    largestNonLpWalletPct: 4.5,
+    bundledLaunchPct: 2
+  },
+  market: {
+    priceEur: 0.021,
+    marketCapEur: 19e5,
+    liquidityEur: 26e4,
+    volume24hEur: 78e4,
+    lpStatus: "burned",
+    sellSimulation: { ok: true, slippagePct: 2 }
+  },
+  behavior: {
+    volumeSpikeFlatPrice: false,
+    manySmallBuysOneHugeSell: false,
+    mcapSpikeNoOrganicVolume: false,
+    deployerLinkedSelling: false,
+    abnormalEarlyVolume: false
+  },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
+  socials: {
+    website: "https://quokka.example",
+    twitter: "https://x.com/quokka",
+    telegram: "https://t.me/quokka",
+    verified: true
+    // -5
+  },
+  smartMoney: { accumulating: true, exiting: false, walletCount: 6 },
+  // -10 (strong)
+  launch: null,
+  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
+  sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
+  fetchedAt: now()
+};
+var ALL_FIXTURES = [FIXTURE_AVOID, FIXTURE_WATCH, FIXTURE_NEUTRAL];
+function fixtureForAddress(address) {
+  const exact = ALL_FIXTURES.find((f) => f.identity.address === address);
+  const base = exact ?? ALL_FIXTURES[simpleHash(address) % ALL_FIXTURES.length];
+  return {
+    ...base,
+    identity: { ...base.identity, address },
+    fetchedAt: Date.now()
+  };
+}
+function simpleHash(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = h * 31 + s.charCodeAt(i) >>> 0;
+  }
+  return h;
+}
 
 // lib/http.ts
 function rateLimitFor(host) {
@@ -296,8 +537,145 @@ function asString(v) {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-// lib/dexscreenerClient.ts
+// lib/pumpfunClient.ts
+var TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+async function fetchPumpfunData(address) {
+  if (MOCK_MODE) {
+    const f = fixtureForAddress(address);
+    return {
+      status: "mock",
+      symbol: f.identity.symbol,
+      name: f.identity.name,
+      ageMinutes: f.identity.ageMinutes,
+      marketCapEur: f.market?.marketCapEur ?? null,
+      bondingCurveComplete: true,
+      isBanned: false,
+      isToken2022: f.mint?.isToken2022 ?? null,
+      creator: null,
+      socials: f.socials,
+      bondingCurveAccounts: []
+    };
+  }
+  if (!PUMPFUN.enabled) return { ...EMPTY, status: "disabled" };
+  const url = `${PUMPFUN.baseUrl}${PUMPFUN.coinEndpoint.replace("{address}", address)}`;
+  const json = await fetchJson(url);
+  if (json === null) return { ...EMPTY, status: "unavailable" };
+  const createdMs = asNumber(pick(json, ["created_timestamp"]));
+  const tokenProgram = asString(pick(json, ["token_program"]));
+  const website = asString(pick(json, ["website"]));
+  const twitter = asString(pick(json, ["twitter"]));
+  const telegram = asString(pick(json, ["telegram"]));
+  return {
+    status: "ok",
+    symbol: asString(pick(json, ["symbol"])),
+    name: asString(pick(json, ["name"])),
+    ageMinutes: createdMs !== null ? Math.max(0, (Date.now() - createdMs) / 6e4) : null,
+    marketCapEur: usdToEur(asNumber(pick(json, ["usd_market_cap", "market_cap"]))),
+    bondingCurveComplete: asBoolLoose(pick(json, ["complete"])),
+    isBanned: asBoolLoose(pick(json, ["is_banned"])),
+    isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
+    creator: asString(pick(json, ["creator"])),
+    socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null,
+    bondingCurveAccounts: [
+      asString(pick(json, ["bonding_curve"])),
+      asString(pick(json, ["associated_bonding_curve"])),
+      asString(pick(json, ["pool_address"]))
+    ].filter((s) => s !== null)
+  };
+}
 var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+async function fetchPumpfunNewCoins(limit, offset = 0) {
+  if (MOCK_MODE || !PUMPFUN.enabled) return [];
+  const path = PUMPFUN.listEndpoint.replace("{offset}", String(offset)).replace("{limit}", String(limit));
+  const json = await fetchJson(`${PUMPFUN.baseUrl}${path}`);
+  const arr = Array.isArray(json) ? json : Array.isArray(json?.coins) ? json.coins : [];
+  const out = [];
+  for (const c of arr) {
+    const mint = asString(pick(c, ["mint", "address", "coin_mint"]));
+    if (!mint || !BASE58_RE.test(mint)) continue;
+    out.push({
+      mint,
+      symbol: asString(pick(c, ["symbol"])),
+      name: asString(pick(c, ["name"])),
+      createdMs: asNumber(pick(c, ["created_timestamp"]))
+    });
+  }
+  return out;
+}
+async function fetchCreatorCoins(creator) {
+  if (MOCK_MODE || !PUMPFUN.enabled) return null;
+  const path = PUMPFUN.creatorCoinsEndpoint.replace("{creator}", creator);
+  const json = await fetchJson(`${PUMPFUN.baseUrl}${path}`);
+  const arr = Array.isArray(json) ? json : Array.isArray(json?.coins) ? json.coins : null;
+  if (!arr) return null;
+  const out = [];
+  for (const c of arr) {
+    const mint = asString(pick(c, ["mint", "address"]));
+    if (!mint) continue;
+    out.push({
+      mint,
+      createdMs: asNumber(pick(c, ["created_timestamp"])),
+      usdMarketCap: asNumber(pick(c, ["usd_market_cap", "market_cap"])),
+      complete: asBoolLoose(pick(c, ["complete"]))
+    });
+  }
+  return out;
+}
+var usdToEur = (v) => v === null ? null : v * EUR_PER_USD;
+function asBoolLoose(v) {
+  if (typeof v === "boolean") return v;
+  if (v === 1 || v === "1") return true;
+  if (v === 0 || v === "0") return false;
+  return null;
+}
+var EMPTY = {
+  status: "unavailable",
+  symbol: null,
+  name: null,
+  ageMinutes: null,
+  marketCapEur: null,
+  bondingCurveComplete: null,
+  isBanned: null,
+  isToken2022: null,
+  creator: null,
+  socials: null,
+  bondingCurveAccounts: []
+};
+
+// lib/deployerClient.ts
+var nullDeployerAdapter = {
+  async fetchDeployerHistory() {
+    return {
+      status: "disabled",
+      deployer: { priorRugs: null, fundingSource: "unknown", priorLaunches: null, priorDeadLaunches: null }
+    };
+  }
+};
+var pumpfunDeployerAdapter = {
+  async fetchDeployerHistory(tokenAddress, creatorAddress) {
+    if (!creatorAddress) return nullDeployerAdapter.fetchDeployerHistory(tokenAddress, creatorAddress);
+    const coins = await fetchCreatorCoins(creatorAddress);
+    if (coins === null) return nullDeployerAdapter.fetchDeployerHistory(tokenAddress, creatorAddress);
+    const dayAgo = Date.now() - 24 * 60 * 6e4;
+    const prior = coins.filter((c) => c.mint !== tokenAddress);
+    const dead = prior.filter(
+      (c) => c.complete === false && (c.usdMarketCap ?? 0) < 1e4 && c.createdMs !== null && c.createdMs < dayAgo
+    );
+    return {
+      status: "ok",
+      deployer: {
+        priorRugs: null,
+        // we never claim "rug" from launch records alone
+        fundingSource: "unknown",
+        priorLaunches: prior.length,
+        priorDeadLaunches: dead.length
+      }
+    };
+  }
+};
+
+// lib/dexscreenerClient.ts
+var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 async function fetchPairBaseTokens(pairAddresses) {
   const out = {};
   if (MOCK_MODE || !DEXSCREENER.enabled || pairAddresses.length === 0) return out;
@@ -309,7 +687,7 @@ async function fetchPairBaseTokens(pairAddresses) {
     for (const p of pairs) {
       const pairAddr = asString(pick(p, ["pairAddress"]));
       const base = asString(pick(p, ["baseToken.address"]));
-      if (pairAddr && base && BASE58_RE.test(base)) {
+      if (pairAddr && base && BASE58_RE2.test(base)) {
         out[pairAddr] = { address: base, symbol: asString(pick(p, ["baseToken.symbol"])) };
       }
     }
@@ -326,191 +704,12 @@ async function fetchDexscreenerNewSolana(limit) {
     const chain = asString(pick(item, ["chainId", "chain"]));
     if (chain !== "solana") continue;
     const addr = asString(pick(item, ["tokenAddress", "address"]));
-    if (!addr || !BASE58_RE.test(addr) || seen.has(addr)) continue;
+    if (!addr || !BASE58_RE2.test(addr) || seen.has(addr)) continue;
     seen.add(addr);
     out.push(addr);
     if (out.length >= limit) break;
   }
   return out;
-}
-
-// mock/fixtures.ts
-var now = () => Date.now();
-var FIXTURE_AVOID = {
-  identity: {
-    address: "RugKing111111111111111111111111111111111111",
-    symbol: "RUGKING",
-    name: "Rug King (mock)",
-    chain: "sol",
-    ageMinutes: 95,
-    logoUri: null
-  },
-  mint: {
-    mintAuthorityActive: true,
-    // +25
-    freezeAuthorityActive: true,
-    // +20
-    metadataMutable: false,
-    isToken2022: false,
-    transferFeeBps: null,
-    feeAuthorityActive: false
-  },
-  holders: {
-    holderCount: 3100,
-    top5Pct: 68,
-    top10Pct: 72,
-    // +15
-    largestNonLpWalletPct: 18,
-    bundledLaunchPct: 10
-  },
-  market: {
-    priceEur: 31e-5,
-    marketCapEur: 3e5,
-    liquidityEur: 6e4,
-    volume24hEur: 41e4,
-    lpStatus: "deployer_held",
-    // +20
-    sellSimulation: { ok: true, slippagePct: 12 }
-  },
-  behavior: {
-    volumeSpikeFlatPrice: false,
-    manySmallBuysOneHugeSell: false,
-    mcapSpikeNoOrganicVolume: false,
-    deployerLinkedSelling: false,
-    abnormalEarlyVolume: false
-  },
-  deployer: { priorRugs: 0, fundingSource: "cex" },
-  socials: { website: null, twitter: null, telegram: null, verified: null },
-  // +10 no socials
-  smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
-  launch: null,
-  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
-  sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
-  fetchedAt: now()
-};
-var FIXTURE_WATCH = {
-  identity: {
-    address: "WifCat22222222222222222222222222222222222222",
-    symbol: "WIFCAT",
-    name: "Wif Cat (mock)",
-    chain: "sol",
-    ageMinutes: 22,
-    // +10 with abnormalEarlyVolume
-    logoUri: null
-  },
-  mint: {
-    mintAuthorityActive: false,
-    freezeAuthorityActive: false,
-    metadataMutable: true,
-    // +5
-    isToken2022: false,
-    transferFeeBps: null,
-    feeAuthorityActive: false
-  },
-  holders: {
-    holderCount: 5400,
-    top5Pct: 58,
-    top10Pct: 65,
-    // +15
-    largestNonLpWalletPct: 11,
-    bundledLaunchPct: 9
-  },
-  market: {
-    priceEur: 14e-4,
-    marketCapEur: 72e4,
-    // +10 with thin liquidity below
-    liquidityEur: 38e3,
-    volume24hEur: 95e4,
-    lpStatus: "burned",
-    sellSimulation: { ok: true, slippagePct: 6 }
-  },
-  behavior: {
-    volumeSpikeFlatPrice: false,
-    manySmallBuysOneHugeSell: false,
-    mcapSpikeNoOrganicVolume: false,
-    deployerLinkedSelling: false,
-    abnormalEarlyVolume: true
-  },
-  deployer: { priorRugs: 0, fundingSource: "cex" },
-  socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
-  // +5
-  smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
-  launch: null,
-  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
-  sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
-  fetchedAt: now()
-};
-var FIXTURE_NEUTRAL = {
-  identity: {
-    address: "Quokka33333333333333333333333333333333333333",
-    symbol: "QUOKKA",
-    name: "Quokka (mock)",
-    chain: "sol",
-    ageMinutes: 4320,
-    // 3 days
-    logoUri: null
-  },
-  mint: {
-    mintAuthorityActive: false,
-    freezeAuthorityActive: false,
-    metadataMutable: false,
-    isToken2022: false,
-    transferFeeBps: null,
-    feeAuthorityActive: false
-  },
-  holders: {
-    holderCount: 18200,
-    top5Pct: 15,
-    top10Pct: 24,
-    largestNonLpWalletPct: 4.5,
-    bundledLaunchPct: 2
-  },
-  market: {
-    priceEur: 0.021,
-    marketCapEur: 19e5,
-    liquidityEur: 26e4,
-    volume24hEur: 78e4,
-    lpStatus: "burned",
-    sellSimulation: { ok: true, slippagePct: 2 }
-  },
-  behavior: {
-    volumeSpikeFlatPrice: false,
-    manySmallBuysOneHugeSell: false,
-    mcapSpikeNoOrganicVolume: false,
-    deployerLinkedSelling: false,
-    abnormalEarlyVolume: false
-  },
-  deployer: { priorRugs: 0, fundingSource: "cex" },
-  socials: {
-    website: "https://quokka.example",
-    twitter: "https://x.com/quokka",
-    telegram: "https://t.me/quokka",
-    verified: true
-    // -5
-  },
-  smartMoney: { accumulating: true, exiting: false, walletCount: 6 },
-  // -10 (strong)
-  launch: null,
-  // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
-  sources: { gmgn: "mock", solana: "mock", pumpfun: "mock", rugcheck: "mock", deployer: "mock" },
-  fetchedAt: now()
-};
-var ALL_FIXTURES = [FIXTURE_AVOID, FIXTURE_WATCH, FIXTURE_NEUTRAL];
-function fixtureForAddress(address) {
-  const exact = ALL_FIXTURES.find((f) => f.identity.address === address);
-  const base = exact ?? ALL_FIXTURES[simpleHash(address) % ALL_FIXTURES.length];
-  return {
-    ...base,
-    identity: { ...base.identity, address },
-    fetchedAt: Date.now()
-  };
-}
-function simpleHash(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) {
-    h = h * 31 + s.charCodeAt(i) >>> 0;
-  }
-  return h;
 }
 
 // lib/gmgnClient.ts
@@ -534,7 +733,7 @@ async function fetchGmgnData(address) {
 }
 function parseGmgn(raw) {
   const { security, tokenInfo, preview, feeDist, slippage, topBuyers } = raw;
-  const out = { ...EMPTY };
+  const out = { ...EMPTY2 };
   if (security !== null) {
     out.mintRenounced = asBool(pick(security, ["renounced_mint", "security.renounced_mint"]));
     out.freezeRenounced = asBool(pick(security, ["renounced_freeze_account", "security.renounced_freeze_account"]));
@@ -553,16 +752,16 @@ function parseGmgn(raw) {
   }
   if (tokenInfo !== null) {
     out.holderCount = out.holderCount ?? asNumber(pick(tokenInfo, ["holder_count"]));
-    out.liquidityEur = usdToEur(asNumber(pick(tokenInfo, ["liquidity"])));
+    out.liquidityEur = usdToEur2(asNumber(pick(tokenInfo, ["liquidity"])));
     const createdSec = asNumber(pick(tokenInfo, ["creation_timestamp", "open_timestamp"]));
     if (createdSec !== null) out.ageMinutes = Math.max(0, (Date.now() / 1e3 - createdSec) / 60);
   }
   if (preview !== null) {
     out.symbol = asString(pick(preview, ["symbol", "token.symbol"]));
     out.name = asString(pick(preview, ["name", "token.name"]));
-    out.marketCapEur = usdToEur(asNumber(pick(preview, ["mc", "market_cap", "usd_market_cap"])));
-    out.priceEur = usdToEur(asNumber(pick(preview, ["price", "usd_price"])));
-    out.volume24hEur = usdToEur(asNumber(pick(preview, ["volume_24h", "volume24h", "v24h"])));
+    out.marketCapEur = usdToEur2(asNumber(pick(preview, ["mc", "market_cap", "usd_market_cap"])));
+    out.priceEur = usdToEur2(asNumber(pick(preview, ["price", "usd_price"])));
+    out.volume24hEur = usdToEur2(asNumber(pick(preview, ["volume_24h", "volume24h", "v24h"])));
     const twitter = asString(pick(preview, ["twitter", "socials.twitter", "twitter_username", "link.twitter_username"]));
     const website = asString(pick(preview, ["website", "socials.website", "link.website"]));
     const telegram = asString(pick(preview, ["telegram", "socials.telegram", "link.telegram"]));
@@ -629,7 +828,7 @@ function deriveLpStatus(security) {
   if (burnStatus !== null || burnRatio !== null) return "unlocked";
   return "unknown";
 }
-var usdToEur = (v) => v === null ? null : v * EUR_PER_USD;
+var usdToEur2 = (v) => v === null ? null : v * EUR_PER_USD;
 function ratioToPct(v) {
   if (v === null) return null;
   return v <= 1 ? v * 100 : v;
@@ -675,9 +874,9 @@ function mockGmgnData(address) {
   };
 }
 function emptyGmgnData() {
-  return { ...EMPTY };
+  return { ...EMPTY2 };
 }
-var EMPTY = {
+var EMPTY2 = {
   status: "unavailable",
   symbol: null,
   name: null,
@@ -703,91 +902,68 @@ var EMPTY = {
   behavior: null
 };
 
-// lib/pumpfunClient.ts
-var TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchPumpfunData(address) {
-  if (MOCK_MODE) {
-    const f = fixtureForAddress(address);
-    return {
-      status: "mock",
-      symbol: f.identity.symbol,
-      name: f.identity.name,
-      ageMinutes: f.identity.ageMinutes,
-      marketCapEur: f.market?.marketCapEur ?? null,
-      bondingCurveComplete: true,
-      isBanned: false,
-      isToken2022: f.mint?.isToken2022 ?? null,
-      creator: null,
-      socials: f.socials,
-      bondingCurveAccounts: []
-    };
+// lib/qualityScorer.ts
+function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
+  const reasons = [];
+  const hit = (points, text) => reasons.push({ points, text });
+  const insufficientData = a.mint === null && a.market === null && a.holders === null;
+  if (insufficientData) {
+    return { qualityScore: 0, reasons, insufficientData: true };
   }
-  if (!PUMPFUN.enabled) return { ...EMPTY2, status: "disabled" };
-  const url = `${PUMPFUN.baseUrl}${PUMPFUN.coinEndpoint.replace("{address}", address)}`;
-  const json = await fetchJson(url);
-  if (json === null) return { ...EMPTY2, status: "unavailable" };
-  const createdMs = asNumber(pick(json, ["created_timestamp"]));
-  const tokenProgram = asString(pick(json, ["token_program"]));
-  const website = asString(pick(json, ["website"]));
-  const twitter = asString(pick(json, ["twitter"]));
-  const telegram = asString(pick(json, ["telegram"]));
-  return {
-    status: "ok",
-    symbol: asString(pick(json, ["symbol"])),
-    name: asString(pick(json, ["name"])),
-    ageMinutes: createdMs !== null ? Math.max(0, (Date.now() - createdMs) / 6e4) : null,
-    marketCapEur: usdToEur2(asNumber(pick(json, ["usd_market_cap", "market_cap"]))),
-    bondingCurveComplete: asBoolLoose(pick(json, ["complete"])),
-    isBanned: asBoolLoose(pick(json, ["is_banned"])),
-    isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
-    creator: asString(pick(json, ["creator"])),
-    socials: website || twitter || telegram ? { website, twitter, telegram, verified: null } : null,
-    bondingCurveAccounts: [
-      asString(pick(json, ["bonding_curve"])),
-      asString(pick(json, ["associated_bonding_curve"])),
-      asString(pick(json, ["pool_address"]))
-    ].filter((s) => s !== null)
-  };
-}
-var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-async function fetchPumpfunNewCoins(limit, offset = 0) {
-  if (MOCK_MODE || !PUMPFUN.enabled) return [];
-  const path = PUMPFUN.listEndpoint.replace("{offset}", String(offset)).replace("{limit}", String(limit));
-  const json = await fetchJson(`${PUMPFUN.baseUrl}${path}`);
-  const arr = Array.isArray(json) ? json : Array.isArray(json?.coins) ? json.coins : [];
-  const out = [];
-  for (const c of arr) {
-    const mint = asString(pick(c, ["mint", "address", "coin_mint"]));
-    if (!mint || !BASE58_RE2.test(mint)) continue;
-    out.push({
-      mint,
-      symbol: asString(pick(c, ["symbol"])),
-      name: asString(pick(c, ["name"])),
-      createdMs: asNumber(pick(c, ["created_timestamp"]))
-    });
+  const sm = a.smartMoney;
+  if (sm?.accumulating === true && sm.exiting !== true) {
+    const strong = sm.walletCount !== null && sm.walletCount >= 3;
+    hit(
+      strong ? w.smartMoneyStrong : w.smartMoneyLight,
+      `Smart-money wallets accumulating${sm.walletCount ? ` (${sm.walletCount})` : ""}.`
+    );
   }
-  return out;
+  const s = a.socials;
+  if (s?.verified === true) hit(w.verifiedSocials, "Verified website/Twitter/Telegram.");
+  if (s && s.website && s.twitter && s.telegram) {
+    hit(w.fullSocialPresence, "Full social presence (site + Twitter + Telegram).");
+  }
+  const lp = a.market?.lpStatus;
+  if (lp === "burned") hit(w.lpBurned, "LP burned \u2014 liquidity cannot be pulled.");
+  else if (lp === "locked") hit(w.lpLocked, "LP locked with a third-party locker.");
+  if (a.mint?.mintAuthorityActive === false && a.mint?.freezeAuthorityActive === false) {
+    hit(w.authoritiesRevoked, "Mint AND freeze authority revoked.");
+  }
+  const h = a.holders;
+  if (h?.top10Pct !== null && h?.top10Pct !== void 0 && h.top10Pct <= l.healthyTop10Pct) {
+    hit(w.healthyDistribution, `Healthy distribution \u2014 top 10 hold only ${h.top10Pct.toFixed(0)}%.`);
+  }
+  if (h?.holderCount !== null && h?.holderCount !== void 0) {
+    if (h.holderCount >= l.largeHolderCount) hit(w.holderBaseLarge, `${h.holderCount.toLocaleString()} holders.`);
+    else if (h.holderCount >= l.minHolderCount) hit(w.holderBase, `${h.holderCount.toLocaleString()} holders.`);
+  }
+  const m = a.market;
+  if (m?.liquidityEur !== null && m?.liquidityEur !== void 0 && m.marketCapEur !== null) {
+    if (m.liquidityEur >= l.minLiquidityEur && m.liquidityEur / m.marketCapEur >= l.minLiqMcapRatio) {
+      hit(w.liquidityDepth, `Real liquidity depth (\u20AC${Math.round(m.liquidityEur / 1e3)}k, ${(m.liquidityEur / m.marketCapEur * 100).toFixed(0)}% of cap).`);
+    }
+    if (m.volume24hEur !== null && m.marketCapEur > 0) {
+      const ratio = m.volume24hEur / m.marketCapEur;
+      if (ratio >= l.volMcapMin && ratio <= l.volMcapMax) {
+        hit(w.organicVolume, "Volume/market-cap ratio in a healthy band.");
+      }
+    }
+  }
+  if (a.launch?.bondingCurveComplete === true) {
+    hit(w.graduated, "Graduated its bonding curve \u2014 survived the launchpad.");
+  }
+  const age = a.identity.ageMinutes;
+  if (age !== null) {
+    if (age >= 7 * 1440) hit(w.survived7d, "Survived 7+ days with data intact.");
+    else if (age >= 1440) hit(w.survived24h, "Survived 24+ hours.");
+  }
+  reasons.sort((x, y) => y.points - x.points);
+  const qualityScore = Math.min(
+    100,
+    Math.max(0, Math.round(reasons.reduce((sum, r) => sum + r.points, 0)))
+  );
+  return { qualityScore, reasons, insufficientData: false };
 }
-var usdToEur2 = (v) => v === null ? null : v * EUR_PER_USD;
-function asBoolLoose(v) {
-  if (typeof v === "boolean") return v;
-  if (v === 1 || v === "1") return true;
-  if (v === 0 || v === "0") return false;
-  return null;
-}
-var EMPTY2 = {
-  status: "unavailable",
-  symbol: null,
-  name: null,
-  ageMinutes: null,
-  marketCapEur: null,
-  bondingCurveComplete: null,
-  isBanned: null,
-  isToken2022: null,
-  creator: null,
-  socials: null,
-  bondingCurveAccounts: []
-};
 
 // lib/riskScorer.ts
 function signalForScore(score, thresholds = SIGNAL_THRESHOLDS) {
@@ -839,6 +1015,21 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
       hit(w.metadataMutable, "Metadata mutable \u2014 token identity (name/symbol/socials) can be changed post-launch.");
     } else if (mint.metadataMutable === null) {
       gap("Metadata mutability unknown (needs a DAS-capable RPC such as Helius).");
+    }
+    if (mint.permanentDelegateActive === true) {
+      hit(w.permanentDelegate, "PERMANENT DELEGATE set \u2014 the dev can seize tokens out of your wallet.");
+    }
+    if (mint.nonTransferable === true) {
+      hit(w.nonTransferable, "Token is NON-TRANSFERABLE (soulbound) \u2014 you cannot sell at all.");
+    }
+    if (mint.defaultAccountFrozen === true) {
+      hit(w.defaultAccountFrozen, "New holder accounts start FROZEN \u2014 classic modern honeypot setup.");
+    }
+    if (mint.transferHookActive === true) {
+      hit(w.transferHook, "Transfer hook installed \u2014 transfers run dev code that can block sells.");
+    }
+    if (mint.isToken2022 === true && (mint.permanentDelegateActive === null || mint.transferHookActive === null)) {
+      gap("Token-2022 extension traps (permanent delegate / transfer hook) could not be read.");
     }
   }
   const market = a.market;
@@ -944,6 +1135,12 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
     if (d.fundingSource === "known_rugger") {
       hit(w.deployerFundedByRugger, "Deployer was funded from a wallet linked to known rugs.");
     }
+    if (d.priorLaunches !== null && d.priorDeadLaunches !== null && d.priorLaunches >= l.serialMinLaunches && d.priorDeadLaunches / d.priorLaunches >= l.serialDeadRatio) {
+      hit(
+        w.serialDeployer,
+        `Serial launcher \u2014 creator has ${d.priorLaunches} prior coins, ${d.priorDeadLaunches} dead/abandoned.`
+      );
+    }
   }
   const s = a.socials;
   if (!s) {
@@ -1047,13 +1244,33 @@ async function fetchMintInfo(address) {
   const freezeAuthorityActive = info.freezeAuthority != null;
   let transferFeeBps = null;
   let feeAuthorityActive = isToken2022 ? false : null;
+  let permanentDelegateActive = false;
+  let transferHookActive = false;
+  let defaultAccountFrozen = false;
+  let nonTransferable = false;
   const extensions = Array.isArray(info.extensions) ? info.extensions : [];
   for (const ext of extensions) {
-    if (ext.extension === "transferFeeConfig") {
-      const state = ext.state ?? {};
-      const newer = state.newerTransferFee ?? {};
-      transferFeeBps = asNumber(newer.transferFeeBasisPoints) ?? 0;
-      feeAuthorityActive = state.transferFeeConfigAuthority != null || state.withdrawWithheldAuthority != null;
+    const state = ext.state ?? {};
+    switch (ext.extension) {
+      case "transferFeeConfig": {
+        const newer = state.newerTransferFee ?? {};
+        transferFeeBps = asNumber(newer.transferFeeBasisPoints) ?? 0;
+        feeAuthorityActive = state.transferFeeConfigAuthority != null || state.withdrawWithheldAuthority != null;
+        break;
+      }
+      case "permanentDelegate":
+        permanentDelegateActive = state.delegate != null;
+        break;
+      case "transferHook":
+        transferHookActive = state.programId != null;
+        break;
+      case "defaultAccountState":
+        defaultAccountFrozen = state.accountState === "frozen";
+        break;
+      case "nonTransferable":
+      case "nonTransferableAccount":
+        nonTransferable = true;
+        break;
     }
   }
   return {
@@ -1062,7 +1279,11 @@ async function fetchMintInfo(address) {
     metadataMutable: await fetchMetadataMutable(address),
     isToken2022,
     transferFeeBps,
-    feeAuthorityActive
+    feeAuthorityActive,
+    permanentDelegateActive,
+    transferHookActive,
+    defaultAccountFrozen,
+    nonTransferable
   };
 }
 async function fetchMetadataMutable(address) {
@@ -1208,6 +1429,7 @@ async function doLiveFeedSweep() {
       riskScore: entry.risk.riskScore,
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
+      qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
       insufficientData: entry.risk.insufficientData,
       unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()
@@ -1250,7 +1472,7 @@ async function analyzeToken(address, force, rawGmgn, lite = false) {
   }
   const cached = cache.get(address);
   if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS && (!cached.lite || lite)) {
-    return { ok: true, analysis: cached.analysis, risk: cached.risk, mock: MOCK_MODE };
+    return { ok: true, analysis: cached.analysis, risk: cached.risk, quality: cached.quality, mock: MOCK_MODE };
   }
   const pending = inFlight.get(address);
   if (pending) return pending;
@@ -1267,7 +1489,7 @@ async function doAnalyze(address, rawGmgn, lite = false) {
       fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts),
       rugcheckAdapter.fetchAudit(address)
     ]);
-    const deployerHist = await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
+    const deployerHist = lite ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator) : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
     const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, {
       gmgn: gmgn.status,
       solana: solana.status,
@@ -1276,9 +1498,10 @@ async function doAnalyze(address, rawGmgn, lite = false) {
       deployer: deployerHist.status
     });
     const risk = scoreToken(analysis);
-    cache.set(address, { analysis, risk, at: Date.now(), lite });
+    const quality = scoreQuality(analysis);
+    cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
     if (!lite) await saveRecent(analysis, risk);
-    return { ok: true, analysis, risk, mock: MOCK_MODE };
+    return { ok: true, analysis, risk, quality, mock: MOCK_MODE };
   } catch (err) {
     console.error("[CRYPTO-KING] analysis failed:", err);
     return { ok: false, error: "Analysis failed \u2014 data unavailable." };
@@ -1293,7 +1516,12 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
       metadataMutable: null,
       isToken2022: pumpfun.isToken2022,
       transferFeeBps: gmgn.taxBps,
-      feeAuthorityActive: gmgn.feeAuthorityActive
+      feeAuthorityActive: gmgn.feeAuthorityActive,
+      // Extension traps need the on-chain mint account; unknown via GMGN alone.
+      permanentDelegateActive: null,
+      transferHookActive: null,
+      defaultAccountFrozen: null,
+      nonTransferable: null
     };
   } else if (mint) {
     mint = {

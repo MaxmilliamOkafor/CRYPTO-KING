@@ -46,6 +46,10 @@ export const FIXTURE_AVOID: TokenAnalysis = {
     isToken2022: false,
     transferFeeBps: null,
     feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false,
   },
   holders: {
     holderCount: 3100,
@@ -69,7 +73,7 @@ export const FIXTURE_AVOID: TokenAnalysis = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false,
   },
-  deployer: { priorRugs: 0, fundingSource: 'cex' },
+  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null },
   socials: { website: null, twitter: null, telegram: null, verified: null }, // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
@@ -107,6 +111,10 @@ export const FIXTURE_WATCH: TokenAnalysis = {
     isToken2022: false,
     transferFeeBps: null,
     feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false,
   },
   holders: {
     holderCount: 5400,
@@ -130,7 +138,7 @@ export const FIXTURE_WATCH: TokenAnalysis = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: true,
   },
-  deployer: { priorRugs: 0, fundingSource: 'cex' },
+  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null },
   socials: { website: 'https://wifcat.example', twitter: 'https://x.com/wifcat', telegram: null, verified: false }, // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
   launch: null, // launchpad factors don't apply to fixtures — keeps the walkthrough arithmetic exact
@@ -167,6 +175,10 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     isToken2022: false,
     transferFeeBps: null,
     feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false,
   },
   holders: {
     holderCount: 18_200,
@@ -190,7 +202,7 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false,
   },
-  deployer: { priorRugs: 0, fundingSource: 'cex' },
+  deployer: { priorRugs: 0, fundingSource: 'cex', priorLaunches: null, priorDeadLaunches: null },
   socials: {
     website: 'https://quokka.example',
     twitter: 'https://x.com/quokka',

@@ -5,7 +5,7 @@
  */
 
 import { DISCLAIMER, SIGNAL_META } from '../config.ts';
-import type { AnalyzeResponse, RecentResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
+import type { AnalyzeResponse, QualityResult, RecentResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
 const URL_PATTERNS = [
@@ -41,7 +41,7 @@ async function init(): Promise<void> {
       $('state').textContent = res.error;
       return;
     }
-    render(res.analysis, res.risk, res.mock);
+    render(res.analysis, res.risk, res.quality, res.mock);
   });
 }
 
@@ -60,7 +60,7 @@ function extractAddress(url: string): string | null {
 
 /* ── Rendering ─────────────────────────────────────────────────────────── */
 
-function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void {
+function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResult, mock: boolean): void {
   $('state').hidden = true;
   $('mock-badge').hidden = !mock;
 
@@ -107,14 +107,14 @@ function render(analysis: TokenAnalysis, risk: RiskResult, mock: boolean): void 
   for (const g of risk.dataGaps) gaps.appendChild(li('gap-item', g));
   $('gaps-details').hidden = risk.dataGaps.length === 0;
 
-  renderMetrics(analysis);
+  renderMetrics(analysis, quality);
 
   ($('link-solscan') as HTMLAnchorElement).href = `https://solscan.io/token/${addr}`;
   ($('link-rugcheck') as HTMLAnchorElement).href = `https://rugcheck.xyz/tokens/${addr}`;
   ($('link-gmgn') as HTMLAnchorElement).href = `https://gmgn.ai/sol/token/${addr}`;
 }
 
-function renderMetrics(a: TokenAnalysis): void {
+function renderMetrics(a: TokenAnalysis, quality: QualityResult): void {
   const m = a.market;
   const h = a.holders;
   const mint = a.mint;
@@ -141,6 +141,11 @@ function renderMetrics(a: TokenAnalysis): void {
     { k: 'LP status', v: lp.v, cls: lp.cls },
     ...authorityMetric('Mint authority', mint?.mintAuthorityActive ?? null),
     ...authorityMetric('Freeze authority', mint?.freezeAuthorityActive ?? null),
+    {
+      k: 'Quality signals',
+      v: quality.insufficientData ? 'unknown' : `${quality.qualityScore}/100`,
+      cls: !quality.insufficientData && quality.qualityScore >= 50 ? 'good' : undefined,
+    },
   ];
 
   const grid = $('metrics');

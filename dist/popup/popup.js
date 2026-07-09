@@ -40,7 +40,7 @@ async function init() {
       $("state").textContent = res.error;
       return;
     }
-    render(res.analysis, res.risk, res.mock);
+    render(res.analysis, res.risk, res.quality, res.mock);
   });
 }
 function extractAddress(url) {
@@ -54,7 +54,7 @@ function extractAddress(url) {
   }
   return null;
 }
-function render(analysis, risk, mock) {
+function render(analysis, risk, quality, mock) {
   $("state").hidden = true;
   $("mock-badge").hidden = !mock;
   if (risk.insufficientData) {
@@ -92,12 +92,12 @@ function render(analysis, risk, mock) {
   gaps.innerHTML = "";
   for (const g of risk.dataGaps) gaps.appendChild(li("gap-item", g));
   $("gaps-details").hidden = risk.dataGaps.length === 0;
-  renderMetrics(analysis);
+  renderMetrics(analysis, quality);
   $("link-solscan").href = `https://solscan.io/token/${addr}`;
   $("link-rugcheck").href = `https://rugcheck.xyz/tokens/${addr}`;
   $("link-gmgn").href = `https://gmgn.ai/sol/token/${addr}`;
 }
-function renderMetrics(a) {
+function renderMetrics(a, quality) {
   const m = a.market;
   const h = a.holders;
   const mint = a.mint;
@@ -121,7 +121,12 @@ function renderMetrics(a) {
     },
     { k: "LP status", v: lp.v, cls: lp.cls },
     ...authorityMetric("Mint authority", mint?.mintAuthorityActive ?? null),
-    ...authorityMetric("Freeze authority", mint?.freezeAuthorityActive ?? null)
+    ...authorityMetric("Freeze authority", mint?.freezeAuthorityActive ?? null),
+    {
+      k: "Quality signals",
+      v: quality.insufficientData ? "unknown" : `${quality.qualityScore}/100`,
+      cls: !quality.insufficientData && quality.qualityScore >= 50 ? "good" : void 0
+    }
   ];
   const grid = $("metrics");
   grid.innerHTML = "";

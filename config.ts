@@ -88,6 +88,8 @@ export const PUMPFUN = {
   coinEndpoint: '/coins/{address}',
   /** Newest-coins list for the Live feed. sort=created_timestamp gives fresh launches first. */
   listEndpoint: '/coins?offset={offset}&limit={limit}&sort=created_timestamp&order=DESC&includeNsfw=false',
+  /** Coins previously created by a wallet — powers the serial-deployer check. Unverified path; degrades to null. */
+  creatorCoinsEndpoint: '/coins/user-created-coins/{creator}?offset=0&limit=20&includeNsfw=true',
 };
 
 /**
@@ -118,6 +120,14 @@ export const LIVE_FEED = {
    */
   notifyLowRisk: true,
   notifyMaxScore: 39, // CONSIDER / NEUTRAL territory
+  /** "Low caps only" feed filter threshold (early-stage hunting ground). */
+  lowCapMaxEur: 100_000,
+  /**
+   * 💎 gem-alert threshold: a feed coin pulses gold when risk ≤ notifyMaxScore
+   * AND quality ≥ gemMinQuality. An attention aid for candidates worth YOUR
+   * research — emphatically not a buy signal.
+   */
+  gemMinQuality: 30,
 };
 
 /**
@@ -213,6 +223,12 @@ export const WEIGHTS = {
   lpNotSecured: 20, // LP neither burned nor locked
   sellSimulationFailed: 30, // sell fails / honeypot flag / slippage > LIMITS.sellSlippageMaxPct
 
+  // Token-2022 trap extensions — the current generation of rug tricks
+  permanentDelegate: 30, // delegate can SEIZE tokens from any holder wallet
+  nonTransferable: 30, // soulbound — you cannot sell at all
+  defaultAccountFrozen: 25, // new holder accounts start frozen
+  transferHook: 20, // transfers run dev code that can block sells
+
   // Holder concentration (medium-high)
   top10Concentrated: 15, // top 10 > LIMITS.top10Pct (LP/burn excluded)
   singleWalletDominant: 10, // one non-LP wallet > LIMITS.singleWalletPct
@@ -231,6 +247,7 @@ export const WEIGHTS = {
 
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10, // age < LIMITS.youngAgeMinutes with abnormal volume
+  serialDeployer: 15, // creator launched many coins, most dead (see LIMITS.serial*)
   deployerLinkedSelling: 15,
   deployerPriorRugs: 20, // deployer wallet linked to ≥1 prior rug
   deployerFundedByRugger: 15, // deployer funded from a known rugger wallet
@@ -260,6 +277,42 @@ export const LIMITS = {
   microMcapEur: 50_000,
   youngAgeMinutes: 30,
   smartMoneyStrongWallets: 3,
+  serialMinLaunches: 3, // serial-deployer factor needs at least this many prior coins…
+  serialDeadRatio: 0.7, // …with at least this share dead/abandoned
+} as const;
+
+/* ─────────────────────── Quality/momentum model ───────────────────────────
+ * The positive axis: additive points for OBSERVABLE good signals, clamp 0–100.
+ * Explicitly NOT a profit prediction — meme coins with perfect signals still
+ * go to zero. Used to rank candidates worth researching (🏆 sort in the feed).
+ */
+
+export const QUALITY_WEIGHTS = {
+  smartMoneyStrong: 20, // ≥ LIMITS.smartMoneyStrongWallets smart wallets accumulating
+  smartMoneyLight: 10,
+  verifiedSocials: 10,
+  fullSocialPresence: 5, // website + twitter + telegram all present
+  lpBurned: 15,
+  lpLocked: 10,
+  authoritiesRevoked: 10, // BOTH mint and freeze authority revoked
+  healthyDistribution: 10, // top-10 holders ≤ QUALITY_LIMITS.healthyTop10Pct
+  holderBaseLarge: 10, // ≥ QUALITY_LIMITS.largeHolderCount holders
+  holderBase: 5, // ≥ QUALITY_LIMITS.minHolderCount holders
+  liquidityDepth: 10, // liq ≥ minLiquidityEur AND liq/mcap ≥ minLiqMcapRatio
+  organicVolume: 5, // vol24h/mcap inside a sane band
+  graduated: 10, // bonding curve completed — survived the launchpad
+  survived7d: 10,
+  survived24h: 5,
+} as const;
+
+export const QUALITY_LIMITS = {
+  healthyTop10Pct: 30,
+  minHolderCount: 1000,
+  largeHolderCount: 10_000,
+  minLiquidityEur: 30_000,
+  minLiqMcapRatio: 0.08,
+  volMcapMin: 0.2,
+  volMcapMax: 8,
 } as const;
 
 /** Total mitigation is capped at this many points (applied as a floor of -15). */

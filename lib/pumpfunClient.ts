@@ -118,6 +118,43 @@ export async function fetchPumpfunNewCoins(limit: number, offset = 0): Promise<P
   return out;
 }
 
+/** Slim record of a creator's prior coin, for the serial-deployer heuristic. */
+export interface CreatorCoin {
+  mint: string;
+  createdMs: number | null;
+  usdMarketCap: number | null;
+  complete: boolean | null;
+}
+
+/**
+ * Coins previously created by this wallet (pump.fun records — platform data,
+ * not wallet deanonymization). null = endpoint unavailable/changed → the
+ * serial-deployer check simply reports a data gap.
+ */
+export async function fetchCreatorCoins(creator: string): Promise<CreatorCoin[] | null> {
+  if (MOCK_MODE || !PUMPFUN.enabled) return null;
+  const path = PUMPFUN.creatorCoinsEndpoint.replace('{creator}', creator);
+  const json = await fetchJson(`${PUMPFUN.baseUrl}${path}`);
+  const arr = Array.isArray(json)
+    ? json
+    : Array.isArray((json as { coins?: unknown })?.coins)
+      ? (json as { coins: unknown[] }).coins
+      : null;
+  if (!arr) return null;
+  const out: CreatorCoin[] = [];
+  for (const c of arr) {
+    const mint = asString(pick(c, ['mint', 'address']));
+    if (!mint) continue;
+    out.push({
+      mint,
+      createdMs: asNumber(pick(c, ['created_timestamp'])),
+      usdMarketCap: asNumber(pick(c, ['usd_market_cap', 'market_cap'])),
+      complete: asBoolLoose(pick(c, ['complete'])),
+    });
+  }
+  return out;
+}
+
 const usdToEur = (v: number | null) => (v === null ? null : v * EUR_PER_USD);
 
 function asBoolLoose(v: unknown): boolean | null {

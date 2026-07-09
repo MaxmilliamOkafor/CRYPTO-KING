@@ -15,10 +15,11 @@
  */
 
 import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
-import { nullDeployerAdapter } from '../lib/deployerClient.ts';
+import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
+import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
@@ -29,6 +30,7 @@ import type {
   LiveFeedResponse,
   MarketInfo,
   MintInfo,
+  QualityResult,
   RecentResponse,
   RecentToken,
   ResolvePairsResponse,
@@ -42,6 +44,7 @@ const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 interface CacheEntry {
   analysis: TokenAnalysis;
   risk: RiskResult;
+  quality: QualityResult;
   at: number;
   /** true = produced by a lite feed scan (mint-only); a full request re-scans. */
   lite: boolean;
@@ -145,6 +148,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       riskScore: entry.risk.riskScore,
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
+      qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
       insufficientData: entry.risk.insufficientData,
       unverified:
         entry.analysis.holders === null ||
@@ -211,7 +215,7 @@ async function analyzeToken(address: string, force: boolean, rawGmgn?: unknown, 
   // request upgrades it with the complete scan.
   const cached = cache.get(address);
   if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS && (!cached.lite || lite)) {
-    return { ok: true, analysis: cached.analysis, risk: cached.risk, mock: MOCK_MODE };
+    return { ok: true, analysis: cached.analysis, risk: cached.risk, quality: cached.quality, mock: MOCK_MODE };
   }
 
   const pending = inFlight.get(address);
@@ -244,7 +248,11 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
       fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts),
       rugcheckAdapter.fetchAudit(address),
     ]);
-    const deployerHist = await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
+    // Full scans check the creator's launch history (serial-deployer signal);
+    // lite feed sweeps skip it to stay within the per-poll budget.
+    const deployerHist = lite
+      ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator)
+      : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
 
     const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, {
       gmgn: gmgn.status,
@@ -255,11 +263,12 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     });
 
     const risk = scoreToken(analysis);
-    cache.set(address, { analysis, risk, at: Date.now(), lite });
+    const quality = scoreQuality(analysis);
+    cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
     // Lite feed sweeps would flush the user's own browsing history out of the
     // dashboard's capped recent list — only full scans are recorded there.
     if (!lite) await saveRecent(analysis, risk);
-    return { ok: true, analysis, risk, mock: MOCK_MODE };
+    return { ok: true, analysis, risk, quality, mock: MOCK_MODE };
   } catch (err) {
     console.error('[CRYPTO-KING] analysis failed:', err);
     return { ok: false, error: 'Analysis failed — data unavailable.' };
@@ -291,6 +300,11 @@ function mergeSources(
       isToken2022: pumpfun.isToken2022,
       transferFeeBps: gmgn.taxBps,
       feeAuthorityActive: gmgn.feeAuthorityActive,
+      // Extension traps need the on-chain mint account; unknown via GMGN alone.
+      permanentDelegateActive: null,
+      transferHookActive: null,
+      defaultAccountFrozen: null,
+      nonTransferable: null,
     };
   } else if (mint) {
     // RPC verdicts stand; GMGN only fills fields the RPC couldn't produce.

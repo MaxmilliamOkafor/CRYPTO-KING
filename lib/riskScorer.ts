@@ -78,6 +78,26 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
     } else if (mint.metadataMutable === null) {
       gap('Metadata mutability unknown (needs a DAS-capable RPC such as Helius).');
     }
+
+    /* Token-2022 trap extensions — the current generation of rug tricks. */
+    if (mint.permanentDelegateActive === true) {
+      hit(w.permanentDelegate, 'PERMANENT DELEGATE set — the dev can seize tokens out of your wallet.');
+    }
+    if (mint.nonTransferable === true) {
+      hit(w.nonTransferable, 'Token is NON-TRANSFERABLE (soulbound) — you cannot sell at all.');
+    }
+    if (mint.defaultAccountFrozen === true) {
+      hit(w.defaultAccountFrozen, 'New holder accounts start FROZEN — classic modern honeypot setup.');
+    }
+    if (mint.transferHookActive === true) {
+      hit(w.transferHook, 'Transfer hook installed — transfers run dev code that can block sells.');
+    }
+    if (
+      mint.isToken2022 === true &&
+      (mint.permanentDelegateActive === null || mint.transferHookActive === null)
+    ) {
+      gap('Token-2022 extension traps (permanent delegate / transfer hook) could not be read.');
+    }
   }
 
   /* ── Liquidity, LP status & sell simulation ────────────────────────── */
@@ -198,6 +218,17 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
     }
     if (d.fundingSource === 'known_rugger') {
       hit(w.deployerFundedByRugger, 'Deployer was funded from a wallet linked to known rugs.');
+    }
+    if (
+      d.priorLaunches !== null &&
+      d.priorDeadLaunches !== null &&
+      d.priorLaunches >= l.serialMinLaunches &&
+      d.priorDeadLaunches / d.priorLaunches >= l.serialDeadRatio
+    ) {
+      hit(
+        w.serialDeployer,
+        `Serial launcher — creator has ${d.priorLaunches} prior coins, ${d.priorDeadLaunches} dead/abandoned.`,
+      );
     }
   }
 

@@ -52,6 +52,15 @@ export interface MintInfo {
   transferFeeBps: number | null;
   /** true = fee-config or withdraw-withheld authority still set → fees can change after you buy. */
   feeAuthorityActive: boolean | null;
+  /* Token-2022 trap extensions — the current generation of rug tricks: */
+  /** permanentDelegate set → the delegate can SEIZE tokens from any wallet. */
+  permanentDelegateActive: boolean | null;
+  /** transferHook set → transfers run dev code that can block sells (programmable honeypot). */
+  transferHookActive: boolean | null;
+  /** defaultAccountState = frozen → new holder accounts start frozen. */
+  defaultAccountFrozen: boolean | null;
+  /** nonTransferable → soulbound; you cannot sell at all. */
+  nonTransferable: boolean | null;
 }
 
 /** Holder distribution, LP/burn addresses excluded where possible. */
@@ -102,6 +111,10 @@ export interface DeployerInfo {
   /** Number of prior tokens from this deployer that rugged. null = unknown. */
   priorRugs: number | null;
   fundingSource: DeployerFunding;
+  /** Coins this creator launched before this one (launchpad records). null = unknown. */
+  priorLaunches: number | null;
+  /** Of those, how many are dead/abandoned (never graduated, negligible mcap). */
+  priorDeadLaunches: number | null;
 }
 
 export interface SocialInfo {
@@ -157,6 +170,19 @@ export interface TokenAnalysis {
 export interface RiskReason {
   points: number; // positive = risk, negative = mitigation
   text: string;
+}
+
+/**
+ * The positive axis: observable quality/momentum signals (0–100). Explicitly
+ * NOT a profit prediction — it counts good signs (smart money, burned LP,
+ * healthy distribution, real liquidity, survival) the way the risk score
+ * counts bad ones.
+ */
+export interface QualityResult {
+  qualityScore: number;
+  /** Triggered positive signals, sorted by points descending. */
+  reasons: RiskReason[];
+  insufficientData: boolean;
 }
 
 export interface RiskResult {
@@ -221,7 +247,7 @@ export type BgRequest =
   | { type: 'RESOLVE_PAIRS'; pairAddresses: string[] };
 
 export type AnalyzeResponse =
-  | { ok: true; analysis: TokenAnalysis; risk: RiskResult; mock: boolean }
+  | { ok: true; analysis: TokenAnalysis; risk: RiskResult; quality: QualityResult; mock: boolean }
   | { ok: false; error: string };
 
 export type RecentResponse = { ok: true; recent: RecentToken[] } | { ok: false; error: string };
@@ -236,6 +262,8 @@ export interface FeedRow {
   riskScore: number;
   signal: Signal;
   topReason: string | null;
+  /** Positive-signal score (0–100), null when too little data to say anything. */
+  qualityScore: number | null;
   insufficientData: boolean;
   /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
   unverified: boolean;

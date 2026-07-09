@@ -75,13 +75,35 @@ async function fetchMintInfo(address: string): Promise<MintInfo | null> {
 
   let transferFeeBps: number | null = null;
   let feeAuthorityActive: boolean | null = isToken2022 ? false : null; // legacy SPL: concept doesn't exist
+  // Token-2022 trap extensions — the current generation of rug tricks. Legacy
+  // SPL mints CANNOT carry these, so false is accurate there (not unknown).
+  let permanentDelegateActive = false;
+  let transferHookActive = false;
+  let defaultAccountFrozen = false;
+  let nonTransferable = false;
   const extensions = Array.isArray(info.extensions) ? (info.extensions as Array<Record<string, unknown>>) : [];
   for (const ext of extensions) {
-    if (ext.extension === 'transferFeeConfig') {
-      const state = (ext.state ?? {}) as Record<string, unknown>;
-      const newer = (state.newerTransferFee ?? {}) as Record<string, unknown>;
-      transferFeeBps = asNumber(newer.transferFeeBasisPoints) ?? 0;
-      feeAuthorityActive = state.transferFeeConfigAuthority != null || state.withdrawWithheldAuthority != null;
+    const state = (ext.state ?? {}) as Record<string, unknown>;
+    switch (ext.extension) {
+      case 'transferFeeConfig': {
+        const newer = (state.newerTransferFee ?? {}) as Record<string, unknown>;
+        transferFeeBps = asNumber(newer.transferFeeBasisPoints) ?? 0;
+        feeAuthorityActive = state.transferFeeConfigAuthority != null || state.withdrawWithheldAuthority != null;
+        break;
+      }
+      case 'permanentDelegate':
+        permanentDelegateActive = state.delegate != null;
+        break;
+      case 'transferHook':
+        transferHookActive = state.programId != null;
+        break;
+      case 'defaultAccountState':
+        defaultAccountFrozen = state.accountState === 'frozen';
+        break;
+      case 'nonTransferable':
+      case 'nonTransferableAccount':
+        nonTransferable = true;
+        break;
     }
   }
 
@@ -92,6 +114,10 @@ async function fetchMintInfo(address: string): Promise<MintInfo | null> {
     isToken2022,
     transferFeeBps,
     feeAuthorityActive,
+    permanentDelegateActive,
+    transferHookActive,
+    defaultAccountFrozen,
+    nonTransferable,
   };
 }
 

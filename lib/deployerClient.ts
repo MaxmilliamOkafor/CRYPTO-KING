@@ -15,6 +15,7 @@
  *    that is the whole integration surface.
  */
 
+import { fetchCreatorCoins } from './pumpfunClient.ts';
 import type { DeployerInfo, SourceStatus } from './types.ts';
 
 export interface DeployerHistory {
@@ -31,7 +32,42 @@ export const nullDeployerAdapter: DeployerAdapter = {
   async fetchDeployerHistory(): Promise<DeployerHistory> {
     return {
       status: 'disabled',
-      deployer: { priorRugs: null, fundingSource: 'unknown' },
+      deployer: { priorRugs: null, fundingSource: 'unknown', priorLaunches: null, priorDeadLaunches: null },
+    };
+  },
+};
+
+/**
+ * Launchpad-records adapter: counts the creator's PRIOR pump.fun coins and how
+ * many are dead/abandoned (never graduated, negligible mcap, older than a day).
+ * This is platform data about launches — still no funding-graph profiling.
+ * priorRugs stays null: a dead launch is not proof of a rug, and we don't
+ * overclaim; the scorer has a separate, honestly-worded serial-deployer factor.
+ */
+export const pumpfunDeployerAdapter: DeployerAdapter = {
+  async fetchDeployerHistory(tokenAddress: string, creatorAddress: string | null): Promise<DeployerHistory> {
+    if (!creatorAddress) return nullDeployerAdapter.fetchDeployerHistory(tokenAddress, creatorAddress);
+    const coins = await fetchCreatorCoins(creatorAddress);
+    if (coins === null) return nullDeployerAdapter.fetchDeployerHistory(tokenAddress, creatorAddress);
+
+    const dayAgo = Date.now() - 24 * 60 * 60_000;
+    const prior = coins.filter((c) => c.mint !== tokenAddress);
+    const dead = prior.filter(
+      (c) =>
+        c.complete === false &&
+        (c.usdMarketCap ?? 0) < 10_000 &&
+        c.createdMs !== null &&
+        c.createdMs < dayAgo,
+    );
+
+    return {
+      status: 'ok',
+      deployer: {
+        priorRugs: null, // we never claim "rug" from launch records alone
+        fundingSource: 'unknown',
+        priorLaunches: prior.length,
+        priorDeadLaunches: dead.length,
+      },
     };
   },
 };

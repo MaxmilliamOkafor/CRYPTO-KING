@@ -58,8 +58,16 @@ var LIVE_FEED = {
    * observed risk ≠ safe" — informational, never a buy signal.
    */
   notifyLowRisk: true,
-  notifyMaxScore: 39
+  notifyMaxScore: 39,
   // CONSIDER / NEUTRAL territory
+  /** "Low caps only" feed filter threshold (early-stage hunting ground). */
+  lowCapMaxEur: 1e5,
+  /**
+   * 💎 gem-alert threshold: a feed coin pulses gold when risk ≤ notifyMaxScore
+   * AND quality ≥ gemMinQuality. An attention aid for candidates worth YOUR
+   * research — emphatically not a buy signal.
+   */
+  gemMinQuality: 30
 };
 var INLINE_BADGES = {
   enabled: true,
@@ -102,7 +110,11 @@ var FIXTURE_AVOID = {
     metadataMutable: false,
     isToken2022: false,
     transferFeeBps: null,
-    feeAuthorityActive: false
+    feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false
   },
   holders: {
     holderCount: 3100,
@@ -128,7 +140,7 @@ var FIXTURE_AVOID = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false
   },
-  deployer: { priorRugs: 0, fundingSource: "cex" },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
   socials: { website: null, twitter: null, telegram: null, verified: null },
   // +10 no socials
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
@@ -154,7 +166,11 @@ var FIXTURE_WATCH = {
     // +5
     isToken2022: false,
     transferFeeBps: null,
-    feeAuthorityActive: false
+    feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false
   },
   holders: {
     holderCount: 5400,
@@ -180,7 +196,7 @@ var FIXTURE_WATCH = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: true
   },
-  deployer: { priorRugs: 0, fundingSource: "cex" },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
   socials: { website: "https://wifcat.example", twitter: "https://x.com/wifcat", telegram: null, verified: false },
   // +5
   smartMoney: { accumulating: false, exiting: false, walletCount: 0 },
@@ -205,7 +221,11 @@ var FIXTURE_NEUTRAL = {
     metadataMutable: false,
     isToken2022: false,
     transferFeeBps: null,
-    feeAuthorityActive: false
+    feeAuthorityActive: false,
+    permanentDelegateActive: false,
+    transferHookActive: false,
+    defaultAccountFrozen: false,
+    nonTransferable: false
   },
   holders: {
     holderCount: 18200,
@@ -229,7 +249,7 @@ var FIXTURE_NEUTRAL = {
     deployerLinkedSelling: false,
     abnormalEarlyVolume: false
   },
-  deployer: { priorRugs: 0, fundingSource: "cex" },
+  deployer: { priorRugs: 0, fundingSource: "cex", priorLaunches: null, priorDeadLaunches: null },
   socials: {
     website: "https://quokka.example",
     twitter: "https://x.com/quokka",
@@ -389,7 +409,7 @@ async function analyze(address, _manual = false) {
     showError(res.error);
     return;
   }
-  render(res.analysis, res.risk, res.mock);
+  render(res.analysis, res.risk, res.quality, res.mock);
 }
 var host = null;
 var shadow = null;
@@ -458,12 +478,30 @@ var STYLES = `
   .muted { color: #9aa1af; }
   /* collapsed floating button */
   .fab {
+    position: relative;
     width: 46px; height: 46px; border-radius: 50%;
     background: linear-gradient(135deg,#2f6df6,#1b3fae); color: #fff;
     box-shadow: 0 8px 24px rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center;
     font-size: 22px; cursor: pointer; border: 1px solid #3a5bd0;
   }
   .fab:hover { filter: brightness(1.1); }
+  @keyframes gemPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,200,60,.65); }
+    50% { box-shadow: 0 0 14px 5px rgba(255,200,60,.25); }
+  }
+  .fab.gem-alert { border-color: #ffc83c; animation: gemPulse 1.2s infinite; }
+  .fab-badge {
+    position: absolute; top: -4px; right: -4px;
+    min-width: 18px; height: 18px; border-radius: 999px;
+    background: #ffc83c; color: #1b1b18; font: 800 11px/18px system-ui, sans-serif;
+    text-align: center; padding: 0 4px; border: 1px solid #b8860b;
+  }
+  .scan-item.gem {
+    border: 1px solid #b8860b; border-radius: 8px;
+    background: linear-gradient(90deg, #251f0e, #1a1d24);
+    animation: gemPulse 1.8s infinite;
+  }
+  .scan-item.gem:hover { background: linear-gradient(90deg, #2c2510, #1e222b); }
   /* page scan list */
   .scan-section { margin-top: 12px; border-top: 1px solid #2c303a; padding-top: 10px; }
   .scan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
@@ -490,6 +528,13 @@ var STYLES = `
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
+  .live-controls { display: flex; align-items: center; gap: 10px; margin: 6px 0 2px; flex-wrap: wrap; }
+  .sort-toggle { color: #7aa2ff; font-size: 10.5px; padding: 1px 6px; border: 1px solid #2c303a; border-radius: 6px; }
+  .sort-toggle:hover { border-color: #7aa2ff; }
+  .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
+  .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
+  .quality-line { color: #9fd8b1; font-size: 11.5px; margin: -2px 0 8px; }
+  .quality-line .muted { color: #8a91a0; font-size: 10px; }
   .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
   .copy:hover { color: #fff; background: #2a2f3e; }
   .copy.copied { color: #6fd08c; }
@@ -515,8 +560,11 @@ function wrapEl() {
 }
 function renderCollapsed() {
   const w = wrapEl();
-  w.innerHTML = `<div class="fab" title="Open CRYPTO-KING risk scanner">\u{1F451}</div>`;
-  stopLiveFeed();
+  w.innerHTML = `
+    <div class="fab" title="Open CRYPTO-KING risk scanner">\u{1F451}
+      <span class="fab-badge" hidden>0</span>
+    </div>`;
+  refreshGemAlerts();
   w.querySelector(".fab")?.addEventListener("click", () => {
     collapsed = false;
     if (currentAddress) {
@@ -554,7 +602,11 @@ function renderHome() {
       <div class="scan-head">
         <span class="live-dot"></span>
         <span class="t">Live Solana launches \u2014 auto-scanning</span>
+      </div>
+      <div class="live-controls">
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
+        <label class="safe-toggle"><input type="checkbox" class="low-cap" /> low caps only</label>
+        <button class="sort-toggle" title="Toggle between newest-first and best quality\u2212risk first">Sort: newest</button>
       </div>
       <div class="live-status">Starting live scan\u2026</div>
       <div class="livelist"></div>
@@ -609,6 +661,23 @@ function renderHome() {
     safeToggle.checked = liveSafeOnly;
     safeToggle.addEventListener("change", () => {
       liveSafeOnly = safeToggle.checked;
+      updateLiveList();
+    });
+  }
+  const lowCapToggle = body.querySelector(".low-cap");
+  if (lowCapToggle) {
+    lowCapToggle.checked = liveLowCapOnly;
+    lowCapToggle.addEventListener("change", () => {
+      liveLowCapOnly = lowCapToggle.checked;
+      updateLiveList();
+    });
+  }
+  const sortToggle = body.querySelector(".sort-toggle");
+  if (sortToggle) {
+    sortToggle.textContent = liveSortBest ? "Sort: \u{1F3C6} best" : "Sort: newest";
+    sortToggle.addEventListener("click", () => {
+      liveSortBest = !liveSortBest;
+      sortToggle.textContent = liveSortBest ? "Sort: \u{1F3C6} best" : "Sort: newest";
       updateLiveList();
     });
   }
@@ -742,6 +811,8 @@ var liveRows = [];
 var liveTimer = null;
 var livePolling = false;
 var liveSafeOnly = false;
+var liveLowCapOnly = false;
+var liveSortBest = false;
 function startLiveFeed() {
   if (liveTimer) return;
   void pollLiveFeed();
@@ -754,7 +825,7 @@ function stopLiveFeed() {
   }
 }
 async function pollLiveFeed() {
-  if (livePolling || collapsed || view !== "home") return;
+  if (livePolling || view !== "home") return;
   livePolling = true;
   try {
     const res = await new Promise((resolve) => {
@@ -762,19 +833,40 @@ async function pollLiveFeed() {
     });
     if (view !== "home") return;
     if (!res || !res.ok) {
-      setLiveStatus(res?.ok === false ? res.error : "Live feed unavailable.");
+      if (!collapsed) setLiveStatus(res?.ok === false ? res.error : "Live feed unavailable.");
       return;
     }
     liveRows = res.feed;
-    updateLiveList();
-    const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === "AVOID" || r.signal === "HIGH_RISK")).length;
-    const lower = liveRows.filter((r) => !r.insufficientData && (r.signal === "CONSIDER" || r.signal === "NEUTRAL")).length;
-    setLiveStatus(
-      `\u{1F534} live \xB7 ${liveRows.length} fresh coins \xB7 \u26A0 ${worst} high-risk \xB7 ${lower} lower-risk` + (res.source === "mock" ? " \xB7 MOCK" : "")
-    );
+    if (!collapsed) {
+      updateLiveList();
+      const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === "AVOID" || r.signal === "HIGH_RISK")).length;
+      const gems = liveRows.filter(isGem).length;
+      setLiveStatus(
+        `\u{1F534} live \xB7 ${liveRows.length} fresh coins \xB7 \u26A0 ${worst} high-risk \xB7 \u{1F48E} ${gems} candidates` + (res.source === "mock" ? " \xB7 MOCK" : "")
+      );
+    }
+    refreshGemAlerts();
   } finally {
     livePolling = false;
   }
+}
+var gemSeen = /* @__PURE__ */ new Set();
+function isGem(r) {
+  return !r.insufficientData && r.riskScore <= LIVE_FEED.notifyMaxScore && r.qualityScore !== null && r.qualityScore >= LIVE_FEED.gemMinQuality;
+}
+function refreshGemAlerts() {
+  const gems = liveRows.filter(isGem);
+  if (!collapsed && view === "home") {
+    for (const g of gems) gemSeen.add(g.address);
+  }
+  const fab = shadow?.querySelector(".fab");
+  const badge = shadow?.querySelector(".fab-badge");
+  if (!fab || !badge) return;
+  const unseen = gems.filter((g) => !gemSeen.has(g.address)).length;
+  fab.classList.toggle("gem-alert", unseen > 0);
+  badge.hidden = unseen === 0;
+  badge.textContent = String(unseen);
+  fab.title = unseen > 0 ? `CRYPTO-KING: ${unseen} \u{1F48E} candidate${unseen > 1 ? "s" : ""} \u2014 click to review` : "Open CRYPTO-KING risk scanner";
 }
 function setLiveStatus(text) {
   const el = shadow?.querySelector(".live-status");
@@ -785,8 +877,12 @@ function updateLiveList() {
   if (!list) return;
   let rows = [...liveRows];
   if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK");
+  if (liveLowCapOnly) rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur);
+  if (liveSortBest) {
+    rows.sort((a, b) => (b.qualityScore ?? 0) - b.riskScore - ((a.qualityScore ?? 0) - a.riskScore));
+  }
   if (rows.length === 0) {
-    list.innerHTML = `<div class="scan-empty">${liveSafeOnly ? "No lower-risk fresh launches right now." : "Waiting for the first live results\u2026"}</div>`;
+    list.innerHTML = `<div class="scan-empty">${liveSafeOnly || liveLowCapOnly ? "No fresh launches match the filters right now." : "Waiting for the first live results\u2026"}</div>`;
     return;
   }
   list.innerHTML = rows.map((r) => {
@@ -796,17 +892,27 @@ function updateLiveList() {
     const fg = r.insufficientData ? "#e6e8ee" : meta.textColor;
     const sym = r.symbol ?? short(r.address);
     const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? (r.unverified ? "Early checks clean \u2014 holders/LP not verified yet (click for full scan)" : "No risk factors triggered \u2014 still not a buy signal");
+    const gem = isGem(r);
     return `
-        <div class="scan-item" data-addr="${esc(r.address)}">
+        <div class="scan-item${gem ? " gem" : ""}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${esc(sym)} <span class="age">${esc(ageShort(r.ageMinutes))}</span>${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ""}</span>
+            <span class="si-sym">${gem ? "\u{1F48E} " : ""}${esc(sym)}
+              <span class="age">${esc(ageShort(r.ageMinutes))}</span>
+              ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ""}
+              ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals \u2014 not a profit prediction">Q${r.qualityScore}</span>` : ""}
+              ${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
         </div>`;
   }).join("");
   wireRowHandlers(list);
+}
+function eurShort(v) {
+  if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
+  return `\u20AC${v.toFixed(0)}`;
 }
 function wireRowHandlers(list) {
   list.querySelectorAll(".scan-item").forEach((el) => {
@@ -1001,7 +1107,7 @@ function showError(message) {
     <button class="back-btn">\u2190 Scan another token</button>`;
   body.querySelector(".back-btn")?.addEventListener("click", backToHome);
 }
-function render(analysis, risk, mock) {
+function render(analysis, risk, quality, mock) {
   if (collapsed) return;
   if (risk.insufficientData) {
     showError("Not enough data to assess this token.");
@@ -1011,6 +1117,7 @@ function render(analysis, risk, mock) {
   const meta = SIGNAL_META[risk.signal];
   const topReason = risk.reasons[0]?.text ?? "No individual risk factors triggered \u2014 low observed risk \u2260 safe.";
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
+  const qualityLine = quality.insufficientData ? "" : `<div class="quality-line">Quality signals: <b>${quality.qualityScore}/100</b> <span class="muted">(observed positives \u2014 not a profit prediction)</span></div>`;
   body.innerHTML = `
     <div class="head">
       <span class="badge" style="background:${meta.color};color:${meta.textColor}">${meta.label}</span>
@@ -1020,6 +1127,7 @@ function render(analysis, risk, mock) {
       <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">\u29C9</button>
     </div>
     <div class="top-reason">${esc(topReason)}</div>
+    ${qualityLine}
     <div class="row">
       <button class="details-btn">Details \u25BE</button>
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
@@ -1036,7 +1144,7 @@ function render(analysis, risk, mock) {
     const open = !panel.hidden;
     panel.hidden = open;
     if (btn) btn.textContent = open ? "Details \u25BE" : "Details \u25B4";
-    if (!open && panel.childElementCount === 0) fillPanel(panel, analysis, risk);
+    if (!open && panel.childElementCount === 0) fillPanel(panel, analysis, risk, quality);
   });
 }
 function backToHome() {
@@ -1044,14 +1152,16 @@ function backToHome() {
   view = "home";
   renderHome();
 }
-function fillPanel(panel, analysis, risk) {
+function fillPanel(panel, analysis, risk, quality) {
   const addr = analysis.identity.address;
   const reasons = risk.reasons.slice(0, 6).map((r) => `<li><span class="pts bad">+${r.points}</span><span>${esc(r.text)}</span></li>`).join("");
   const mitigations = risk.mitigations.map((m) => `<li><span class="pts good">${m.points}</span><span>${esc(m.text)}</span></li>`).join("");
+  const qualityItems = quality.reasons.slice(0, 6).map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`).join("");
   const gaps = risk.dataGaps.slice(0, 5).map((g) => `<li class="gap">${esc(g)}</li>`).join("");
   panel.innerHTML = `
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ""}
+    ${qualityItems ? `<h4>Quality signals (not a profit prediction)</h4><ul>${qualityItems}</ul>` : ""}
     ${gaps ? `<h4>Not checked (data unavailable)</h4><ul>${gaps}</ul>` : ""}
     <div class="links">
       <a href="https://solscan.io/token/${addr}" target="_blank" rel="noreferrer">Solscan \u2197</a>

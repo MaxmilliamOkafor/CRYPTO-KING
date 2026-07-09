@@ -26,10 +26,21 @@ export interface SolanaData {
   status: 'ok' | 'partial' | 'unavailable' | 'mock';
 }
 
-export async function fetchSolanaData(address: string): Promise<SolanaData> {
+/**
+ * `lite` = mint account only (1 RPC call instead of 4). Used by the Live feed's
+ * bulk scans: mint/freeze authority is the highest-weight rug check, and holder
+ * math is deferred (honest data gap) until the user opens the coin — a full
+ * scan then upgrades the cached result.
+ */
+export async function fetchSolanaData(address: string, lite = false): Promise<SolanaData> {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, status: 'mock' };
+  }
+
+  if (lite) {
+    const mint = await fetchMintInfo(address);
+    return { mint, holders: null, status: mint ? 'partial' : 'unavailable' };
   }
 
   const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address)]);

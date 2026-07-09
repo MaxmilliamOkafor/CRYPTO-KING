@@ -103,6 +103,7 @@ async function requestAnalysis(address: string, lite = false): Promise<AnalyzeRe
 /** Scan a single token and show its full card. */
 async function analyze(address: string, _manual = false): Promise<void> {
   stopLiveFeed(); // we're leaving the home/live view
+  view = 'token'; // set here (not just in detect) so feed-row clicks count too
   currentAddress = address;
   showLoading(address);
   const res = await requestAnalysis(address, false);

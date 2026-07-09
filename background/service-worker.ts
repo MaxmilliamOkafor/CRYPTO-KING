@@ -17,7 +17,7 @@
 import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana } from '../lib/dexscreenerClient.ts';
-import { fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
+import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
@@ -42,6 +42,8 @@ interface CacheEntry {
   analysis: TokenAnalysis;
   risk: RiskResult;
   at: number;
+  /** true = produced by a lite feed scan (mint-only); a full request re-scans. */
+  lite: boolean;
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -75,10 +77,20 @@ async function handle(msg: BgRequest): Promise<AnalyzeResponse | RecentResponse 
 /* ── Live feed: real-time auto-scan of the newest launches ─────────────── */
 
 const feed = new Map<string, FeedRow>();
+const notified = new Set<string>(); // mints already desktop-notified
+let feedInFlight: Promise<LiveFeedResponse> | null = null;
 
-async function getLiveFeed(): Promise<LiveFeedResponse> {
-  if (!LIVE_FEED.enabled) return { ok: false, error: 'Live feed disabled in config.' };
+/** Concurrent polls (multiple tabs) share one sweep instead of doubling the scans. */
+function getLiveFeed(): Promise<LiveFeedResponse> {
+  if (!LIVE_FEED.enabled) return Promise.resolve({ ok: false, error: 'Live feed disabled in config.' });
+  if (feedInFlight) return feedInFlight;
+  feedInFlight = doLiveFeedSweep().finally(() => {
+    feedInFlight = null;
+  });
+  return feedInFlight;
+}
 
+async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
   let coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
   if (coins.length === 0) {
     // Fallback: DexScreener fresh Solana tokens (address-only; details fill in on scan).
@@ -92,37 +104,45 @@ async function getLiveFeed(): Promise<LiveFeedResponse> {
     };
   }
 
-  // Prune anything too old to still count as a fresh launch.
-  const cutoff = Date.now() - LIVE_FEED.maxAgeMinutes * 60_000;
+  // Age existing rows by the time elapsed since their scan, then prune stale ones.
   for (const [mint, row] of feed) {
-    if (row.ageMinutes !== null && row.scannedAt < cutoff && row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
+    if (row.ageMinutes !== null) {
+      row.ageMinutes += (Date.now() - row.scannedAt) / 60_000;
+      row.scannedAt = Date.now();
+      if (row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
+    }
   }
 
-  // Scan newest-first, but only a budget of NOT-yet-scanned coins per poll
-  // (each scan costs several RPC calls). Cached coins refresh for free.
+  // Scan newest-first with a per-poll budget of not-yet-scanned coins. Feed
+  // scans are LITE (mint-authority check only, 1 RPC call) so a full budget
+  // fits inside the poll interval on the public RPC; opening a coin upgrades
+  // it to a full scan. Cached coins refresh for free.
   let scannedThisPoll = 0;
   for (const c of coins) {
     const cached = cache.get(c.mint);
     const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
     if (!fresh) {
       if (scannedThisPoll >= LIVE_FEED.scanBudgetPerPoll) continue;
-      await analyzeToken(c.mint, false); // populates cache
+      await analyzeToken(c.mint, false, undefined, /*lite*/ true);
       scannedThisPoll++;
     }
     const entry = cache.get(c.mint);
     if (!entry) continue;
-    feed.set(c.mint, {
+    const row: FeedRow = {
       address: c.mint,
       symbol: entry.analysis.identity.symbol ?? c.symbol,
       name: entry.analysis.identity.name ?? c.name,
-      ageMinutes: entry.analysis.identity.ageMinutes ?? (c.createdMs ? Math.max(0, (Date.now() - c.createdMs) / 60_000) : null),
+      ageMinutes:
+        entry.analysis.identity.ageMinutes ?? (c.createdMs ? Math.max(0, (Date.now() - c.createdMs) / 60_000) : null),
       marketCapEur: entry.analysis.market?.marketCapEur ?? null,
       riskScore: entry.risk.riskScore,
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       insufficientData: entry.risk.insufficientData,
       scannedAt: Date.now(),
-    });
+    };
+    feed.set(c.mint, row);
+    maybeNotifyLowRisk(row, entry.risk);
   }
 
   // Newest first, capped.
@@ -138,35 +158,74 @@ async function getLiveFeed(): Promise<LiveFeedResponse> {
   return { ok: true, feed: rows, source: MOCK_MODE ? 'mock' : 'ok', scannedThisPoll };
 }
 
-async function analyzeToken(address: string, force: boolean, rawGmgn?: unknown): Promise<AnalyzeResponse> {
+/**
+ * Desktop notification when a fresh launch scans lower-risk — so the user
+ * doesn't have to watch the panel. Requires the on-chain authority checks to
+ * have actually run (never notify on insufficient data), fires once per mint,
+ * and the copy stays risk-framed: "lower observed risk", never "buy".
+ */
+function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
+  if (!LIVE_FEED.notifyLowRisk || MOCK_MODE) return;
+  if (row.insufficientData || risk.riskScore > LIVE_FEED.notifyMaxScore) return;
+  if (notified.has(row.address)) return;
+  const mintChecked = risk.dataGaps.every((g) => !/mint data unavailable/i.test(g));
+  if (!mintChecked) return;
+  notified.add(row.address);
+  if (notified.size > 500) notified.clear(); // bounded memory; duplicate ping is harmless
+
+  const sym = row.symbol ?? `${row.address.slice(0, 4)}…${row.address.slice(-4)}`;
+  chrome.notifications.create(`ck-${row.address}`, {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: `👑 ${sym} — score ${risk.riskScore} (${risk.signal})`,
+    message: `Fresh launch, lower observed risk (≠ safe). ${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ''}Click to open on GMGN.`,
+  });
+}
+
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith('ck-')) return;
+  const address = id.slice(3);
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
+  chrome.notifications.clear(id);
+});
+
+async function analyzeToken(address: string, force: boolean, rawGmgn?: unknown, lite = false): Promise<AnalyzeResponse> {
   if (!BASE58_RE.test(address)) {
     return { ok: false, error: 'Not a valid Solana address.' };
   }
 
+  // A cached lite (mint-only) result satisfies lite requests, but a full
+  // request upgrades it with the complete scan.
   const cached = cache.get(address);
-  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) {
+  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS && (!cached.lite || lite)) {
     return { ok: true, analysis: cached.analysis, risk: cached.risk, mock: MOCK_MODE };
   }
 
   const pending = inFlight.get(address);
   if (pending) return pending;
 
-  const job = doAnalyze(address, rawGmgn).finally(() => inFlight.delete(address));
+  const job = doAnalyze(address, rawGmgn, lite).finally(() => inFlight.delete(address));
   inFlight.set(address, job);
   return job;
 }
 
-async function doAnalyze(address: string, rawGmgn?: unknown): Promise<AnalyzeResponse> {
+async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Promise<AnalyzeResponse> {
   try {
     // GMGN: prefer the raw payload the content script fetched same-origin (cookies
     // apply, dodges Cloudflare); otherwise fetch it here (mock mode, or the popup
-    // which isn't running on gmgn.ai).
+    // which isn't running on gmgn.ai). Lite feed scans skip GMGN entirely — the
+    // cross-origin fetch would be Cloudflare-challenged anyway and each attempt
+    // burns ~2.4s of the gmgn.ai rate-limit budget.
     const gmgnPromise =
-      !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn as GmgnRaw)) : fetchGmgnData(address);
+      !MOCK_MODE && rawGmgn
+        ? Promise.resolve(parseGmgn(rawGmgn as GmgnRaw))
+        : lite && !MOCK_MODE
+          ? Promise.resolve(emptyGmgnData())
+          : fetchGmgnData(address);
     // All adapters degrade to honest "unavailable" internally; Promise.all is safe.
     const [gmgn, solana, pumpfun, audit] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address),
+      fetchSolanaData(address, lite),
       fetchPumpfunData(address),
       rugcheckAdapter.fetchAudit(address),
     ]);
@@ -181,8 +240,10 @@ async function doAnalyze(address: string, rawGmgn?: unknown): Promise<AnalyzeRes
     });
 
     const risk = scoreToken(analysis);
-    cache.set(address, { analysis, risk, at: Date.now() });
-    await saveRecent(analysis, risk);
+    cache.set(address, { analysis, risk, at: Date.now(), lite });
+    // Lite feed sweeps would flush the user's own browsing history out of the
+    // dashboard's capped recent list — only full scans are recorded there.
+    if (!lite) await saveRecent(analysis, risk);
     return { ok: true, analysis, risk, mock: MOCK_MODE };
   } catch (err) {
     console.error('[CRYPTO-KING] analysis failed:', err);

@@ -49,9 +49,10 @@ var LIVE_FEED = {
   /** How many newest coins to pull from the source each poll. */
   fetchCount: 50,
   /**
-   * Max NEW coins to fully risk-scan per poll. Each scan makes several Solana
-   * RPC calls, so keep this modest on the public RPC (raise it once you add a
-   * Helius key — see SOLANA.rpcUrl). Already-scanned coins are served from cache.
+   * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
+   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
+   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
+   * key (see SOLANA.rpcUrl) you can raise this substantially.
    */
   scanBudgetPerPoll: 6,
   /** Panel auto-refresh / poll interval in ms. */
@@ -59,7 +60,15 @@ var LIVE_FEED = {
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
-  maxRows: 60
+  maxRows: 60,
+  /**
+   * Desktop notification when a fresh launch scans at or below notifyMaxScore
+   * (with the on-chain authority checks actually completed). Framed as "lower
+   * observed risk ≠ safe" — informational, never a buy signal.
+   */
+  notifyLowRisk: true,
+  notifyMaxScore: 39
+  // CONSIDER / NEUTRAL territory
 };
 var DEXSCREENER = {
   enabled: true,
@@ -199,7 +208,7 @@ function rateLimitFor(host) {
   const bare = host.replace(/^www\./, "");
   return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
 }
-var hostQueues = /* @__PURE__ */ new Map();
+var hostState = /* @__PURE__ */ new Map();
 function hostOf(url) {
   try {
     return new URL(url).host;
@@ -210,11 +219,15 @@ function hostOf(url) {
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function fetchJson(url, init) {
   const host = hostOf(url);
-  const q = hostQueues.get(host) ?? { lastAt: 0, chain: Promise.resolve() };
-  const run = q.chain.then(async () => {
-    const wait = q.lastAt + rateLimitFor(host) - Date.now();
+  let st = hostState.get(host);
+  if (!st) {
+    st = { nextAt: 0, chain: Promise.resolve() };
+    hostState.set(host, st);
+  }
+  const run = st.chain.then(async () => {
+    const wait = st.nextAt - Date.now();
     if (wait > 0) await sleep(wait);
-    q.lastAt = Date.now();
+    st.nextAt = Date.now() + rateLimitFor(host);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
@@ -231,11 +244,8 @@ async function fetchJson(url, init) {
       clearTimeout(timer);
     }
   });
-  hostQueues.set(host, { lastAt: q.lastAt, chain: run.catch(() => void 0) });
-  const result = await run;
-  const entry = hostQueues.get(host);
-  if (entry) entry.lastAt = Math.max(entry.lastAt, Date.now() - 1);
-  return result;
+  st.chain = run.catch(() => void 0);
+  return run;
 }
 async function rpcCall(rpcUrl, method, params) {
   const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
@@ -631,6 +641,9 @@ function mockGmgnData(address) {
     behavior: f.behavior
   };
 }
+function emptyGmgnData() {
+  return { ...EMPTY };
+}
 var EMPTY = {
   status: "unavailable",
   symbol: null,
@@ -952,10 +965,14 @@ var rugcheckAdapter = {
 
 // lib/solanaClient.ts
 var TOKEN_2022_PROGRAM2 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchSolanaData(address) {
+async function fetchSolanaData(address, lite = false) {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, status: "mock" };
+  }
+  if (lite) {
+    const mint2 = await fetchMintInfo(address);
+    return { mint: mint2, holders: null, status: mint2 ? "partial" : "unavailable" };
   }
   const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address)]);
   const status = mint && holders ? "ok" : mint || holders ? "partial" : "unavailable";
@@ -1059,8 +1076,17 @@ async function handle(msg) {
   }
 }
 var feed = /* @__PURE__ */ new Map();
-async function getLiveFeed() {
-  if (!LIVE_FEED.enabled) return { ok: false, error: "Live feed disabled in config." };
+var notified = /* @__PURE__ */ new Set();
+var feedInFlight = null;
+function getLiveFeed() {
+  if (!LIVE_FEED.enabled) return Promise.resolve({ ok: false, error: "Live feed disabled in config." });
+  if (feedInFlight) return feedInFlight;
+  feedInFlight = doLiveFeedSweep().finally(() => {
+    feedInFlight = null;
+  });
+  return feedInFlight;
+}
+async function doLiveFeedSweep() {
   let coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
   if (coins.length === 0) {
     const addrs = await fetchDexscreenerNewSolana(LIVE_FEED.fetchCount);
@@ -1072,9 +1098,12 @@ async function getLiveFeed() {
       error: MOCK_MODE ? "Live feed needs live mode (MOCK_MODE=false)." : "Live launch source unavailable right now."
     };
   }
-  const cutoff = Date.now() - LIVE_FEED.maxAgeMinutes * 6e4;
   for (const [mint, row] of feed) {
-    if (row.ageMinutes !== null && row.scannedAt < cutoff && row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
+    if (row.ageMinutes !== null) {
+      row.ageMinutes += (Date.now() - row.scannedAt) / 6e4;
+      row.scannedAt = Date.now();
+      if (row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
+    }
   }
   let scannedThisPoll = 0;
   for (const c of coins) {
@@ -1082,12 +1111,18 @@ async function getLiveFeed() {
     const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
     if (!fresh) {
       if (scannedThisPoll >= LIVE_FEED.scanBudgetPerPoll) continue;
-      await analyzeToken(c.mint, false);
+      await analyzeToken(
+        c.mint,
+        false,
+        void 0,
+        /*lite*/
+        true
+      );
       scannedThisPoll++;
     }
     const entry = cache.get(c.mint);
     if (!entry) continue;
-    feed.set(c.mint, {
+    const row = {
       address: c.mint,
       symbol: entry.analysis.identity.symbol ?? c.symbol,
       name: entry.analysis.identity.name ?? c.name,
@@ -1098,7 +1133,9 @@ async function getLiveFeed() {
       topReason: entry.risk.reasons[0]?.text ?? null,
       insufficientData: entry.risk.insufficientData,
       scannedAt: Date.now()
-    });
+    };
+    feed.set(c.mint, row);
+    maybeNotifyLowRisk(row, entry.risk);
   }
   const rows = [...feed.values()].sort((a, b) => (a.ageMinutes ?? 1e9) - (b.ageMinutes ?? 1e9)).slice(0, LIVE_FEED.maxRows);
   if (feed.size > LIVE_FEED.maxRows * 2) {
@@ -1107,26 +1144,48 @@ async function getLiveFeed() {
   }
   return { ok: true, feed: rows, source: MOCK_MODE ? "mock" : "ok", scannedThisPoll };
 }
-async function analyzeToken(address, force, rawGmgn) {
+function maybeNotifyLowRisk(row, risk) {
+  if (!LIVE_FEED.notifyLowRisk || MOCK_MODE) return;
+  if (row.insufficientData || risk.riskScore > LIVE_FEED.notifyMaxScore) return;
+  if (notified.has(row.address)) return;
+  const mintChecked = risk.dataGaps.every((g) => !/mint data unavailable/i.test(g));
+  if (!mintChecked) return;
+  notified.add(row.address);
+  if (notified.size > 500) notified.clear();
+  const sym = row.symbol ?? `${row.address.slice(0, 4)}\u2026${row.address.slice(-4)}`;
+  chrome.notifications.create(`ck-${row.address}`, {
+    type: "basic",
+    iconUrl: "icons/icon128.png",
+    title: `\u{1F451} ${sym} \u2014 score ${risk.riskScore} (${risk.signal})`,
+    message: `Fresh launch, lower observed risk (\u2260 safe). ${row.ageMinutes !== null ? `${Math.round(row.ageMinutes)} min old. ` : ""}Click to open on GMGN.`
+  });
+}
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith("ck-")) return;
+  const address = id.slice(3);
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
+  chrome.notifications.clear(id);
+});
+async function analyzeToken(address, force, rawGmgn, lite = false) {
   if (!BASE58_RE3.test(address)) {
     return { ok: false, error: "Not a valid Solana address." };
   }
   const cached = cache.get(address);
-  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) {
+  if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS && (!cached.lite || lite)) {
     return { ok: true, analysis: cached.analysis, risk: cached.risk, mock: MOCK_MODE };
   }
   const pending = inFlight.get(address);
   if (pending) return pending;
-  const job = doAnalyze(address, rawGmgn).finally(() => inFlight.delete(address));
+  const job = doAnalyze(address, rawGmgn, lite).finally(() => inFlight.delete(address));
   inFlight.set(address, job);
   return job;
 }
-async function doAnalyze(address, rawGmgn) {
+async function doAnalyze(address, rawGmgn, lite = false) {
   try {
-    const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : fetchGmgnData(address);
+    const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : lite && !MOCK_MODE ? Promise.resolve(emptyGmgnData()) : fetchGmgnData(address);
     const [gmgn, solana, pumpfun, audit] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address),
+      fetchSolanaData(address, lite),
       fetchPumpfunData(address),
       rugcheckAdapter.fetchAudit(address)
     ]);
@@ -1139,8 +1198,8 @@ async function doAnalyze(address, rawGmgn) {
       deployer: deployerHist.status
     });
     const risk = scoreToken(analysis);
-    cache.set(address, { analysis, risk, at: Date.now() });
-    await saveRecent(analysis, risk);
+    cache.set(address, { analysis, risk, at: Date.now(), lite });
+    if (!lite) await saveRecent(analysis, risk);
     return { ok: true, analysis, risk, mock: MOCK_MODE };
   } catch (err) {
     console.error("[CRYPTO-KING] analysis failed:", err);

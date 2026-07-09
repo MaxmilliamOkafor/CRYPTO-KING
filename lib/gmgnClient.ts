@@ -278,6 +278,11 @@ function mockGmgnData(address: string): GmgnData {
   };
 }
 
+/** All-unknown GmgnData — used when GMGN is deliberately skipped (lite feed scans). */
+export function emptyGmgnData(): GmgnData {
+  return { ...EMPTY };
+}
+
 const EMPTY: GmgnData = {
   status: 'unavailable',
   symbol: null,

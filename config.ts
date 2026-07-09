@@ -99,9 +99,10 @@ export const LIVE_FEED = {
   /** How many newest coins to pull from the source each poll. */
   fetchCount: 50,
   /**
-   * Max NEW coins to fully risk-scan per poll. Each scan makes several Solana
-   * RPC calls, so keep this modest on the public RPC (raise it once you add a
-   * Helius key — see SOLANA.rpcUrl). Already-scanned coins are served from cache.
+   * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
+   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
+   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
+   * key (see SOLANA.rpcUrl) you can raise this substantially.
    */
   scanBudgetPerPoll: 6,
   /** Panel auto-refresh / poll interval in ms. */
@@ -110,6 +111,13 @@ export const LIVE_FEED = {
   maxAgeMinutes: 180,
   /** Feed cache size. */
   maxRows: 60,
+  /**
+   * Desktop notification when a fresh launch scans at or below notifyMaxScore
+   * (with the on-chain authority checks actually completed). Framed as "lower
+   * observed risk ≠ safe" — informational, never a buy signal.
+   */
+  notifyLowRisk: true,
+  notifyMaxScore: 39, // CONSIDER / NEUTRAL territory
 };
 
 /**

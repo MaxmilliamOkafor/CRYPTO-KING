@@ -17,8 +17,13 @@ function rateLimitFor(host: string): number {
   return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
 }
 
-/** Last-call timestamp and pending chain per host — a minimal serial queue. */
-const hostQueues = new Map<string, { lastAt: number; chain: Promise<unknown> }>();
+/**
+ * Per-host serial queue with enforced spacing. ONE persistent state object per
+ * host: `chain` serializes requests, `nextAt` is the earliest time the next
+ * request may start. (An earlier version stored a fresh object per call, which
+ * silently lost the spacing between queued requests.)
+ */
+const hostState = new Map<string, { nextAt: number; chain: Promise<unknown> }>();
 
 function hostOf(url: string): string {
   try {
@@ -37,12 +42,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  */
 export async function fetchJson(url: string, init?: RequestInit): Promise<unknown | null> {
   const host = hostOf(url);
-  const q = hostQueues.get(host) ?? { lastAt: 0, chain: Promise.resolve() };
+  let st = hostState.get(host);
+  if (!st) {
+    st = { nextAt: 0, chain: Promise.resolve() };
+    hostState.set(host, st);
+  }
 
-  const run = q.chain.then(async () => {
-    const wait = q.lastAt + rateLimitFor(host) - Date.now();
+  const run = st.chain.then(async () => {
+    const wait = st.nextAt - Date.now();
     if (wait > 0) await sleep(wait);
-    q.lastAt = Date.now();
+    st.nextAt = Date.now() + rateLimitFor(host);
 
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
@@ -62,11 +71,8 @@ export async function fetchJson(url: string, init?: RequestInit): Promise<unknow
   });
 
   // Keep the chain alive even if this request failed.
-  hostQueues.set(host, { lastAt: q.lastAt, chain: run.catch(() => undefined) });
-  const result = await run;
-  const entry = hostQueues.get(host);
-  if (entry) entry.lastAt = Math.max(entry.lastAt, Date.now() - 1);
-  return result;
+  st.chain = run.catch(() => undefined);
+  return run;
 }
 
 /** Rate-limited JSON-RPC POST helper (Solana RPC / Helius DAS). */

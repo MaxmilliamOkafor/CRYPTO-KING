@@ -40,9 +40,10 @@ var LIVE_FEED = {
   /** How many newest coins to pull from the source each poll. */
   fetchCount: 50,
   /**
-   * Max NEW coins to fully risk-scan per poll. Each scan makes several Solana
-   * RPC calls, so keep this modest on the public RPC (raise it once you add a
-   * Helius key — see SOLANA.rpcUrl). Already-scanned coins are served from cache.
+   * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
+   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
+   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
+   * key (see SOLANA.rpcUrl) you can raise this substantially.
    */
   scanBudgetPerPoll: 6,
   /** Panel auto-refresh / poll interval in ms. */
@@ -50,7 +51,15 @@ var LIVE_FEED = {
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
-  maxRows: 60
+  maxRows: 60,
+  /**
+   * Desktop notification when a fresh launch scans at or below notifyMaxScore
+   * (with the on-chain authority checks actually completed). Framed as "lower
+   * observed risk ≠ safe" — informational, never a buy signal.
+   */
+  notifyLowRisk: true,
+  notifyMaxScore: 39
+  // CONSIDER / NEUTRAL territory
 };
 var RATE_LIMITS_MS = {
   default: 1100,
@@ -228,7 +237,7 @@ function rateLimitFor(host2) {
   const bare = host2.replace(/^www\./, "");
   return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
 }
-var hostQueues = /* @__PURE__ */ new Map();
+var hostState = /* @__PURE__ */ new Map();
 function hostOf(url) {
   try {
     return new URL(url).host;
@@ -239,11 +248,15 @@ function hostOf(url) {
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function fetchJson(url, init) {
   const host2 = hostOf(url);
-  const q = hostQueues.get(host2) ?? { lastAt: 0, chain: Promise.resolve() };
-  const run = q.chain.then(async () => {
-    const wait = q.lastAt + rateLimitFor(host2) - Date.now();
+  let st = hostState.get(host2);
+  if (!st) {
+    st = { nextAt: 0, chain: Promise.resolve() };
+    hostState.set(host2, st);
+  }
+  const run = st.chain.then(async () => {
+    const wait = st.nextAt - Date.now();
     if (wait > 0) await sleep(wait);
-    q.lastAt = Date.now();
+    st.nextAt = Date.now() + rateLimitFor(host2);
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
@@ -260,11 +273,8 @@ async function fetchJson(url, init) {
       clearTimeout(timer);
     }
   });
-  hostQueues.set(host2, { lastAt: q.lastAt, chain: run.catch(() => void 0) });
-  const result = await run;
-  const entry = hostQueues.get(host2);
-  if (entry) entry.lastAt = Math.max(entry.lastAt, Date.now() - 1);
-  return result;
+  st.chain = run.catch(() => void 0);
+  return run;
 }
 
 // lib/gmgnClient.ts
@@ -357,6 +367,7 @@ async function requestAnalysis(address, lite = false) {
 }
 async function analyze(address, _manual = false) {
   stopLiveFeed();
+  view = "token";
   currentAddress = address;
   showLoading(address);
   const res = await requestAnalysis(address, false);

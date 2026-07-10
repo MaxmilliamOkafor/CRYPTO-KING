@@ -504,15 +504,17 @@ function addressFromDom() {
   const m = link?.href.match(new RegExp(`solscan\\.io/token/(${BASE58})`));
   return m ? m[1] : null;
 }
+var lastAutoScanned = null;
 function detect() {
   if (collapsed) return;
-  const address = addressFromUrl() ?? addressFromDom();
-  if (address) {
-    if (view === "token" && address === currentAddress) return;
+  const urlAddr = addressFromUrl();
+  if (urlAddr && urlAddr !== lastAutoScanned) {
+    lastAutoScanned = urlAddr;
     view = "token";
-    void analyze(address);
+    void analyze(urlAddr);
     return;
   }
+  if (view === "token") return;
   if (view !== "home") {
     view = "home";
     currentAddress = null;
@@ -1426,6 +1428,7 @@ function tick() {
     lastHref = location.href;
     currentAddress = null;
     view = "none";
+    lastAutoScanned = null;
     pageScan.clear();
     symbolHints.clear();
     inlineResults.clear();

@@ -67,18 +67,26 @@ function addressFromDom(): string | null {
   return m ? m[1] : null;
 }
 
-/** React to the current page: auto-scan a detected token page, else show the
- *  home view (scan box + whole-page coin scan). */
+/** React to the current page. Auto-scan ONLY when the URL itself is a token
+ *  page, and only ONCE per navigation — never from stray DOM links (that used
+ *  to hijack the panel into scanning a random coin off the page), and never
+ *  re-hijacking after the user clicks "← Scan another token". */
+let lastAutoScanned: string | null = null;
+
 function detect(): void {
   if (collapsed) return; // user minimized us; don't pop back open on navigation
-  const address = addressFromUrl() ?? addressFromDom();
-  if (address) {
-    if (view === 'token' && address === currentAddress) return; // already showing it
+  const urlAddr = addressFromUrl();
+
+  if (urlAddr && urlAddr !== lastAutoScanned) {
+    lastAutoScanned = urlAddr; // one auto-scan per navigation to this token
     view = 'token';
-    void analyze(address);
+    void analyze(urlAddr);
     return;
   }
-  // No single token in the URL → list/trending page.
+
+  // Everything else (list pages, or the user navigated back home on a token
+  // page) → keep/show the home view; user scans coins by clicking, only.
+  if (view === 'token') return; // a card is showing (auto or user-chosen); leave it alone
   if (view !== 'home') {
     view = 'home';
     currentAddress = null;
@@ -1185,6 +1193,7 @@ function tick(): void {
     lastHref = location.href;
     currentAddress = null;
     view = 'none'; // new route → re-detect fresh (token page vs list page)
+    lastAutoScanned = null; // a NEW token page may auto-scan once again
     pageScan.clear(); // coins differ per page
     symbolHints.clear();
     inlineResults.clear(); // badges died with the old DOM; results re-serve from bg cache

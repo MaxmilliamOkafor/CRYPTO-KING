@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade } from '../lib/kingGrade.ts';
 import { matchNarratives } from '../lib/narratives.ts';
+import { assessRugPotential } from '../lib/rugPotential.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
 import { computeWatchAlerts } from '../lib/watchAlerts.ts';
@@ -423,6 +424,39 @@ test('watch alerts: healthy coin fires nothing; unknown data never alerts', () =
   assert.equal(computeWatchAlerts(baseline, healthy).length, 0);
   const unknown = { at: 1, grade: null, liquidityEur: null, marketCapEur: null, lpStatus: 'unknown' as const, devHoldsPct: null, largestNonLpWalletPct: null };
   assert.equal(computeWatchAlerts(baseline, unknown).length, 0);
+});
+
+/* ── 🚩 Rug potential (the pre-buy verdict) ────────────────────────────── */
+
+test('rug potential: RUGKING is HIGH (freeze + mint + deployer-held LP)', () => {
+  const r = assessRugPotential(FIXTURE_AVOID, scoreToken(FIXTURE_AVOID));
+  assert.equal(r.verdict, 'HIGH');
+  assert.ok(r.vectors.some((v) => /liquidity can be pulled in one transaction/i.test(v)));
+  assert.ok(r.vectors.some((v) => /Supply can be inflated/.test(v)));
+});
+
+test('rug potential: QUOKKA is LOW... but never claims safe wording', () => {
+  const r = assessRugPotential(FIXTURE_NEUTRAL, scoreToken(FIXTURE_NEUTRAL));
+  assert.equal(r.verdict, 'LOW');
+  assert.equal(r.vectors.length, 0);
+});
+
+test('rug potential: one open vector → POSSIBLE; two → HIGH', () => {
+  const one: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  one.market = { ...one.market!, lpStatus: 'unlocked' };
+  assert.equal(assessRugPotential(one, scoreToken(one)).verdict, 'POSSIBLE');
+
+  const two: TokenAnalysis = structuredClone(one);
+  two.holders = { ...two.holders!, devHoldsPct: 9 }; // unlocked LP + positioned dev
+  assert.equal(assessRugPotential(two, scoreToken(two)).verdict, 'HIGH');
+});
+
+test('rug potential: missing checks → UNVERIFIED, never LOW', () => {
+  const partial: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  partial.market = { ...partial.market!, lpStatus: 'unknown' };
+  const r = assessRugPotential(partial, scoreToken(partial));
+  assert.equal(r.verdict, 'UNVERIFIED');
+  assert.ok(r.unverified.includes('LP burn/lock status'));
 });
 
 console.log(`\n${passed} tests passed.`);

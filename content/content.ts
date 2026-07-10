@@ -24,6 +24,7 @@
 import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
+import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
 import type {
   AnalyzeResponse,
@@ -194,6 +195,8 @@ const STYLES = `
   .row { display: flex; justify-content: space-between; align-items: center; }
   .details-btn { color: #7aa2ff; font-size: 12px; }
   .back-btn { color: #7aa2ff; font-size: 12px; padding: 2px 0; }
+  .rug-banner { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 8px; margin-bottom: 8px; font-size: 11.5px; }
+  .rug-banner span { font-weight: 400; opacity: .92; }
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
   .watch-btn:hover { border-color: #ffc83c; }
   .watch-btn:disabled { opacity: .7; cursor: default; }
@@ -1075,6 +1078,18 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? 'No individual risk factors triggered — low observed risk ≠ safe.';
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
+  // The PRE-BUY question, answered first: can this coin rug me?
+  const rug = assessRugPotential(analysis, risk);
+  const rm = RUG_VERDICT_META[rug.verdict];
+  const rugDetail =
+    rug.verdict === 'LOW'
+      ? ''
+      : esc(rug.vectors[0] ?? (rug.unverified.length ? `Unverified: ${rug.unverified.join(', ')}.` : ''));
+  const rugBanner = `
+    <div class="rug-banner" style="background:${rm.color};color:${rm.textColor}">
+      <b>${esc(rm.label)}</b>${rugDetail ? `<span>${rugDetail}</span>` : ''}
+      ${rug.vectors.length > 1 ? `<span>+${rug.vectors.length - 1} more vector${rug.vectors.length > 2 ? 's' : ''} — see Details</span>` : ''}
+    </div>`;
   // Everything here reads the SAME direction as the grade: higher = better.
   const subLine = quality.insufficientData
     ? ''
@@ -1088,6 +1103,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
       ${mock ? '<span class="mock">MOCK</span>' : ''}
       <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">⧉</button>
     </div>
+    ${rugBanner}
     <div class="top-reason">${esc(topReason)}</div>
     ${subLine}
     <div class="row">
@@ -1097,7 +1113,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
     <div class="panel" hidden></div>
     <div class="row" style="margin-top:10px">
       <button class="back-btn">← Scan another token</button>
-      <button class="watch-btn" title="Re-scan this coin every few minutes and alert you if rug conditions develop (LP change, liquidity drop, dev selling, grade collapse)">👁 Watch for rug alerts</button>
+      <button class="watch-btn" title="For coins you ALREADY hold: re-scans every few minutes and alerts you if rug conditions develop (LP change, liquidity drop, dev selling, grade collapse)">👁 Holding it? Watch</button>
     </div>`;
 
   body.querySelector('.back-btn')?.addEventListener('click', backToHome);
@@ -1150,6 +1166,13 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
     .slice(0, 6)
     .map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`)
     .join('');
+  const rug = assessRugPotential(analysis, risk);
+  const rugItems =
+    rug.vectors.map((v) => `<li><span class="pts bad">🚩</span><span>${esc(v)}</span></li>`).join('') +
+    rug.unverified.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`).join('');
+  const rugSection = rugItems
+    ? `<h4>Rug-pull vectors</h4><ul>${rugItems}</ul>`
+    : `<h4>Rug-pull vectors</h4><ul><li><span class="pts good">✓</span><span>None found on verified data — market risk still applies.</span></li></ul>`;
   const verdict = gemBackgroundCheck(analysis, risk, quality);
   const kg = computeKingGrade(analysis, risk, quality);
   const capItems = kg.caps.map((c) => `<li><span class="pts bad">▼</span><span>${esc(c)}</span></li>`).join('');
@@ -1166,6 +1189,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
     .join('');
 
   panel.innerHTML = `
+    ${rugSection}
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
     ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ''}

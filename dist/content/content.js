@@ -85,6 +85,34 @@ var RATE_LIMITS_MS = {
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
+var LIMITS = {
+  transferFeeHighBps: 1e3,
+  // 10%
+  transferFeeVeryHighBps: 2e3,
+  // 20%
+  sellSlippageMaxPct: 40,
+  top10Pct: 60,
+  singleWalletPct: 30,
+  top5Pct: 80,
+  top5MinHolders: 500,
+  // "looks distributed but is effectively concentrated"
+  bundledPct: 20,
+  thinLiquidityEur: 5e4,
+  thinLiqMcapEur: 5e5,
+  microMcapEur: 5e4,
+  youngAgeMinutes: 30,
+  smartMoneyStrongWallets: 3,
+  serialMinLaunches: 3,
+  // serial-deployer factor needs at least this many prior coins…
+  serialDeadRatio: 0.7,
+  // …with at least this share dead/abandoned
+  earlyWhalePct: 5,
+  // % of TOTAL supply in one non-curve wallet while still on the curve
+  earlyTop10Pct: 15,
+  // % of TOTAL supply in top-10 non-curve wallets while on the curve
+  devHoldsPct: 5
+  // creator holdings at/above this % → devHoldingsHigh risk
+};
 var KING_GRADE = {
   safetyWeight: 0.5,
   // (100 - riskScore) share
@@ -220,6 +248,58 @@ function gradeColors(grade) {
   for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };
   return { color: "#e5484d", textColor: "#ffffff" };
 }
+
+// lib/rugPotential.ts
+function assessRugPotential(a, risk) {
+  const hard = [];
+  const soft = [];
+  const unverified = [];
+  const mint = a.mint;
+  if (!mint) {
+    unverified.push("mint/freeze authority");
+  } else {
+    if (mint.mintAuthorityActive === true) hard.push("Supply can be inflated (mint authority active).");
+    if (mint.freezeAuthorityActive === true) hard.push("Your wallet can be frozen (freeze authority active).");
+    if (mint.permanentDelegateActive === true) hard.push("Dev can seize tokens (permanent delegate).");
+    if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
+    if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
+    if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.mintAuthorityActive === null) unverified.push("mint authority");
+    if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
+  }
+  const sim = a.market?.sellSimulation;
+  if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (lp === "deployer_held") hard.push("Deployer holds the LP \u2014 liquidity can be pulled in one transaction.");
+  else if (lp === "unlocked") soft.push("LP not burned/locked \u2014 liquidity can be pulled.");
+  else if (lp === "unknown") unverified.push("LP burn/lock status");
+  if (a.launch?.bondingCurveComplete === false) {
+    soft.push("Still on the bonding curve \u2014 insiders can dump at any moment.");
+  }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev >= LIMITS.devHoldsPct) soft.push(`Dev wallet holds ${dev.toFixed(1)}% \u2014 positioned to dump.`);
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > GEM_CRITERIA.maxLargestWalletPct) {
+    soft.push(`A single wallet holds ${whale.toFixed(1)}% \u2014 one seller from a crash.`);
+  }
+  if (whale === null) unverified.push("holder concentration");
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) {
+    hard.push("Creator is a serial launcher with mostly dead coins.");
+  }
+  let verdict;
+  if (hard.length > 0) verdict = "HIGH";
+  else if (soft.length >= 2) verdict = "HIGH";
+  else if (soft.length === 1) verdict = "POSSIBLE";
+  else if (unverified.length > 0) verdict = "UNVERIFIED";
+  else verdict = "LOW";
+  return { verdict, vectors: [...hard, ...soft], unverified };
+}
+var RUG_VERDICT_META = {
+  HIGH: { color: "#e5484d", textColor: "#ffffff", label: "\u{1F6A9} RUG POTENTIAL: HIGH" },
+  POSSIBLE: { color: "#f76b15", textColor: "#ffffff", label: "\u{1F6A9} RUG POTENTIAL: POSSIBLE" },
+  LOW: { color: "#2e5a3c", textColor: "#c9f0d4", label: "RUG VECTORS: none found (\u2260 safe)" },
+  UNVERIFIED: { color: "#3a3f4c", textColor: "#e6e8ee", label: "RUG CHECK: not fully verified yet" }
+};
 
 // mock/fixtures.ts
 var now = () => Date.now();
@@ -608,6 +688,8 @@ var STYLES = `
   .row { display: flex; justify-content: space-between; align-items: center; }
   .details-btn { color: #7aa2ff; font-size: 12px; }
   .back-btn { color: #7aa2ff; font-size: 12px; padding: 2px 0; }
+  .rug-banner { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 8px; margin-bottom: 8px; font-size: 11.5px; }
+  .rug-banner span { font-weight: 400; opacity: .92; }
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
   .watch-btn:hover { border-color: #ffc83c; }
   .watch-btn:disabled { opacity: .7; cursor: default; }
@@ -1341,6 +1423,14 @@ function render(analysis, risk, quality, mock) {
   const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? "No individual risk factors triggered \u2014 low observed risk \u2260 safe.";
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
+  const rug = assessRugPotential(analysis, risk);
+  const rm = RUG_VERDICT_META[rug.verdict];
+  const rugDetail = rug.verdict === "LOW" ? "" : esc(rug.vectors[0] ?? (rug.unverified.length ? `Unverified: ${rug.unverified.join(", ")}.` : ""));
+  const rugBanner = `
+    <div class="rug-banner" style="background:${rm.color};color:${rm.textColor}">
+      <b>${esc(rm.label)}</b>${rugDetail ? `<span>${rugDetail}</span>` : ""}
+      ${rug.vectors.length > 1 ? `<span>+${rug.vectors.length - 1} more vector${rug.vectors.length > 2 ? "s" : ""} \u2014 see Details</span>` : ""}
+    </div>`;
   const subLine = quality.insufficientData ? "" : `<div class="quality-line">Safety <b>${Math.round(kg.parts.safety)}/100</b> \xB7 Quality <b>${quality.qualityScore}/100</b> \xB7 Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
   body.innerHTML = `
     <div class="head">
@@ -1350,6 +1440,7 @@ function render(analysis, risk, quality, mock) {
       ${mock ? '<span class="mock">MOCK</span>' : ""}
       <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">\u29C9</button>
     </div>
+    ${rugBanner}
     <div class="top-reason">${esc(topReason)}</div>
     ${subLine}
     <div class="row">
@@ -1359,7 +1450,7 @@ function render(analysis, risk, quality, mock) {
     <div class="panel" hidden></div>
     <div class="row" style="margin-top:10px">
       <button class="back-btn">\u2190 Scan another token</button>
-      <button class="watch-btn" title="Re-scan this coin every few minutes and alert you if rug conditions develop (LP change, liquidity drop, dev selling, grade collapse)">\u{1F441} Watch for rug alerts</button>
+      <button class="watch-btn" title="For coins you ALREADY hold: re-scans every few minutes and alerts you if rug conditions develop (LP change, liquidity drop, dev selling, grade collapse)">\u{1F441} Holding it? Watch</button>
     </div>`;
   body.querySelector(".back-btn")?.addEventListener("click", backToHome);
   const copyBtn = body.querySelector(".copy");
@@ -1400,12 +1491,16 @@ function fillPanel(panel, analysis, risk, quality) {
   const reasons = risk.reasons.slice(0, 6).map((r) => `<li><span class="pts bad">+${r.points}</span><span>${esc(r.text)}</span></li>`).join("");
   const mitigations = risk.mitigations.map((m) => `<li><span class="pts good">${m.points}</span><span>${esc(m.text)}</span></li>`).join("");
   const qualityItems = quality.reasons.slice(0, 6).map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`).join("");
+  const rug = assessRugPotential(analysis, risk);
+  const rugItems = rug.vectors.map((v) => `<li><span class="pts bad">\u{1F6A9}</span><span>${esc(v)}</span></li>`).join("") + rug.unverified.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`).join("");
+  const rugSection = rugItems ? `<h4>Rug-pull vectors</h4><ul>${rugItems}</ul>` : `<h4>Rug-pull vectors</h4><ul><li><span class="pts good">\u2713</span><span>None found on verified data \u2014 market risk still applies.</span></li></ul>`;
   const verdict = gemBackgroundCheck(analysis, risk, quality);
   const kg = computeKingGrade(analysis, risk, quality);
   const capItems = kg.caps.map((c) => `<li><span class="pts bad">\u25BC</span><span>${esc(c)}</span></li>`).join("");
   const gemSection = (verdict.gem ? `<h4>\u{1F48E} Background check</h4><ul><li><span class="pts good">\u2713</span><span>PASSED \u2014 graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>` : `<h4>\u{1F48E} Background check \u2014 not passed</h4><ul>${verdict.blockers.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`).join("")}</ul>`) + (capItems ? `<h4>Why the grade is capped</h4><ul>${capItems}</ul>` : "");
   const gaps = risk.dataGaps.slice(0, 5).map((g) => `<li class="gap">${esc(g)}</li>`).join("");
   panel.innerHTML = `
+    ${rugSection}
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
     ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ""}

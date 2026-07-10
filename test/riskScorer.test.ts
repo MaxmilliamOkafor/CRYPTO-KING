@@ -13,6 +13,7 @@ import { computeKingGrade } from '../lib/kingGrade.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
+import { computeWatchAlerts } from '../lib/watchAlerts.ts';
 import { FIXTURE_AVOID, FIXTURE_NEUTRAL, FIXTURE_WATCH } from '../mock/fixtures.ts';
 import type { TokenAnalysis } from '../lib/types.ts';
 
@@ -109,7 +110,7 @@ test('score clamps at 100 when everything is on fire', () => {
   };
   worst.identity = { ...worst.identity, ageMinutes: 5 };
   worst.deployer = { priorRugs: 3, fundingSource: 'known_rugger', priorLaunches: null, priorDeadLaunches: null, graduatedLaunches: null };
-  worst.holders = { holderCount: 900, top5Pct: 91, top10Pct: 95, largestNonLpWalletPct: 55, bundledLaunchPct: 60, smartMoneyPct: null };
+  worst.holders = { holderCount: 900, top5Pct: 91, top10Pct: 95, largestNonLpWalletPct: 55, bundledLaunchPct: 60, smartMoneyPct: null, devHoldsPct: null };
   const r = scoreToken(worst);
   assert.equal(r.riskScore, 100);
   assert.equal(r.signal, 'AVOID');
@@ -371,6 +372,57 @@ test('King Grade: 80%+ unreachable without a passed background check', () => {
   const kg = computeKingGrade(noGem, scoreToken(noGem), scoreQuality(noGem));
   assert.ok(kg.grade !== null && kg.grade <= 79);
   assert.ok(kg.caps.some((c) => /background check/.test(c)));
+});
+
+/* ── Dev holdings & 👁 watch alerts ────────────────────────────────────── */
+
+test('dev wallet holding ≥5% adds risk and blocks gem grade above 10%', () => {
+  const devCoin: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  devCoin.holders = { ...devCoin.holders!, devHoldsPct: 12 };
+  const r = scoreToken(devCoin);
+  assert.ok(r.reasons.some((x) => /Dev wallet holds 12\.0%/.test(x.text)));
+  const v = gemBackgroundCheck(devCoin, r, scoreQuality(devCoin));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.some((b) => /Dev wallet holds/.test(b)));
+});
+
+test('watch alerts: dev selling, liquidity collapse and grade collapse all fire', () => {
+  const baseline = {
+    at: 0,
+    grade: 85,
+    liquidityEur: 100_000,
+    marketCapEur: 500_000,
+    lpStatus: 'burned' as const,
+    devHoldsPct: 6,
+    largestNonLpWalletPct: 5,
+  };
+  const rugged = {
+    at: 1,
+    grade: 30, // −55 ≥ 20 → grade-collapse
+    liquidityEur: 20_000, // −80% ≥ 50% → liquidity-drop
+    marketCapEur: 100_000, // −80% ≥ 60% → mcap-drop
+    lpStatus: 'unlocked' as const, // burned → unlocked → lp-unsecured
+    devHoldsPct: 0.5, // −5.5pts ≥ 2 → dev-selling
+    largestNonLpWalletPct: 5,
+  };
+  const kinds = computeWatchAlerts(baseline, rugged).map((a) => a.kind).sort();
+  assert.deepEqual(kinds, ['dev-selling', 'grade-collapse', 'liquidity-drop', 'lp-unsecured', 'mcap-drop']);
+});
+
+test('watch alerts: healthy coin fires nothing; unknown data never alerts', () => {
+  const baseline = {
+    at: 0,
+    grade: 85,
+    liquidityEur: 100_000,
+    marketCapEur: 500_000,
+    lpStatus: 'burned' as const,
+    devHoldsPct: 6,
+    largestNonLpWalletPct: 5,
+  };
+  const healthy = { ...baseline, at: 1, grade: 80, liquidityEur: 90_000, marketCapEur: 600_000 };
+  assert.equal(computeWatchAlerts(baseline, healthy).length, 0);
+  const unknown = { at: 1, grade: null, liquidityEur: null, marketCapEur: null, lpStatus: 'unknown' as const, devHoldsPct: null, largestNonLpWalletPct: null };
+  assert.equal(computeWatchAlerts(baseline, unknown).length, 0);
 });
 
 console.log(`\n${passed} tests passed.`);

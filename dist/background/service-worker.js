@@ -197,6 +197,8 @@ var WEIGHTS = {
   // age < LIMITS.youngAgeMinutes with abnormal volume
   serialDeployer: 15,
   // creator launched many coins, most dead (see LIMITS.serial*)
+  devHoldingsHigh: 10,
+  // creator wallet holds ≥ LIMITS.devHoldsPct of supply — can dump on you
   deployerLinkedSelling: 15,
   deployerPriorRugs: 20,
   // deployer wallet linked to ≥1 prior rug
@@ -236,8 +238,25 @@ var LIMITS = {
   // …with at least this share dead/abandoned
   earlyWhalePct: 5,
   // % of TOTAL supply in one non-curve wallet while still on the curve
-  earlyTop10Pct: 15
+  earlyTop10Pct: 15,
   // % of TOTAL supply in top-10 non-curve wallets while on the curve
+  devHoldsPct: 5
+  // creator holdings at/above this % → devHoldingsHigh risk
+};
+var WATCHLIST = {
+  maxCoins: 10,
+  // full re-scans are RPC-heavy; keep the list focused
+  pollMinutes: 5,
+  alerts: {
+    liquidityDropPct: 50,
+    // liquidity fell ≥ this % from your baseline
+    marketCapDropPct: 60,
+    // mcap fell ≥ this % from your baseline
+    devSoldPointsDrop: 2,
+    // dev holdings fell ≥ this many percentage points
+    gradeDrop: 20
+    // King Grade fell ≥ this many points
+  }
 };
 var QUALITY_WEIGHTS = {
   smartMoneyStrong: 20,
@@ -369,7 +388,8 @@ var FIXTURE_AVOID = {
     // +15
     largestNonLpWalletPct: 18,
     bundledLaunchPct: 10,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    devHoldsPct: null
   },
   market: {
     priceEur: 31e-5,
@@ -427,7 +447,8 @@ var FIXTURE_WATCH = {
     // +15
     largestNonLpWalletPct: 11,
     bundledLaunchPct: 9,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    devHoldsPct: null
   },
   market: {
     priceEur: 14e-4,
@@ -483,7 +504,8 @@ var FIXTURE_NEUTRAL = {
     top10Pct: 24,
     largestNonLpWalletPct: 4.5,
     bundledLaunchPct: 2,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    devHoldsPct: null
   },
   market: {
     priceEur: 0.021,
@@ -831,6 +853,10 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push("Holder distribution not verified yet.");
   } else if (largest > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+    blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
   if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
     blockers.push("Creator's launch history not checked yet.");
@@ -1283,6 +1309,9 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
         `Top 5 wallets hold ${h.top5Pct.toFixed(0)}% despite ${h.holderCount} holders \u2014 looks distributed but is effectively concentrated.`
       );
     }
+    if (h.devHoldsPct !== null && h.devHoldsPct >= l.devHoldsPct) {
+      hit(w.devHoldingsHigh, `Dev wallet holds ${h.devHoldsPct.toFixed(1)}% of supply \u2014 can dump on holders.`);
+    }
     if (h.bundledLaunchPct !== null && h.bundledLaunchPct > l.bundledPct) {
       hit(
         w.bundledLaunch,
@@ -1406,6 +1435,45 @@ function fmtK(n) {
   return n.toFixed(0);
 }
 
+// lib/watchAlerts.ts
+function computeWatchAlerts(baseline, current) {
+  const alerts = [];
+  const t = WATCHLIST.alerts;
+  const lpWasSecured = baseline.lpStatus === "burned" || baseline.lpStatus === "locked";
+  const lpNowSecured = current.lpStatus === "burned" || current.lpStatus === "locked";
+  if (lpWasSecured && !lpNowSecured && current.lpStatus !== "unknown") {
+    alerts.push({
+      kind: "lp-unsecured",
+      message: `LP is no longer ${baseline.lpStatus} (now ${current.lpStatus.replace("_", " ")}) \u2014 rug risk changed.`
+    });
+  }
+  if (baseline.liquidityEur !== null && current.liquidityEur !== null && baseline.liquidityEur > 0) {
+    const dropPct = (1 - current.liquidityEur / baseline.liquidityEur) * 100;
+    if (dropPct >= t.liquidityDropPct) {
+      alerts.push({ kind: "liquidity-drop", message: `Liquidity down ${dropPct.toFixed(0)}% since you started watching.` });
+    }
+  }
+  if (baseline.marketCapEur !== null && current.marketCapEur !== null && baseline.marketCapEur > 0) {
+    const dropPct = (1 - current.marketCapEur / baseline.marketCapEur) * 100;
+    if (dropPct >= t.marketCapDropPct) {
+      alerts.push({ kind: "mcap-drop", message: `Market cap down ${dropPct.toFixed(0)}% since you started watching.` });
+    }
+  }
+  if (baseline.devHoldsPct !== null && current.devHoldsPct !== null && baseline.devHoldsPct - current.devHoldsPct >= t.devSoldPointsDrop) {
+    alerts.push({
+      kind: "dev-selling",
+      message: `Dev wallet cut holdings from ${baseline.devHoldsPct.toFixed(1)}% to ${current.devHoldsPct.toFixed(1)}% \u2014 dev is selling.`
+    });
+  }
+  if (baseline.grade !== null && current.grade !== null && baseline.grade - current.grade >= t.gradeDrop) {
+    alerts.push({
+      kind: "grade-collapse",
+      message: `King Grade fell ${baseline.grade}% \u2192 ${current.grade}% \u2014 risk profile worsened.`
+    });
+  }
+  return alerts;
+}
+
 // lib/rugcheckClient.ts
 var rugcheckAdapter = {
   async fetchAudit(address) {
@@ -1430,7 +1498,7 @@ var rugcheckAdapter = {
 
 // lib/solanaClient.ts
 var TOKEN_2022_PROGRAM2 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchSolanaData(address, lite = false, excludeTokenAccounts = []) {
+async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [], creatorAddress = null) {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, status: "mock" };
@@ -1439,7 +1507,7 @@ async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [])
     const [mint2, holders2] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts)]);
     return { mint: mint2, holders: holders2, status: mint2 ? "partial" : "unavailable" };
   }
-  const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address)]);
+  const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address, creatorAddress)]);
   const status = mint && holders ? "ok" : mint || holders ? "partial" : "unavailable";
   return { mint, holders, status };
 }
@@ -1504,7 +1572,7 @@ async function fetchMetadataMutable(address) {
   const asset = await rpcCall(SOLANA.rpcUrl, "getAsset", { id: address });
   return typeof asset?.mutable === "boolean" ? asset.mutable : null;
 }
-async function fetchHolderInfo(address) {
+async function fetchHolderInfo(address, creatorAddress = null) {
   const [supplyRes, largestRes] = await Promise.all([
     rpcCall(SOLANA.rpcUrl, "getTokenSupply", [address, { commitment: "confirmed" }]),
     rpcCall(SOLANA.rpcUrl, "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
@@ -1524,6 +1592,10 @@ async function fetchHolderInfo(address) {
     100,
     accounts.reduce((s, a, i) => owners[i] !== null && smartSet.has(owners[i]) ? s + a.amount : s, 0) / supply * 100
   );
+  const devHoldsPct = creatorAddress === null ? null : Math.min(
+    100,
+    accounts.reduce((s, a, i) => owners[i] === creatorAddress ? s + a.amount : s, 0) / supply * 100
+  );
   return {
     holderCount: null,
     // plain RPC has no cheap holder count; GMGN fills this in when live
@@ -1532,7 +1604,8 @@ async function fetchHolderInfo(address) {
     largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
     bundledLaunchPct: null,
     // needs block-0..2 funding-graph analysis; honest "unknown" for now
-    smartMoneyPct
+    smartMoneyPct,
+    devHoldsPct
   };
 }
 async function fetchHolderInfoLite(address, excludeTokenAccounts) {
@@ -1551,7 +1624,9 @@ async function fetchHolderInfoLite(address, excludeTokenAccounts) {
     top10Pct: pct(accounts.slice(0, 10)),
     largestNonLpWalletPct: pct(accounts.slice(0, 1)),
     bundledLaunchPct: null,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    // needs owner resolution — full scans only
+    devHoldsPct: null
     // needs owner resolution — full scans only
   };
 }
@@ -1590,6 +1665,12 @@ async function handle(msg) {
       const valid = msg.pairAddresses.filter((p) => BASE58_RE3.test(p)).slice(0, 90);
       return { ok: true, tokens: await fetchPairBaseTokens(valid) };
     }
+    case "WATCH_TOKEN":
+      return watchToken(msg.address, msg.symbol);
+    case "UNWATCH_TOKEN":
+      return unwatchToken(msg.address);
+    case "GET_WATCHLIST":
+      return { ok: true, watchlist: await loadWatchlist() };
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
@@ -1698,7 +1779,7 @@ function maybeNotifyLowRisk(row, risk) {
   });
 }
 chrome.notifications?.onClicked.addListener((id) => {
-  if (!id.startsWith("ck-")) return;
+  if (!id.startsWith("ck-") || id.startsWith("ck-watch-")) return;
   const address = id.slice(3);
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
@@ -1723,10 +1804,11 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     const pumpfun = await fetchPumpfunData(address);
     const [gmgn, solana, audit] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator),
       rugcheckAdapter.fetchAudit(address)
     ]);
-    const deployerHist = lite ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator) : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
+    let deployerHist = lite ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator) : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
+    deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
     const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, {
       gmgn: gmgn.status,
       solana: solana.status,
@@ -1774,7 +1856,8 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
     top10Pct: solana.holders?.top10Pct ?? gmgn.top10Pct,
     largestNonLpWalletPct: solana.holders?.largestNonLpWalletPct ?? null,
     bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct,
-    smartMoneyPct: solana.holders?.smartMoneyPct ?? null
+    smartMoneyPct: solana.holders?.smartMoneyPct ?? null,
+    devHoldsPct: solana.holders?.devHoldsPct ?? null
   } : null;
   const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== "unknown" ? gmgn.lpStatus : auditLpStatus ?? gmgn.lpStatus ?? "unknown";
   const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
@@ -1825,6 +1908,132 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
     fetchedAt: Date.now()
   };
 }
+var CREATORS_KEY = "ck:creators";
+async function applyCreatorMemory(creator, hist) {
+  if (!creator) return hist;
+  const data = await chrome.storage.local.get(CREATORS_KEY);
+  const memory = data[CREATORS_KEY] ?? {};
+  const d = hist.deployer;
+  if (hist.status === "ok" && d && d.priorLaunches !== null) {
+    memory[creator] = {
+      launches: d.priorLaunches,
+      dead: d.priorDeadLaunches ?? 0,
+      graduated: d.graduatedLaunches ?? 0,
+      lastSeen: Date.now()
+    };
+    const keys = Object.keys(memory);
+    if (keys.length > 500) {
+      keys.sort((a, b) => memory[a].lastSeen - memory[b].lastSeen).slice(0, keys.length - 500).forEach((k) => delete memory[k]);
+    }
+    await chrome.storage.local.set({ [CREATORS_KEY]: memory });
+    return hist;
+  }
+  const known2 = memory[creator];
+  if (known2) {
+    return {
+      status: "partial",
+      deployer: {
+        priorRugs: null,
+        fundingSource: "unknown",
+        priorLaunches: known2.launches,
+        priorDeadLaunches: known2.dead,
+        graduatedLaunches: known2.graduated
+      }
+    };
+  }
+  return hist;
+}
+var WATCHLIST_KEY = "ck:watchlist";
+async function loadWatchlist() {
+  const data = await chrome.storage.local.get(WATCHLIST_KEY);
+  return Array.isArray(data[WATCHLIST_KEY]) ? data[WATCHLIST_KEY] : [];
+}
+async function saveWatchlist(list) {
+  await chrome.storage.local.set({ [WATCHLIST_KEY]: list });
+}
+function snapshotOf(entry) {
+  return {
+    at: Date.now(),
+    grade: computeKingGrade(entry.analysis, entry.risk, entry.quality).grade,
+    liquidityEur: entry.analysis.market?.liquidityEur ?? null,
+    marketCapEur: entry.analysis.market?.marketCapEur ?? null,
+    lpStatus: entry.analysis.market?.lpStatus ?? "unknown",
+    devHoldsPct: entry.analysis.holders?.devHoldsPct ?? null,
+    largestNonLpWalletPct: entry.analysis.holders?.largestNonLpWalletPct ?? null
+  };
+}
+async function watchToken(address, symbol) {
+  if (!BASE58_RE3.test(address)) return { ok: false, error: "Not a valid Solana address." };
+  const list = await loadWatchlist();
+  if (list.some((w) => w.address === address)) return { ok: true, watchlist: list };
+  if (list.length >= WATCHLIST.maxCoins) {
+    return { ok: false, error: `Watchlist is full (${WATCHLIST.maxCoins} coins) \u2014 unwatch one first.` };
+  }
+  const res = await analyzeToken(address, false);
+  if (!res.ok) return { ok: false, error: res.error };
+  const entry = cache.get(address);
+  if (!entry) return { ok: false, error: "Scan failed \u2014 cannot watch." };
+  const snap = snapshotOf(entry);
+  const coin = {
+    address,
+    symbol: entry.analysis.identity.symbol ?? symbol,
+    addedAt: Date.now(),
+    baseline: snap,
+    last: snap,
+    alerted: []
+  };
+  const next = [...list, coin];
+  await saveWatchlist(next);
+  ensureWatchAlarm();
+  return { ok: true, watchlist: next };
+}
+async function unwatchToken(address) {
+  const next = (await loadWatchlist()).filter((w) => w.address !== address);
+  await saveWatchlist(next);
+  return { ok: true, watchlist: next };
+}
+async function sweepWatchlist() {
+  const list = await loadWatchlist();
+  if (list.length === 0) return;
+  for (const coin of list) {
+    const res = await analyzeToken(
+      coin.address,
+      /*force*/
+      true
+    );
+    if (!res.ok) continue;
+    const entry = cache.get(coin.address);
+    if (!entry) continue;
+    coin.last = snapshotOf(entry);
+    for (const alert of computeWatchAlerts(coin.baseline, coin.last)) {
+      if (coin.alerted.includes(alert.kind)) continue;
+      coin.alerted.push(alert.kind);
+      const sym = coin.symbol ?? `${coin.address.slice(0, 4)}\u2026${coin.address.slice(-4)}`;
+      chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
+        type: "basic",
+        iconUrl: "icons/icon128.png",
+        title: `\u{1F6A8} ${sym} \u2014 watched coin alert`,
+        message: `${alert.message} Click to open on GMGN.`,
+        priority: 2
+      });
+    }
+  }
+  await saveWatchlist(list);
+}
+function ensureWatchAlarm() {
+  chrome.alarms.create("ck-watch", { periodInMinutes: WATCHLIST.pollMinutes });
+}
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "ck-watch") void sweepWatchlist();
+});
+chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
+chrome.runtime.onStartup.addListener(ensureWatchAlarm);
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith("ck-watch-")) return;
+  const address = id.slice("ck-watch-".length).split("-")[0];
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
+  chrome.notifications.clear(id);
+});
 async function loadRecent() {
   const data = await chrome.storage.local.get(RECENT_KEY);
   const list = data[RECENT_KEY];

@@ -158,6 +158,9 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
         `Top 5 wallets hold ${h.top5Pct.toFixed(0)}% despite ${h.holderCount} holders — looks distributed but is effectively concentrated.`,
       );
     }
+    if (h.devHoldsPct !== null && h.devHoldsPct >= l.devHoldsPct) {
+      hit(w.devHoldingsHigh, `Dev wallet holds ${h.devHoldsPct.toFixed(1)}% of supply — can dump on holders.`);
+    }
     if (h.bundledLaunchPct !== null && h.bundledLaunchPct > l.bundledPct) {
       hit(
         w.bundledLaunch,

@@ -58,6 +58,7 @@ export const FIXTURE_AVOID: TokenAnalysis = {
     largestNonLpWalletPct: 18,
     bundledLaunchPct: 10,
     smartMoneyPct: null,
+    devHoldsPct: null,
   },
   market: {
     priceEur: 0.00031,
@@ -125,6 +126,7 @@ export const FIXTURE_WATCH: TokenAnalysis = {
     largestNonLpWalletPct: 11,
     bundledLaunchPct: 9,
     smartMoneyPct: null,
+    devHoldsPct: null,
   },
   market: {
     priceEur: 0.0014,
@@ -191,6 +193,7 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     largestNonLpWalletPct: 4.5,
     bundledLaunchPct: 2,
     smartMoneyPct: null,
+    devHoldsPct: null,
   },
   market: {
     priceEur: 0.021,

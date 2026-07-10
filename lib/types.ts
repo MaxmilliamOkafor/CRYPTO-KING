@@ -76,6 +76,8 @@ export interface HolderInfo {
   bundledLaunchPct: number | null;
   /** % of supply held by the user's configured SMART_MONEY_WALLETS (full scans only). */
   smartMoneyPct: number | null;
+  /** % of supply the CREATOR wallet holds among top accounts (full scans only). 0 = dev sold/holds nothing visible. */
+  devHoldsPct: number | null;
 }
 
 export interface SellSimulation {
@@ -222,6 +224,30 @@ export interface RecentToken {
   updatedAt: number; // epoch ms
 }
 
+/** Snapshot of the rug-relevant state of a watched coin at one point in time. */
+export interface WatchSnapshot {
+  at: number;
+  grade: number | null;
+  liquidityEur: number | null;
+  marketCapEur: number | null;
+  lpStatus: LpStatus;
+  devHoldsPct: number | null;
+  largestNonLpWalletPct: number | null;
+}
+
+/** A coin the user is holding/watching — re-scanned periodically for rug alerts. */
+export interface WatchedCoin {
+  address: string;
+  symbol: string | null;
+  addedAt: number;
+  /** State when watching started — alerts compare against this. */
+  baseline: WatchSnapshot;
+  /** Most recent scan state. */
+  last: WatchSnapshot;
+  /** Alert kinds already fired for this coin (each fires once). */
+  alerted: string[];
+}
+
 /** Manual P&L journal entry (dashboard). Manual entries only — no wallet access, ever. */
 export interface JournalEntry {
   id: string;
@@ -252,7 +278,10 @@ export type BgRequest =
   | { type: 'CLEAR_RECENT' }
   | { type: 'GET_LIVE_FEED' }
   /** Resolve DEX pair addresses → base token mints (DEXTools inline badges). */
-  | { type: 'RESOLVE_PAIRS'; pairAddresses: string[] };
+  | { type: 'RESOLVE_PAIRS'; pairAddresses: string[] }
+  | { type: 'WATCH_TOKEN'; address: string; symbol: string | null }
+  | { type: 'UNWATCH_TOKEN'; address: string }
+  | { type: 'GET_WATCHLIST' };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; quality: QualityResult; mock: boolean }
@@ -289,6 +318,8 @@ export interface FeedRow {
 export type LiveFeedResponse =
   | { ok: true; feed: FeedRow[]; source: SourceStatus; scannedThisPoll: number }
   | { ok: false; error: string };
+
+export type WatchlistResponse = { ok: true; watchlist: WatchedCoin[] } | { ok: false; error: string };
 
 export type ResolvePairsResponse =
   | { ok: true; tokens: Record<string, { address: string; symbol: string | null }> }

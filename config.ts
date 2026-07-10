@@ -276,6 +276,7 @@ export const WEIGHTS = {
   // Age & behavior (medium)
   youngTokenAbnormalVolume: 10, // age < LIMITS.youngAgeMinutes with abnormal volume
   serialDeployer: 15, // creator launched many coins, most dead (see LIMITS.serial*)
+  devHoldingsHigh: 10, // creator wallet holds ≥ LIMITS.devHoldsPct of supply — can dump on you
   deployerLinkedSelling: 15,
   deployerPriorRugs: 20, // deployer wallet linked to ≥1 prior rug
   deployerFundedByRugger: 15, // deployer funded from a known rugger wallet
@@ -309,6 +310,23 @@ export const LIMITS = {
   serialDeadRatio: 0.7, // …with at least this share dead/abandoned
   earlyWhalePct: 5, // % of TOTAL supply in one non-curve wallet while still on the curve
   earlyTop10Pct: 15, // % of TOTAL supply in top-10 non-curve wallets while on the curve
+  devHoldsPct: 5, // creator holdings at/above this % → devHoldingsHigh risk
+} as const;
+
+/* ─────────────────────── 👁 Watchlist (rug alerts) ────────────────────────
+ * Coins you're holding get re-scanned on a timer; you're alerted the moment
+ * rug conditions DEVELOP (post-entry protection — the pre-buy scan can't see
+ * a dev who dumps tomorrow). All thresholds tunable.
+ */
+export const WATCHLIST = {
+  maxCoins: 10, // full re-scans are RPC-heavy; keep the list focused
+  pollMinutes: 5,
+  alerts: {
+    liquidityDropPct: 50, // liquidity fell ≥ this % from your baseline
+    marketCapDropPct: 60, // mcap fell ≥ this % from your baseline
+    devSoldPointsDrop: 2, // dev holdings fell ≥ this many percentage points
+    gradeDrop: 20, // King Grade fell ≥ this many points
+  },
 } as const;
 
 /* ─────────────────────── Quality/momentum model ───────────────────────────

@@ -154,6 +154,10 @@ function gemBackgroundCheck(a, risk, quality) {
   } else if (largest > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+    blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
   if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
     blockers.push("Creator's launch history not checked yet.");
   }
@@ -247,7 +251,8 @@ var FIXTURE_AVOID = {
     // +15
     largestNonLpWalletPct: 18,
     bundledLaunchPct: 10,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    devHoldsPct: null
   },
   market: {
     priceEur: 31e-5,
@@ -305,7 +310,8 @@ var FIXTURE_WATCH = {
     // +15
     largestNonLpWalletPct: 11,
     bundledLaunchPct: 9,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    devHoldsPct: null
   },
   market: {
     priceEur: 14e-4,
@@ -361,7 +367,8 @@ var FIXTURE_NEUTRAL = {
     top10Pct: 24,
     largestNonLpWalletPct: 4.5,
     bundledLaunchPct: 2,
-    smartMoneyPct: null
+    smartMoneyPct: null,
+    devHoldsPct: null
   },
   market: {
     priceEur: 0.021,
@@ -593,6 +600,9 @@ var STYLES = `
   .row { display: flex; justify-content: space-between; align-items: center; }
   .details-btn { color: #7aa2ff; font-size: 12px; }
   .back-btn { color: #7aa2ff; font-size: 12px; padding: 2px 0; }
+  .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
+  .watch-btn:hover { border-color: #ffc83c; }
+  .watch-btn:disabled { opacity: .7; cursor: default; }
   .panel { border-top: 1px solid #2c303a; margin-top: 10px; padding-top: 10px; max-height: 280px; overflow-y: auto; }
   .panel h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
   .panel h4:first-child { margin-top: 0; }
@@ -755,6 +765,11 @@ function renderHome() {
     </div>
 
     <div class="scan-section">
+      <div class="scan-head"><span class="t">\u{1F441} Watching (rug alerts)</span></div>
+      <div class="watchlist-box"><div class="scan-empty">Nothing watched \u2014 open a coin and hit "\u{1F441} Watch".</div></div>
+    </div>
+
+    <div class="scan-section">
       <div class="scan-head">
         <span class="t">Coins linked on this page</span>
         <button class="rescan">\u21BB Rescan</button>
@@ -831,6 +846,7 @@ function renderHome() {
     });
   }
   updateLiveList();
+  refreshWatchlistBox();
   startLiveFeed();
   updateScanList();
   void scanPage();
@@ -1065,6 +1081,46 @@ function updateLiveList() {
   }).join("");
   wireRowHandlers(list);
 }
+function refreshWatchlistBox() {
+  const box = shadow?.querySelector(".watchlist-box");
+  if (!box) return;
+  chrome.runtime.sendMessage({ type: "GET_WATCHLIST" }, (res) => {
+    if (chrome.runtime.lastError || !res?.ok || !box.isConnected) return;
+    if (res.watchlist.length === 0) {
+      box.innerHTML = `<div class="scan-empty">Nothing watched \u2014 open a coin and hit "\u{1F441} Watch".</div>`;
+      return;
+    }
+    box.innerHTML = res.watchlist.map((w) => {
+      const gc = gradeColors(w.last.grade);
+      const liqDrift = w.baseline.liquidityEur && w.last.liquidityEur ? Math.round((w.last.liquidityEur / w.baseline.liquidityEur - 1) * 100) : null;
+      const drift = liqDrift === null ? "" : ` \xB7 liq ${liqDrift >= 0 ? "+" : ""}${liqDrift}%`;
+      return `
+          <div class="scan-item" data-addr="${esc(w.address)}">
+            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${w.last.grade === null ? "\u2014" : `${w.last.grade}%`}</span>
+            <span class="si-main">
+              <span class="si-sym">${esc(w.symbol ?? short(w.address))}</span>
+              <span class="si-reason">${w.alerted.length > 0 ? `\u{1F6A8} ${w.alerted.length} alert${w.alerted.length > 1 ? "s" : ""} fired` : "no rug conditions detected"}${esc(drift)}</span>
+            </span>
+            <button class="copy unwatch" data-unwatch="${esc(w.address)}" title="Stop watching">\u2715</button>
+          </div>`;
+    }).join("");
+    box.querySelectorAll(".scan-item").forEach((el) => {
+      el.addEventListener("click", () => {
+        const addr = el.getAttribute("data-addr");
+        if (addr) void analyze(addr, true);
+      });
+    });
+    box.querySelectorAll(".unwatch").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        chrome.runtime.sendMessage(
+          { type: "UNWATCH_TOKEN", address: btn.getAttribute("data-unwatch") ?? "" },
+          () => refreshWatchlistBox()
+        );
+      });
+    });
+  });
+}
 function eurShort(v) {
   if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(1)}M`;
   if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
@@ -1294,10 +1350,29 @@ function render(analysis, risk, quality, mock) {
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
     </div>
     <div class="panel" hidden></div>
-    <button class="back-btn" style="margin-top:10px">\u2190 Scan another token</button>`;
+    <div class="row" style="margin-top:10px">
+      <button class="back-btn">\u2190 Scan another token</button>
+      <button class="watch-btn" title="Re-scan this coin every few minutes and alert you if rug conditions develop (LP change, liquidity drop, dev selling, grade collapse)">\u{1F441} Watch for rug alerts</button>
+    </div>`;
   body.querySelector(".back-btn")?.addEventListener("click", backToHome);
   const copyBtn = body.querySelector(".copy");
   copyBtn?.addEventListener("click", () => copyToClipboard(analysis.identity.address, copyBtn));
+  const watchBtn = body.querySelector(".watch-btn");
+  watchBtn?.addEventListener("click", () => {
+    watchBtn.disabled = true;
+    watchBtn.textContent = "\u{1F441} setting up\u2026";
+    chrome.runtime.sendMessage(
+      { type: "WATCH_TOKEN", address: analysis.identity.address, symbol: analysis.identity.symbol },
+      (res) => {
+        if (chrome.runtime.lastError || !res?.ok) {
+          watchBtn.textContent = `\u2715 ${res && !res.ok ? res.error : "failed"}`;
+          watchBtn.disabled = false;
+          return;
+        }
+        watchBtn.textContent = "\u2713 watching \u2014 you will be alerted";
+      }
+    );
+  });
   const panel = body.querySelector(".panel");
   const btn = body.querySelector(".details-btn");
   btn?.addEventListener("click", () => {

@@ -106,6 +106,10 @@ function gemBackgroundCheck(a, risk, quality) {
   } else if (largest > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+    blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
   if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
     blockers.push("Creator's launch history not checked yet.");
   }

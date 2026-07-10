@@ -34,6 +34,7 @@ import type {
   RiskResult,
   Signal,
   TokenAnalysis,
+  WatchlistResponse,
 } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
@@ -181,6 +182,9 @@ const STYLES = `
   .row { display: flex; justify-content: space-between; align-items: center; }
   .details-btn { color: #7aa2ff; font-size: 12px; }
   .back-btn { color: #7aa2ff; font-size: 12px; padding: 2px 0; }
+  .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
+  .watch-btn:hover { border-color: #ffc83c; }
+  .watch-btn:disabled { opacity: .7; cursor: default; }
   .panel { border-top: 1px solid #2c303a; margin-top: 10px; padding-top: 10px; max-height: 280px; overflow-y: auto; }
   .panel h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
   .panel h4:first-child { margin-top: 0; }
@@ -357,6 +361,11 @@ function renderHome(): void {
     </div>
 
     <div class="scan-section">
+      <div class="scan-head"><span class="t">👁 Watching (rug alerts)</span></div>
+      <div class="watchlist-box"><div class="scan-empty">Nothing watched — open a coin and hit "👁 Watch".</div></div>
+    </div>
+
+    <div class="scan-section">
       <div class="scan-head">
         <span class="t">Coins linked on this page</span>
         <button class="rescan">↻ Rescan</button>
@@ -431,6 +440,7 @@ function renderHome(): void {
   }
 
   updateLiveList();
+  refreshWatchlistBox();
   startLiveFeed();
 
   updateScanList();
@@ -739,6 +749,52 @@ function updateLiveList(): void {
   wireRowHandlers(list);
 }
 
+/** Watched coins list on the home panel: current grade, liq drift, unwatch. */
+function refreshWatchlistBox(): void {
+  const box = shadow?.querySelector<HTMLDivElement>('.watchlist-box');
+  if (!box) return;
+  chrome.runtime.sendMessage({ type: 'GET_WATCHLIST' }, (res: WatchlistResponse | undefined) => {
+    if (chrome.runtime.lastError || !res?.ok || !box.isConnected) return;
+    if (res.watchlist.length === 0) {
+      box.innerHTML = `<div class="scan-empty">Nothing watched — open a coin and hit "👁 Watch".</div>`;
+      return;
+    }
+    box.innerHTML = res.watchlist
+      .map((w) => {
+        const gc = gradeColors(w.last.grade);
+        const liqDrift =
+          w.baseline.liquidityEur && w.last.liquidityEur
+            ? Math.round((w.last.liquidityEur / w.baseline.liquidityEur - 1) * 100)
+            : null;
+        const drift = liqDrift === null ? '' : ` · liq ${liqDrift >= 0 ? '+' : ''}${liqDrift}%`;
+        return `
+          <div class="scan-item" data-addr="${esc(w.address)}">
+            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${w.last.grade === null ? '—' : `${w.last.grade}%`}</span>
+            <span class="si-main">
+              <span class="si-sym">${esc(w.symbol ?? short(w.address))}</span>
+              <span class="si-reason">${w.alerted.length > 0 ? `🚨 ${w.alerted.length} alert${w.alerted.length > 1 ? 's' : ''} fired` : 'no rug conditions detected'}${esc(drift)}</span>
+            </span>
+            <button class="copy unwatch" data-unwatch="${esc(w.address)}" title="Stop watching">✕</button>
+          </div>`;
+      })
+      .join('');
+    box.querySelectorAll<HTMLElement>('.scan-item').forEach((el) => {
+      el.addEventListener('click', () => {
+        const addr = el.getAttribute('data-addr');
+        if (addr) void analyze(addr, true);
+      });
+    });
+    box.querySelectorAll<HTMLButtonElement>('.unwatch').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        chrome.runtime.sendMessage({ type: 'UNWATCH_TOKEN', address: btn.getAttribute('data-unwatch') ?? '' }, () =>
+          refreshWatchlistBox(),
+        );
+      });
+    });
+  });
+}
+
 function eurShort(v: number): string {
   if (v >= 1_000_000) return `€${(v / 1_000_000).toFixed(1)}M`;
   if (v >= 1_000) return `€${(v / 1_000).toFixed(0)}k`;
@@ -1026,11 +1082,30 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
     </div>
     <div class="panel" hidden></div>
-    <button class="back-btn" style="margin-top:10px">← Scan another token</button>`;
+    <div class="row" style="margin-top:10px">
+      <button class="back-btn">← Scan another token</button>
+      <button class="watch-btn" title="Re-scan this coin every few minutes and alert you if rug conditions develop (LP change, liquidity drop, dev selling, grade collapse)">👁 Watch for rug alerts</button>
+    </div>`;
 
   body.querySelector('.back-btn')?.addEventListener('click', backToHome);
   const copyBtn = body.querySelector<HTMLButtonElement>('.copy');
   copyBtn?.addEventListener('click', () => copyToClipboard(analysis.identity.address, copyBtn));
+  const watchBtn = body.querySelector<HTMLButtonElement>('.watch-btn');
+  watchBtn?.addEventListener('click', () => {
+    watchBtn.disabled = true;
+    watchBtn.textContent = '👁 setting up…';
+    chrome.runtime.sendMessage(
+      { type: 'WATCH_TOKEN', address: analysis.identity.address, symbol: analysis.identity.symbol },
+      (res: WatchlistResponse | undefined) => {
+        if (chrome.runtime.lastError || !res?.ok) {
+          watchBtn.textContent = `✕ ${res && !res.ok ? res.error : 'failed'}`;
+          watchBtn.disabled = false;
+          return;
+        }
+        watchBtn.textContent = '✓ watching — you will be alerted';
+      },
+    );
+  });
 
   const panel = body.querySelector<HTMLDivElement>('.panel');
   const btn = body.querySelector<HTMLButtonElement>('.details-btn');

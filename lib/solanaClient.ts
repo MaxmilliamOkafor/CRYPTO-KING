@@ -38,6 +38,7 @@ export async function fetchSolanaData(
   address: string,
   lite = false,
   excludeTokenAccounts: string[] = [],
+  creatorAddress: string | null = null,
 ): Promise<SolanaData> {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
@@ -49,7 +50,7 @@ export async function fetchSolanaData(
     return { mint, holders, status: mint ? 'partial' : 'unavailable' };
   }
 
-  const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address)]);
+  const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address, creatorAddress)]);
   const status = mint && holders ? 'ok' : mint || holders ? 'partial' : 'unavailable';
   return { mint, holders, status };
 }
@@ -130,7 +131,7 @@ async function fetchMetadataMutable(address: string): Promise<boolean | null> {
 
 /* ── Holder concentration (LP/burn excluded) ───────────────────────────── */
 
-async function fetchHolderInfo(address: string): Promise<HolderInfo | null> {
+async function fetchHolderInfo(address: string, creatorAddress: string | null = null): Promise<HolderInfo | null> {
   const [supplyRes, largestRes] = await Promise.all([
     rpcCall(SOLANA.rpcUrl, 'getTokenSupply', [address, { commitment: 'confirmed' }]),
     rpcCall(SOLANA.rpcUrl, 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
@@ -168,6 +169,16 @@ async function fetchHolderInfo(address: string): Promise<HolderInfo | null> {
             100,
         );
 
+  // Creator (dev) holdings among the top accounts. 0 = the dev's wallet holds
+  // nothing visible in the top 20 — an honest floor, not a full-supply audit.
+  const devHoldsPct =
+    creatorAddress === null
+      ? null
+      : Math.min(
+          100,
+          (accounts.reduce((s, a, i) => (owners[i] === creatorAddress ? s + a.amount : s), 0) / supply) * 100,
+        );
+
   return {
     holderCount: null, // plain RPC has no cheap holder count; GMGN fills this in when live
     top5Pct: pct(realHolders.slice(0, 5)),
@@ -175,6 +186,7 @@ async function fetchHolderInfo(address: string): Promise<HolderInfo | null> {
     largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
     bundledLaunchPct: null, // needs block-0..2 funding-graph analysis; honest "unknown" for now
     smartMoneyPct,
+    devHoldsPct,
   };
 }
 
@@ -208,6 +220,7 @@ async function fetchHolderInfoLite(address: string, excludeTokenAccounts: string
     largestNonLpWalletPct: pct(accounts.slice(0, 1)),
     bundledLaunchPct: null,
     smartMoneyPct: null, // needs owner resolution — full scans only
+    devHoldsPct: null, // needs owner resolution — full scans only
   };
 }
 

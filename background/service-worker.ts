@@ -14,7 +14,7 @@
  * Read-only by design: no keys, no wallets, no signing, no trading.
  */
 
-import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
+import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX, WATCHLIST } from '../config.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
@@ -24,6 +24,7 @@ import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } 
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
+import { computeWatchAlerts } from '../lib/watchAlerts.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
 import type {
@@ -39,6 +40,9 @@ import type {
   ResolvePairsResponse,
   RiskResult,
   TokenAnalysis,
+  WatchedCoin,
+  WatchlistResponse,
+  WatchSnapshot,
 } from '../lib/types.ts';
 
 const RECENT_KEY = 'ck:recent';
@@ -65,7 +69,7 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
 
 async function handle(
   msg: BgRequest,
-): Promise<AnalyzeResponse | RecentResponse | LiveFeedResponse | ResolvePairsResponse> {
+): Promise<AnalyzeResponse | RecentResponse | LiveFeedResponse | ResolvePairsResponse | WatchlistResponse> {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
       return analyzeToken(msg.address, msg.force === true, msg.rawGmgn);
@@ -82,6 +86,12 @@ async function handle(
       const valid = msg.pairAddresses.filter((p) => BASE58_RE.test(p)).slice(0, 90);
       return { ok: true, tokens: await fetchPairBaseTokens(valid) };
     }
+    case 'WATCH_TOKEN':
+      return watchToken(msg.address, msg.symbol);
+    case 'UNWATCH_TOKEN':
+      return unwatchToken(msg.address);
+    case 'GET_WATCHLIST':
+      return { ok: true, watchlist: await loadWatchlist() };
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };
   }
@@ -226,7 +236,7 @@ function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
 }
 
 chrome.notifications?.onClicked.addListener((id) => {
-  if (!id.startsWith('ck-')) return;
+  if (!id.startsWith('ck-') || id.startsWith('ck-watch-')) return; // watch alerts have their own handler
   const address = id.slice(3);
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
@@ -271,14 +281,16 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     // Remaining adapters degrade to honest "unavailable" internally; Promise.all is safe.
     const [gmgn, solana, audit] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator),
       rugcheckAdapter.fetchAudit(address),
     ]);
     // Full scans check the creator's launch history (serial-deployer signal);
-    // lite feed sweeps skip it to stay within the per-poll budget.
-    const deployerHist = lite
+    // lite feed sweeps skip it to stay within the per-poll budget. Either way,
+    // the persistent creator memory backfills when the endpoint fails.
+    let deployerHist = lite
       ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator)
       : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
+    deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
 
     const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, {
       gmgn: gmgn.status,
@@ -352,6 +364,7 @@ function mergeSources(
           largestNonLpWalletPct: solana.holders?.largestNonLpWalletPct ?? null,
           bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct,
           smartMoneyPct: solana.holders?.smartMoneyPct ?? null,
+          devHoldsPct: solana.holders?.devHoldsPct ?? null,
         }
       : null;
 
@@ -425,6 +438,173 @@ function mergeSources(
     fetchedAt: Date.now(),
   };
 }
+
+/* ── Persistent creator memory (Dexter-style track record) ──────────────
+ * Every successful deployer-history fetch is remembered in storage, so a
+ * serial rugger (or a proven creator) is recognised INSTANTLY on their next
+ * launch, even when the launchpad endpoint is down or the scan was lite.
+ */
+
+const CREATORS_KEY = 'ck:creators';
+interface CreatorRecord {
+  launches: number;
+  dead: number;
+  graduated: number;
+  lastSeen: number;
+}
+
+async function applyCreatorMemory(
+  creator: string | null,
+  hist: Awaited<ReturnType<typeof pumpfunDeployerAdapter.fetchDeployerHistory>>,
+): Promise<typeof hist> {
+  if (!creator) return hist;
+  const data = await chrome.storage.local.get(CREATORS_KEY);
+  const memory: Record<string, CreatorRecord> = (data[CREATORS_KEY] as Record<string, CreatorRecord>) ?? {};
+
+  const d = hist.deployer;
+  if (hist.status === 'ok' && d && d.priorLaunches !== null) {
+    // Fresh data → update memory (bounded: keep the 500 most recently seen).
+    memory[creator] = {
+      launches: d.priorLaunches,
+      dead: d.priorDeadLaunches ?? 0,
+      graduated: d.graduatedLaunches ?? 0,
+      lastSeen: Date.now(),
+    };
+    const keys = Object.keys(memory);
+    if (keys.length > 500) {
+      keys
+        .sort((a, b) => memory[a].lastSeen - memory[b].lastSeen)
+        .slice(0, keys.length - 500)
+        .forEach((k) => delete memory[k]);
+    }
+    await chrome.storage.local.set({ [CREATORS_KEY]: memory });
+    return hist;
+  }
+
+  // Endpoint unavailable / lite scan → backfill from memory if we know them.
+  const known = memory[creator];
+  if (known) {
+    return {
+      status: 'partial',
+      deployer: {
+        priorRugs: null,
+        fundingSource: 'unknown',
+        priorLaunches: known.launches,
+        priorDeadLaunches: known.dead,
+        graduatedLaunches: known.graduated,
+      },
+    };
+  }
+  return hist;
+}
+
+/* ── 👁 Watchlist: post-entry rug alerts ─────────────────────────────────
+ * The pre-buy scan can't see a dev who dumps tomorrow. Watched coins are
+ * re-scanned on a chrome.alarms timer; lib/watchAlerts.ts diffs each fresh
+ * snapshot against the baseline and fires a desktop notification ONCE per
+ * alert kind per coin.
+ */
+
+const WATCHLIST_KEY = 'ck:watchlist';
+
+async function loadWatchlist(): Promise<WatchedCoin[]> {
+  const data = await chrome.storage.local.get(WATCHLIST_KEY);
+  return Array.isArray(data[WATCHLIST_KEY]) ? (data[WATCHLIST_KEY] as WatchedCoin[]) : [];
+}
+
+async function saveWatchlist(list: WatchedCoin[]): Promise<void> {
+  await chrome.storage.local.set({ [WATCHLIST_KEY]: list });
+}
+
+function snapshotOf(entry: CacheEntry): WatchSnapshot {
+  return {
+    at: Date.now(),
+    grade: computeKingGrade(entry.analysis, entry.risk, entry.quality).grade,
+    liquidityEur: entry.analysis.market?.liquidityEur ?? null,
+    marketCapEur: entry.analysis.market?.marketCapEur ?? null,
+    lpStatus: entry.analysis.market?.lpStatus ?? 'unknown',
+    devHoldsPct: entry.analysis.holders?.devHoldsPct ?? null,
+    largestNonLpWalletPct: entry.analysis.holders?.largestNonLpWalletPct ?? null,
+  };
+}
+
+async function watchToken(address: string, symbol: string | null): Promise<WatchlistResponse> {
+  if (!BASE58_RE.test(address)) return { ok: false, error: 'Not a valid Solana address.' };
+  const list = await loadWatchlist();
+  if (list.some((w) => w.address === address)) return { ok: true, watchlist: list };
+  if (list.length >= WATCHLIST.maxCoins) {
+    return { ok: false, error: `Watchlist is full (${WATCHLIST.maxCoins} coins) — unwatch one first.` };
+  }
+
+  const res = await analyzeToken(address, false); // full scan for a solid baseline
+  if (!res.ok) return { ok: false, error: res.error };
+  const entry = cache.get(address);
+  if (!entry) return { ok: false, error: 'Scan failed — cannot watch.' };
+
+  const snap = snapshotOf(entry);
+  const coin: WatchedCoin = {
+    address,
+    symbol: entry.analysis.identity.symbol ?? symbol,
+    addedAt: Date.now(),
+    baseline: snap,
+    last: snap,
+    alerted: [],
+  };
+  const next = [...list, coin];
+  await saveWatchlist(next);
+  ensureWatchAlarm();
+  return { ok: true, watchlist: next };
+}
+
+async function unwatchToken(address: string): Promise<WatchlistResponse> {
+  const next = (await loadWatchlist()).filter((w) => w.address !== address);
+  await saveWatchlist(next);
+  return { ok: true, watchlist: next };
+}
+
+async function sweepWatchlist(): Promise<void> {
+  const list = await loadWatchlist();
+  if (list.length === 0) return;
+
+  for (const coin of list) {
+    const res = await analyzeToken(coin.address, /*force*/ true); // fresh full scan
+    if (!res.ok) continue; // transient failure → try again next sweep, never alert on missing data
+    const entry = cache.get(coin.address);
+    if (!entry) continue;
+    coin.last = snapshotOf(entry);
+
+    for (const alert of computeWatchAlerts(coin.baseline, coin.last)) {
+      if (coin.alerted.includes(alert.kind)) continue;
+      coin.alerted.push(alert.kind);
+      const sym = coin.symbol ?? `${coin.address.slice(0, 4)}…${coin.address.slice(-4)}`;
+      chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
+        type: 'basic',
+        iconUrl: 'icons/icon128.png',
+        title: `🚨 ${sym} — watched coin alert`,
+        message: `${alert.message} Click to open on GMGN.`,
+        priority: 2,
+      });
+    }
+  }
+  await saveWatchlist(list);
+}
+
+function ensureWatchAlarm(): void {
+  chrome.alarms.create('ck-watch', { periodInMinutes: WATCHLIST.pollMinutes });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'ck-watch') void sweepWatchlist();
+});
+chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
+chrome.runtime.onStartup.addListener(ensureWatchAlarm);
+
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith('ck-watch-')) return;
+  const address = id.slice('ck-watch-'.length).split('-')[0];
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
+  chrome.notifications.clear(id);
+});
 
 /* ── Recent-tokens persistence (dashboard) ────────────────────────────── */
 

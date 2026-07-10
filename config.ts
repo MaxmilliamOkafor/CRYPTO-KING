@@ -361,6 +361,35 @@ export const QUALITY_LIMITS = {
  * passes every gate below. Rationale: the gem must never point at a coin
  * whose dev can still nuke it in one transaction.
  */
+/* ───────────────────────── King Grade (0–100%) ────────────────────────────
+ * One strict percentage per coin: 100% = passed every audit we can run,
+ * 0% = confirmed danger. Composite of safety (inverted risk), quality and
+ * AUDIT COVERAGE — unknowns actively hurt the grade, so a coin cannot score
+ * high on a shallow scan; it must prove itself on a full background check.
+ * Hard caps below keep it strict. Still not a profit prediction.
+ */
+export const KING_GRADE = {
+  safetyWeight: 0.5, // (100 - riskScore) share
+  qualityWeight: 0.3, // qualityScore share
+  coverageWeight: 0.2, // % of the 10 audit checks actually verified
+  caps: {
+    confirmedTrap: 10, // active mint/freeze auth, trap extension, honeypot, deployer-held LP
+    highRisk: 15, // riskScore ≥ 60
+    onBondingCurve: 40, // dev/insiders can dump any second
+    partialData: 50, // holders or LP not verified yet
+    noGemPass: 79, // 80%+ is reserved for coins that passed the full background check
+  },
+} as const;
+
+/** Grade buckets for display. */
+export const GRADE_META: Array<{ min: number; label: string; color: string; textColor: string }> = [
+  { min: 80, label: 'GEM GRADE', color: '#d4a017', textColor: '#1b1b18' },
+  { min: 60, label: 'STRONG', color: '#46a758', textColor: '#ffffff' },
+  { min: 40, label: 'MIXED', color: '#ffb224', textColor: '#1b1b18' },
+  { min: 20, label: 'WEAK', color: '#f76b15', textColor: '#ffffff' },
+  { min: 0, label: 'AVOID', color: '#e5484d', textColor: '#ffffff' },
+];
+
 export const GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
   requireGraduated: true,

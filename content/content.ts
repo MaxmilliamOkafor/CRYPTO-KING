@@ -23,6 +23,7 @@
 
 import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
+import { computeKingGrade, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
 import type {
   AnalyzeResponse,
@@ -693,9 +694,8 @@ function updateLiveList(): void {
   if (liveFreshOnly) rows = rows.filter((r) => r.ageMinutes !== null && r.ageMinutes < 60);
   if (liveGraduatedOnly) rows = rows.filter((r) => r.graduated === true);
   if (liveSortBest) {
-    // 🏆 composite: strongest observed quality minus risk first. A ranking aid
-    // for research — NOT a profit prediction.
-    rows.sort((a, b) => (b.qualityScore ?? 0) - b.riskScore - ((a.qualityScore ?? 0) - a.riskScore));
+    // 🏆 highest King Grade first. A ranking aid for research — NOT a profit prediction.
+    rows.sort((a, b) => (b.grade ?? -1) - (a.grade ?? -1));
   }
 
   if (rows.length === 0) {
@@ -707,10 +707,10 @@ function updateLiveList(): void {
 
   list.innerHTML = rows
     .map((r) => {
-      const meta = SIGNAL_META[r.signal];
-      const label = r.insufficientData ? 'NO DATA' : `${r.riskScore} ${meta.label}`;
-      const bg = r.insufficientData ? '#3a3f4c' : meta.color;
-      const fg = r.insufficientData ? '#e6e8ee' : meta.textColor;
+      const gc = gradeColors(r.grade);
+      const label = r.grade === null ? 'NO DATA' : `${r.grade}% ${gradeLabel(r.grade)}`;
+      const bg = gc.color;
+      const fg = gc.textColor;
       const sym = r.symbol ?? short(r.address);
       const reason = r.insufficientData
         ? 'Not enough data yet'
@@ -800,6 +800,7 @@ interface InlineResult {
   signal: Signal;
   topReason: string | null;
   quality: number | null;
+  grade: number | null;
   insufficient: boolean;
   unverified: boolean;
 }
@@ -922,10 +923,11 @@ function pumpInlineQueue(): void {
                 signal: res.risk.signal,
                 topReason: res.risk.reasons[0]?.text ?? null,
                 quality: res.quality.insufficientData ? null : res.quality.qualityScore,
+                grade: computeKingGrade(res.analysis, res.risk, res.quality).grade,
                 insufficient: res.risk.insufficientData,
                 unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === 'unknown',
               }
-            : { score: 0, signal: 'NEUTRAL', topReason: null, quality: null, insufficient: true, unverified: true },
+            : { score: 0, signal: 'NEUTRAL', topReason: null, quality: null, grade: null, insufficient: true, unverified: true },
         );
         paintBadges(mint);
       })
@@ -941,14 +943,15 @@ function paintBadges(mint: string): void {
   const els = badgeEls.get(mint);
   if (!result || result === 'pending' || !els) return;
   const meta = SIGNAL_META[result.signal];
-  const label = result.insufficient ? '👑 ?' : `👑 ${result.score} ${meta.label}${result.unverified ? '*' : ''}`;
-  const bg = result.insufficient ? '#3a3f4c' : meta.color;
-  const fg = result.insufficient ? '#e6e8ee' : meta.textColor;
+  const gc = gradeColors(result.grade);
+  const label = result.insufficient ? '👑 ?' : `👑 ${result.grade}%${result.unverified ? '*' : ''}`;
+  const bg = result.insufficient ? '#3a3f4c' : gc.color;
+  const fg = result.insufficient ? '#e6e8ee' : gc.textColor;
   const tip = result.insufficient
     ? 'CRYPTO-KING: not enough data — click for details'
-    : `CRYPTO-KING: risk ${result.score}/100 ${meta.label}` +
+    : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) · risk ${result.score}/100 ${meta.label}` +
       `${result.quality !== null ? ` · quality ${result.quality}/100` : ''}` +
-      `${result.unverified ? ' (holders/LP not verified yet)' : ''}` +
+      `${result.unverified ? ' — holders/LP not verified yet, grade capped' : ''}` +
       `${result.topReason ? ` — ${result.topReason}` : ''} · click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
@@ -1000,22 +1003,24 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   }
   const body = cardBody();
   const meta = SIGNAL_META[risk.signal];
+  const kg = computeKingGrade(analysis, risk, quality);
+  const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? 'No individual risk factors triggered — low observed risk ≠ safe.';
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
-  const qualityLine = quality.insufficientData
+  const subLine = quality.insufficientData
     ? ''
-    : `<div class="quality-line">Quality signals: <b>${quality.qualityScore}/100</b> <span class="muted">(observed positives — not a profit prediction)</span></div>`;
+    : `<div class="quality-line">Risk <b>${risk.riskScore}/100</b> (${esc(meta.label)}) · Quality <b>${quality.qualityScore}/100</b> · Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
 
   body.innerHTML = `
     <div class="head">
-      <span class="badge" style="background:${meta.color};color:${meta.textColor}">${meta.label}</span>
-      <span class="score">${risk.riskScore}</span>
+      <span class="badge" style="background:${gc.color};color:${gc.textColor}">${esc(kg.label)}</span>
+      <span class="score">${kg.grade === null ? '—' : `${kg.grade}%`}</span>
       <span class="sym" title="${esc(analysis.identity.address)}">${esc(sym)}</span>
       ${mock ? '<span class="mock">MOCK</span>' : ''}
       <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">⧉</button>
     </div>
     <div class="top-reason">${esc(topReason)}</div>
-    ${qualityLine}
+    ${subLine}
     <div class="row">
       <button class="details-btn">Details ▾</button>
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
@@ -1058,11 +1063,15 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
     .map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`)
     .join('');
   const verdict = gemBackgroundCheck(analysis, risk, quality);
-  const gemSection = verdict.gem
-    ? `<h4>💎 Background check</h4><ul><li><span class="pts good">✓</span><span>PASSED — graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>`
-    : `<h4>💎 Background check — not passed</h4><ul>${verdict.blockers
-        .map((b) => `<li><span class="pts bad">✗</span><span>${esc(b)}</span></li>`)
-        .join('')}</ul>`;
+  const kg = computeKingGrade(analysis, risk, quality);
+  const capItems = kg.caps.map((c) => `<li><span class="pts bad">▼</span><span>${esc(c)}</span></li>`).join('');
+  const gemSection =
+    (verdict.gem
+      ? `<h4>💎 Background check</h4><ul><li><span class="pts good">✓</span><span>PASSED — graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>`
+      : `<h4>💎 Background check — not passed</h4><ul>${verdict.blockers
+          .map((b) => `<li><span class="pts bad">✗</span><span>${esc(b)}</span></li>`)
+          .join('')}</ul>`) +
+    (capItems ? `<h4>Why the grade is capped</h4><ul>${capItems}</ul>` : '');
   const gaps = risk.dataGaps
     .slice(0, 5)
     .map((g) => `<li class="gap">${esc(g)}</li>`)

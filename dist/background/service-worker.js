@@ -292,6 +292,33 @@ var QUALITY_LIMITS = {
   minLaunchesForProven: 2
   // …across at least this many prior launches
 };
+var KING_GRADE = {
+  safetyWeight: 0.5,
+  // (100 - riskScore) share
+  qualityWeight: 0.3,
+  // qualityScore share
+  coverageWeight: 0.2,
+  // % of the 10 audit checks actually verified
+  caps: {
+    confirmedTrap: 10,
+    // active mint/freeze auth, trap extension, honeypot, deployer-held LP
+    highRisk: 15,
+    // riskScore ≥ 60
+    onBondingCurve: 40,
+    // dev/insiders can dump any second
+    partialData: 50,
+    // holders or LP not verified yet
+    noGemPass: 79
+    // 80%+ is reserved for coins that passed the full background check
+  }
+};
+var GRADE_META = [
+  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
+  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
+  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
+  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
+  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+];
 var GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
   requireGraduated: true,
@@ -809,6 +836,56 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push("Creator's launch history not checked yet.");
   }
   return { gem: blockers.length === 0, blockers };
+}
+
+// lib/kingGrade.ts
+var known = (v) => v !== null && v !== void 0;
+function computeKingGrade(a, risk, quality) {
+  if (risk.insufficientData) {
+    return { grade: null, label: "NO DATA", caps: [], parts: { safety: 0, quality: 0, coveragePct: 0 } };
+  }
+  const checks = [
+    known(a.mint?.mintAuthorityActive),
+    known(a.mint?.freezeAuthorityActive),
+    known(a.mint?.permanentDelegateActive),
+    // Token-2022 trap extensions readable
+    known(a.mint?.metadataMutable),
+    a.market !== null && a.market.lpStatus !== "unknown",
+    known(a.holders?.top10Pct),
+    known(a.holders?.largestNonLpWalletPct),
+    a.market?.sellSimulation != null,
+    known(a.deployer?.priorLaunches),
+    a.socials !== null
+  ];
+  const coveragePct = checks.filter(Boolean).length / checks.length * 100;
+  const safety = 100 - risk.riskScore;
+  const raw = KING_GRADE.safetyWeight * safety + KING_GRADE.qualityWeight * quality.qualityScore + KING_GRADE.coverageWeight * coveragePct;
+  let grade = Math.round(Math.min(100, Math.max(0, raw)));
+  const caps = [];
+  const cap = (limit, why) => {
+    if (grade > limit) {
+      grade = limit;
+      caps.push(`Capped at ${limit}%: ${why}`);
+    }
+  };
+  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  if (confirmedTrap) cap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
+  if (risk.riskScore >= 60) cap(KING_GRADE.caps.highRisk, "risk score 60+.");
+  if (a.launch?.bondingCurveComplete === false) {
+    cap(KING_GRADE.caps.onBondingCurve, "still on the bonding curve \u2014 dev can dump any second.");
+  }
+  if (!known(a.holders?.largestNonLpWalletPct) || a.market === null || a.market.lpStatus === "unknown") {
+    cap(KING_GRADE.caps.partialData, "holders/LP not verified yet \u2014 run the full scan.");
+  }
+  if (!gemBackgroundCheck(a, risk, quality).gem) {
+    cap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
+  }
+  return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
+}
+function gradeLabel(grade) {
+  if (grade === null) return "NO DATA";
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.label;
+  return "AVOID";
 }
 
 // lib/narratives.ts
@@ -1577,6 +1654,7 @@ async function doLiveFeedSweep() {
       entry = cache.get(c.mint) ?? entry;
     }
     const verdict = entry.lite ? { gem: false, blockers: ["Full background check pending."] } : gemBackgroundCheck(entry.analysis, entry.risk, entry.quality);
+    const kingGrade = computeKingGrade(entry.analysis, entry.risk, entry.quality);
     const row = {
       address: c.mint,
       symbol: entry.analysis.identity.symbol ?? c.symbol,
@@ -1587,6 +1665,7 @@ async function doLiveFeedSweep() {
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
+      grade: kingGrade.grade,
       gem: verdict.gem,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
@@ -1614,7 +1693,7 @@ function maybeNotifyLowRisk(row, risk) {
   chrome.notifications.create(`ck-${row.address}`, {
     type: "basic",
     iconUrl: "icons/icon128.png",
-    title: `\u{1F48E} ${sym} \u2014 passed background check (risk ${risk.riskScore}, quality ${row.qualityScore ?? "?"})`,
+    title: `\u{1F48E} ${sym} \u2014 King Grade ${row.grade ?? "?"}% (risk ${risk.riskScore}, quality ${row.qualityScore ?? "?"})`,
     message: "Graduated, LP secured, no whale wallet, creator screened. Still speculative \u2014 research it yourself. Click to open on GMGN."
   });
 }

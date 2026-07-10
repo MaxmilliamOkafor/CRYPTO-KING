@@ -18,6 +18,7 @@ import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX } from '../config.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
+import { computeKingGrade } from '../lib/kingGrade.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
@@ -161,6 +162,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
     const verdict = entry.lite
       ? { gem: false, blockers: ['Full background check pending.'] }
       : gemBackgroundCheck(entry.analysis, entry.risk, entry.quality);
+    const kingGrade = computeKingGrade(entry.analysis, entry.risk, entry.quality);
 
     const row: FeedRow = {
       address: c.mint,
@@ -173,6 +175,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
+      grade: kingGrade.grade,
       gem: verdict.gem,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
@@ -216,7 +219,7 @@ function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
   chrome.notifications.create(`ck-${row.address}`, {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
-    title: `💎 ${sym} — passed background check (risk ${risk.riskScore}, quality ${row.qualityScore ?? '?'})`,
+    title: `💎 ${sym} — King Grade ${row.grade ?? '?'}% (risk ${risk.riskScore}, quality ${row.qualityScore ?? '?'})`,
     message:
       'Graduated, LP secured, no whale wallet, creator screened. Still speculative — research it yourself. Click to open on GMGN.',
   });

@@ -272,6 +272,8 @@ export interface FeedRow {
   topReason: string | null;
   /** Positive-signal score (0–100), null when too little data to say anything. */
   qualityScore: number | null;
+  /** King Grade 0–100% (strict composite incl. audit coverage; lib/kingGrade.ts). */
+  grade: number | null;
   /** true = passed the FULL 💎 background check (lib/gemCriteria.ts) on verified data. */
   gem: boolean;
   /** true = graduated off its bonding curve; null = unknown/not a launchpad coin. */

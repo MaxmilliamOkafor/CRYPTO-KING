@@ -83,6 +83,33 @@ var RATE_LIMITS_MS = {
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
+var KING_GRADE = {
+  safetyWeight: 0.5,
+  // (100 - riskScore) share
+  qualityWeight: 0.3,
+  // qualityScore share
+  coverageWeight: 0.2,
+  // % of the 10 audit checks actually verified
+  caps: {
+    confirmedTrap: 10,
+    // active mint/freeze auth, trap extension, honeypot, deployer-held LP
+    highRisk: 15,
+    // riskScore ≥ 60
+    onBondingCurve: 40,
+    // dev/insiders can dump any second
+    partialData: 50,
+    // holders or LP not verified yet
+    noGemPass: 79
+    // 80%+ is reserved for coins that passed the full background check
+  }
+};
+var GRADE_META = [
+  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
+  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
+  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
+  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
+  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+];
 var GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
   requireGraduated: true,
@@ -131,6 +158,61 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push("Creator's launch history not checked yet.");
   }
   return { gem: blockers.length === 0, blockers };
+}
+
+// lib/kingGrade.ts
+var known = (v) => v !== null && v !== void 0;
+function computeKingGrade(a, risk, quality) {
+  if (risk.insufficientData) {
+    return { grade: null, label: "NO DATA", caps: [], parts: { safety: 0, quality: 0, coveragePct: 0 } };
+  }
+  const checks = [
+    known(a.mint?.mintAuthorityActive),
+    known(a.mint?.freezeAuthorityActive),
+    known(a.mint?.permanentDelegateActive),
+    // Token-2022 trap extensions readable
+    known(a.mint?.metadataMutable),
+    a.market !== null && a.market.lpStatus !== "unknown",
+    known(a.holders?.top10Pct),
+    known(a.holders?.largestNonLpWalletPct),
+    a.market?.sellSimulation != null,
+    known(a.deployer?.priorLaunches),
+    a.socials !== null
+  ];
+  const coveragePct = checks.filter(Boolean).length / checks.length * 100;
+  const safety = 100 - risk.riskScore;
+  const raw = KING_GRADE.safetyWeight * safety + KING_GRADE.qualityWeight * quality.qualityScore + KING_GRADE.coverageWeight * coveragePct;
+  let grade = Math.round(Math.min(100, Math.max(0, raw)));
+  const caps = [];
+  const cap = (limit, why) => {
+    if (grade > limit) {
+      grade = limit;
+      caps.push(`Capped at ${limit}%: ${why}`);
+    }
+  };
+  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  if (confirmedTrap) cap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
+  if (risk.riskScore >= 60) cap(KING_GRADE.caps.highRisk, "risk score 60+.");
+  if (a.launch?.bondingCurveComplete === false) {
+    cap(KING_GRADE.caps.onBondingCurve, "still on the bonding curve \u2014 dev can dump any second.");
+  }
+  if (!known(a.holders?.largestNonLpWalletPct) || a.market === null || a.market.lpStatus === "unknown") {
+    cap(KING_GRADE.caps.partialData, "holders/LP not verified yet \u2014 run the full scan.");
+  }
+  if (!gemBackgroundCheck(a, risk, quality).gem) {
+    cap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
+  }
+  return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
+}
+function gradeLabel(grade) {
+  if (grade === null) return "NO DATA";
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.label;
+  return "AVOID";
+}
+function gradeColors(grade) {
+  if (grade === null) return { color: "#3a3f4c", textColor: "#e6e8ee" };
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };
+  return { color: "#e5484d", textColor: "#ffffff" };
 }
 
 // mock/fixtures.ts
@@ -952,17 +1034,17 @@ function updateLiveList() {
   if (liveFreshOnly) rows = rows.filter((r) => r.ageMinutes !== null && r.ageMinutes < 60);
   if (liveGraduatedOnly) rows = rows.filter((r) => r.graduated === true);
   if (liveSortBest) {
-    rows.sort((a, b) => (b.qualityScore ?? 0) - b.riskScore - ((a.qualityScore ?? 0) - a.riskScore));
+    rows.sort((a, b) => (b.grade ?? -1) - (a.grade ?? -1));
   }
   if (rows.length === 0) {
     list.innerHTML = `<div class="scan-empty">${liveSafeOnly || liveLowCapOnly ? "No fresh launches match the filters right now." : "Waiting for the first live results\u2026"}</div>`;
     return;
   }
   list.innerHTML = rows.map((r) => {
-    const meta = SIGNAL_META[r.signal];
-    const label = r.insufficientData ? "NO DATA" : `${r.riskScore} ${meta.label}`;
-    const bg = r.insufficientData ? "#3a3f4c" : meta.color;
-    const fg = r.insufficientData ? "#e6e8ee" : meta.textColor;
+    const gc = gradeColors(r.grade);
+    const label = r.grade === null ? "NO DATA" : `${r.grade}% ${gradeLabel(r.grade)}`;
+    const bg = gc.color;
+    const fg = gc.textColor;
     const sym = r.symbol ?? short(r.address);
     const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? (r.unverified ? "Early checks clean \u2014 holders/LP not verified yet (click for full scan)" : "No risk factors triggered \u2014 still not a buy signal");
     const gem = isGem(r);
@@ -1053,11 +1135,11 @@ function sweepInlineBadges() {
       const pm = href.match(PAIR_HREF_RE);
       if (pm) {
         badgedLinks.add(a);
-        const known = pairCache.get(pm[1]);
-        if (known) {
-          attachBadge(a, known);
-          queueInlineScan(known);
-        } else if (known === void 0) {
+        const known2 = pairCache.get(pm[1]);
+        if (known2) {
+          attachBadge(a, known2);
+          queueInlineScan(known2);
+        } else if (known2 === void 0) {
           pairCache.set(pm[1], null);
           pendingPairs.push({ a, pair: pm[1] });
         }
@@ -1125,9 +1207,10 @@ function pumpInlineQueue() {
           signal: res.risk.signal,
           topReason: res.risk.reasons[0]?.text ?? null,
           quality: res.quality.insufficientData ? null : res.quality.qualityScore,
+          grade: computeKingGrade(res.analysis, res.risk, res.quality).grade,
           insufficient: res.risk.insufficientData,
           unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === "unknown"
-        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, insufficient: true, unverified: true }
+        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, grade: null, insufficient: true, unverified: true }
       );
       paintBadges(mint);
     }).finally(() => {
@@ -1141,10 +1224,11 @@ function paintBadges(mint) {
   const els = badgeEls.get(mint);
   if (!result || result === "pending" || !els) return;
   const meta = SIGNAL_META[result.signal];
-  const label = result.insufficient ? "\u{1F451} ?" : `\u{1F451} ${result.score} ${meta.label}${result.unverified ? "*" : ""}`;
-  const bg = result.insufficient ? "#3a3f4c" : meta.color;
-  const fg = result.insufficient ? "#e6e8ee" : meta.textColor;
-  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: risk ${result.score}/100 ${meta.label}${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " (holders/LP not verified yet)" : ""}${result.topReason ? ` \u2014 ${result.topReason}` : ""} \xB7 click for full breakdown`;
+  const gc = gradeColors(result.grade);
+  const label = result.insufficient ? "\u{1F451} ?" : `\u{1F451} ${result.grade}%${result.unverified ? "*" : ""}`;
+  const bg = result.insufficient ? "#3a3f4c" : gc.color;
+  const fg = result.insufficient ? "#e6e8ee" : gc.textColor;
+  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 risk ${result.score}/100 ${meta.label}${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 ${result.topReason}` : ""} \xB7 click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
       els.delete(el);
@@ -1190,19 +1274,21 @@ function render(analysis, risk, quality, mock) {
   }
   const body = cardBody();
   const meta = SIGNAL_META[risk.signal];
+  const kg = computeKingGrade(analysis, risk, quality);
+  const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? "No individual risk factors triggered \u2014 low observed risk \u2260 safe.";
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
-  const qualityLine = quality.insufficientData ? "" : `<div class="quality-line">Quality signals: <b>${quality.qualityScore}/100</b> <span class="muted">(observed positives \u2014 not a profit prediction)</span></div>`;
+  const subLine = quality.insufficientData ? "" : `<div class="quality-line">Risk <b>${risk.riskScore}/100</b> (${esc(meta.label)}) \xB7 Quality <b>${quality.qualityScore}/100</b> \xB7 Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
   body.innerHTML = `
     <div class="head">
-      <span class="badge" style="background:${meta.color};color:${meta.textColor}">${meta.label}</span>
-      <span class="score">${risk.riskScore}</span>
+      <span class="badge" style="background:${gc.color};color:${gc.textColor}">${esc(kg.label)}</span>
+      <span class="score">${kg.grade === null ? "\u2014" : `${kg.grade}%`}</span>
       <span class="sym" title="${esc(analysis.identity.address)}">${esc(sym)}</span>
       ${mock ? '<span class="mock">MOCK</span>' : ""}
       <button class="copy" data-copy="${esc(analysis.identity.address)}" title="Copy token address">\u29C9</button>
     </div>
     <div class="top-reason">${esc(topReason)}</div>
-    ${qualityLine}
+    ${subLine}
     <div class="row">
       <button class="details-btn">Details \u25BE</button>
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
@@ -1233,7 +1319,9 @@ function fillPanel(panel, analysis, risk, quality) {
   const mitigations = risk.mitigations.map((m) => `<li><span class="pts good">${m.points}</span><span>${esc(m.text)}</span></li>`).join("");
   const qualityItems = quality.reasons.slice(0, 6).map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`).join("");
   const verdict = gemBackgroundCheck(analysis, risk, quality);
-  const gemSection = verdict.gem ? `<h4>\u{1F48E} Background check</h4><ul><li><span class="pts good">\u2713</span><span>PASSED \u2014 graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>` : `<h4>\u{1F48E} Background check \u2014 not passed</h4><ul>${verdict.blockers.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`).join("")}</ul>`;
+  const kg = computeKingGrade(analysis, risk, quality);
+  const capItems = kg.caps.map((c) => `<li><span class="pts bad">\u25BC</span><span>${esc(c)}</span></li>`).join("");
+  const gemSection = (verdict.gem ? `<h4>\u{1F48E} Background check</h4><ul><li><span class="pts good">\u2713</span><span>PASSED \u2014 graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>` : `<h4>\u{1F48E} Background check \u2014 not passed</h4><ul>${verdict.blockers.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`).join("")}</ul>`) + (capItems ? `<h4>Why the grade is capped</h4><ul>${capItems}</ul>` : "");
   const gaps = risk.dataGaps.slice(0, 5).map((g) => `<li class="gap">${esc(g)}</li>`).join("");
   panel.innerHTML = `
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}

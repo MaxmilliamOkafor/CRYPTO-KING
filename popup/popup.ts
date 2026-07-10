@@ -5,6 +5,7 @@
  */
 
 import { DISCLAIMER, SIGNAL_META } from '../config.ts';
+import { computeKingGrade, gradeLabel } from '../lib/kingGrade.ts';
 import type { AnalyzeResponse, QualityResult, RecentResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
@@ -107,14 +108,14 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   for (const g of risk.dataGaps) gaps.appendChild(li('gap-item', g));
   $('gaps-details').hidden = risk.dataGaps.length === 0;
 
-  renderMetrics(analysis, quality);
+  renderMetrics(analysis, risk, quality);
 
   ($('link-solscan') as HTMLAnchorElement).href = `https://solscan.io/token/${addr}`;
   ($('link-rugcheck') as HTMLAnchorElement).href = `https://rugcheck.xyz/tokens/${addr}`;
   ($('link-gmgn') as HTMLAnchorElement).href = `https://gmgn.ai/sol/token/${addr}`;
 }
 
-function renderMetrics(a: TokenAnalysis, quality: QualityResult): void {
+function renderMetrics(a: TokenAnalysis, risk: RiskResult, quality: QualityResult): void {
   const m = a.market;
   const h = a.holders;
   const mint = a.mint;
@@ -146,6 +147,14 @@ function renderMetrics(a: TokenAnalysis, quality: QualityResult): void {
       v: quality.insufficientData ? 'unknown' : `${quality.qualityScore}/100`,
       cls: !quality.insufficientData && quality.qualityScore >= 50 ? 'good' : undefined,
     },
+    (() => {
+      const kg = computeKingGrade(a, risk, quality);
+      return {
+        k: 'King Grade',
+        v: kg.grade === null ? 'unknown' : `${kg.grade}% ${gradeLabel(kg.grade)}`,
+        cls: kg.grade !== null && kg.grade >= 60 ? 'good' : kg.grade !== null && kg.grade < 20 ? 'bad' : undefined,
+      };
+    })(),
   ];
 
   const grid = $('metrics');

@@ -9,6 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
+import { computeKingGrade } from '../lib/kingGrade.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken, signalForScore } from '../lib/riskScorer.ts';
@@ -320,6 +321,56 @@ test('gem check: RUGKING is blocked on multiple gates', () => {
   const v = gemBackgroundCheck(FIXTURE_AVOID, scoreToken(FIXTURE_AVOID), scoreQuality(FIXTURE_AVOID));
   assert.equal(v.gem, false);
   assert.ok(v.blockers.length >= 3); // risk gate, LP not secured, whale wallet
+});
+
+/* ── King Grade (the 0–100% display) ───────────────────────────────────── */
+
+test('King Grade: QUOKKA grades 98% GEM GRADE (only deployer history unchecked)', () => {
+  const kg = computeKingGrade(FIXTURE_NEUTRAL, scoreToken(FIXTURE_NEUTRAL), scoreQuality(FIXTURE_NEUTRAL));
+  // safety 100·0.5 + quality 100·0.3 + coverage 90%·0.2 = 98; gem passed → uncapped
+  assert.equal(kg.grade, 98);
+  assert.equal(kg.label, 'GEM GRADE');
+  assert.equal(kg.caps.length, 0);
+});
+
+test('King Grade: RUGKING is hard-capped at 10% (confirmed trap mechanics)', () => {
+  const kg = computeKingGrade(FIXTURE_AVOID, scoreToken(FIXTURE_AVOID), scoreQuality(FIXTURE_AVOID));
+  assert.equal(kg.grade, 10);
+  assert.equal(kg.label, 'AVOID');
+  assert.ok(kg.caps.some((c) => /confirmed trap/.test(c)));
+});
+
+test('King Grade: WIFCAT lands mid-field (56% MIXED) — real differentiation', () => {
+  const kg = computeKingGrade(FIXTURE_WATCH, scoreToken(FIXTURE_WATCH), scoreQuality(FIXTURE_WATCH));
+  // safety 55·0.5=27.5 + quality 35·0.3=10.5 + coverage 90%·0.2=18 → 56; gem-fail cap (79) is a no-op
+  assert.equal(kg.grade, 56);
+  assert.equal(kg.label, 'MIXED');
+});
+
+test('King Grade: partial data caps at 50% — a coin cannot look good unscanned', () => {
+  const partial: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  partial.holders = null; // holders unverified
+  const kg = computeKingGrade(partial, scoreToken(partial), scoreQuality(partial));
+  assert.ok(kg.grade !== null && kg.grade <= 50);
+  assert.ok(kg.caps.some((c) => /not verified yet/.test(c)));
+});
+
+test('King Grade: on the bonding curve caps at 40% no matter how clean', () => {
+  const curve: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  curve.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false, replyCount: 100 };
+  curve.deployer = { ...curve.deployer!, priorLaunches: 3, priorDeadLaunches: 0, graduatedLaunches: 3 };
+  const kg = computeKingGrade(curve, scoreToken(curve), scoreQuality(curve));
+  assert.ok(kg.grade !== null && kg.grade <= 40);
+  assert.ok(kg.caps.some((c) => /bonding curve/.test(c)));
+});
+
+test('King Grade: 80%+ unreachable without a passed background check', () => {
+  const noGem: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  noGem.market = { ...noGem.market!, lpStatus: 'locked' }; // still fine…
+  noGem.holders = { ...noGem.holders!, largestNonLpWalletPct: 12 }; // …but whale gate fails the gem check
+  const kg = computeKingGrade(noGem, scoreToken(noGem), scoreQuality(noGem));
+  assert.ok(kg.grade !== null && kg.grade <= 79);
+  assert.ok(kg.caps.some((c) => /background check/.test(c)));
 });
 
 console.log(`\n${passed} tests passed.`);

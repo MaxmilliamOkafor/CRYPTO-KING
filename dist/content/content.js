@@ -764,6 +764,9 @@ var STYLES = `
   .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
   .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
   .ntag { background: #221a33; color: #b79bff; border: 1px solid #45348a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; }
+  .rug-tag { font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .rug-tag.high { background: #4a1414; color: #ff8589; border: 1px solid #8a2626; }
+  .rug-tag.poss { background: #3d260f; color: #ffb076; border: 1px solid #7a4a1e; }
   .quality-line { color: #9fd8b1; font-size: 11.5px; margin: -2px 0 8px; }
   .quality-line .muted { color: #8a91a0; font-size: 10px; }
   .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
@@ -998,8 +1001,9 @@ async function scanPage() {
           score: res.risk.riskScore,
           signal: res.risk.signal,
           topReason: res.risk.reasons[0]?.text ?? null,
+          rugVerdict: assessRugPotential(res.analysis, res.risk).verdict,
           insufficient: res.risk.insufficientData
-        } : { address: mint, symbol: hint, name: null, score: 0, signal: "NEUTRAL", topReason: null, insufficient: true }
+        } : { address: mint, symbol: hint, name: null, score: 0, signal: "NEUTRAL", topReason: null, rugVerdict: "UNVERIFIED", insufficient: true }
       );
       updateScanList();
     }
@@ -1050,11 +1054,12 @@ function updateScanList() {
     const fg = r.insufficient ? "#e6e8ee" : meta.textColor;
     const sym = r.symbol ?? short(r.address);
     const reason = r.insufficient ? "Not enough data to assess" : isReplica ? "Shares a symbol with another coin here \u2014 possible copycat/rug" : r.topReason ?? "Lower observed risk \u2014 not a buy signal";
+    const rugTag = r.rugVerdict === "HIGH" ? '<span class="rug-tag high">\u{1F6A9} RUG RISK</span>' : r.rugVerdict === "POSSIBLE" ? '<span class="rug-tag poss">\u{1F6A9} possible</span>' : "";
     return `
         <div class="scan-item" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${esc(sym)}${isReplica ? '<span class="replica">COPYCAT?</span>' : ""}</span>
+            <span class="si-sym">${esc(sym)}${rugTag}${isReplica ? '<span class="replica">COPYCAT?</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
@@ -1133,7 +1138,11 @@ function updateLiveList() {
   const list = shadow?.querySelector(".livelist");
   if (!list) return;
   let rows = [...liveRows];
-  if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK");
+  if (liveSafeOnly) {
+    rows = rows.filter(
+      (r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK" && r.rugVerdict !== "HIGH"
+    );
+  }
   if (liveLowCapOnly) {
     rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur || isGem(r));
   }
@@ -1154,11 +1163,12 @@ function updateLiveList() {
     const sym = r.symbol ?? short(r.address);
     const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? (r.unverified ? "Early checks clean \u2014 holders/LP not verified yet (click for full scan)" : "No risk factors triggered \u2014 still not a buy signal");
     const gem = isGem(r);
+    const rugTag = r.rugVerdict === "HIGH" ? '<span class="rug-tag high">\u{1F6A9} RUG RISK</span>' : r.rugVerdict === "POSSIBLE" ? '<span class="rug-tag poss">\u{1F6A9} possible</span>' : "";
     return `
         <div class="scan-item${gem ? " gem" : ""}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${gem ? "\u{1F48E} " : ""}${esc(sym)}
+            <span class="si-sym">${gem ? "\u{1F48E} " : ""}${esc(sym)}${rugTag}
               <span class="age">${esc(ageShort(r.ageMinutes))}</span>
               ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ""}
               ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals \u2014 not a profit prediction">Q${r.qualityScore}</span>` : ""}
@@ -1354,9 +1364,10 @@ function pumpInlineQueue() {
           topReason: res.risk.reasons[0]?.text ?? null,
           quality: res.quality.insufficientData ? null : res.quality.qualityScore,
           grade: computeKingGrade(res.analysis, res.risk, res.quality).grade,
+          rugVerdict: assessRugPotential(res.analysis, res.risk).verdict,
           insufficient: res.risk.insufficientData,
           unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === "unknown"
-        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, grade: null, insufficient: true, unverified: true }
+        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, grade: null, rugVerdict: "UNVERIFIED", insufficient: true, unverified: true }
       );
       paintBadges(mint);
     }).finally(() => {
@@ -1370,10 +1381,11 @@ function paintBadges(mint) {
   const els = badgeEls.get(mint);
   if (!result || result === "pending" || !els) return;
   const gc = gradeColors(result.grade);
-  const label = result.insufficient ? "\u{1F451} ?" : `\u{1F451} ${result.grade}%${result.unverified ? "*" : ""}`;
+  const rugFlag = result.rugVerdict === "HIGH" ? "\u{1F6A9}" : "";
+  const label = result.insufficient ? "\u{1F451} ?" : `${rugFlag}\u{1F451} ${result.grade}%${result.unverified ? "*" : ""}`;
   const bg = result.insufficient ? "#3a3f4c" : gc.color;
   const fg = result.insufficient ? "#e6e8ee" : gc.textColor;
-  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 safety ${100 - result.score}/100${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 top risk: ${result.topReason}` : ""} \xB7 click for full breakdown`;
+  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: ${result.rugVerdict === "HIGH" ? "\u{1F6A9} RUG POTENTIAL HIGH \xB7 " : result.rugVerdict === "POSSIBLE" ? "\u{1F6A9} rug possible \xB7 " : ""}King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 safety ${100 - result.score}/100${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 top risk: ${result.topReason}` : ""} \xB7 click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
       els.delete(el);

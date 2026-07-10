@@ -1437,6 +1437,52 @@ function fmtK(n) {
   return n.toFixed(0);
 }
 
+// lib/rugPotential.ts
+function assessRugPotential(a, risk) {
+  const hard = [];
+  const soft = [];
+  const unverified = [];
+  const mint = a.mint;
+  if (!mint) {
+    unverified.push("mint/freeze authority");
+  } else {
+    if (mint.mintAuthorityActive === true) hard.push("Supply can be inflated (mint authority active).");
+    if (mint.freezeAuthorityActive === true) hard.push("Your wallet can be frozen (freeze authority active).");
+    if (mint.permanentDelegateActive === true) hard.push("Dev can seize tokens (permanent delegate).");
+    if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
+    if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
+    if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.mintAuthorityActive === null) unverified.push("mint authority");
+    if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
+  }
+  const sim = a.market?.sellSimulation;
+  if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (lp === "deployer_held") hard.push("Deployer holds the LP \u2014 liquidity can be pulled in one transaction.");
+  else if (lp === "unlocked") soft.push("LP not burned/locked \u2014 liquidity can be pulled.");
+  else if (lp === "unknown") unverified.push("LP burn/lock status");
+  if (a.launch?.bondingCurveComplete === false) {
+    soft.push("Still on the bonding curve \u2014 insiders can dump at any moment.");
+  }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev >= LIMITS.devHoldsPct) soft.push(`Dev wallet holds ${dev.toFixed(1)}% \u2014 positioned to dump.`);
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > GEM_CRITERIA.maxLargestWalletPct) {
+    soft.push(`A single wallet holds ${whale.toFixed(1)}% \u2014 one seller from a crash.`);
+  }
+  if (whale === null) unverified.push("holder concentration");
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) {
+    hard.push("Creator is a serial launcher with mostly dead coins.");
+  }
+  let verdict;
+  if (hard.length > 0) verdict = "HIGH";
+  else if (soft.length >= 2) verdict = "HIGH";
+  else if (soft.length === 1) verdict = "POSSIBLE";
+  else if (unverified.length > 0) verdict = "UNVERIFIED";
+  else verdict = "LOW";
+  return { verdict, vectors: [...hard, ...soft], unverified };
+}
+
 // lib/watchAlerts.ts
 function computeWatchAlerts(baseline, current) {
   const alerts = [];
@@ -1754,6 +1800,7 @@ async function doLiveFeedSweep() {
     }
     const verdict = entry.lite ? { gem: false, blockers: ["Full background check pending."] } : gemBackgroundCheck(entry.analysis, entry.risk, entry.quality);
     const kingGrade = computeKingGrade(entry.analysis, entry.risk, entry.quality);
+    const rug = assessRugPotential(entry.analysis, entry.risk);
     const row = {
       address: c.mint,
       symbol: entry.analysis.identity.symbol ?? c.symbol,
@@ -1766,6 +1813,7 @@ async function doLiveFeedSweep() {
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
       grade: kingGrade.grade,
       gem: verdict.gem,
+      rugVerdict: rug.verdict,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
       insufficientData: entry.risk.insufficientData,

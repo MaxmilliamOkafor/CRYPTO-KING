@@ -271,6 +271,9 @@ const STYLES = `
   .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
   .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
   .ntag { background: #221a33; color: #b79bff; border: 1px solid #45348a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; }
+  .rug-tag { font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .rug-tag.high { background: #4a1414; color: #ff8589; border: 1px solid #8a2626; }
+  .rug-tag.poss { background: #3d260f; color: #ffb076; border: 1px solid #7a4a1e; }
   .quality-line { color: #9fd8b1; font-size: 11.5px; margin: -2px 0 8px; }
   .quality-line .muted { color: #8a91a0; font-size: 10px; }
   .copy { color: #8a91a0; font-size: 13px; line-height: 1; padding: 3px 6px; border-radius: 6px; flex: none; }
@@ -471,6 +474,7 @@ interface ScanRow {
   score: number;
   signal: Signal;
   topReason: string | null;
+  rugVerdict: 'HIGH' | 'POSSIBLE' | 'LOW' | 'UNVERIFIED';
   insufficient: boolean;
 }
 
@@ -535,9 +539,10 @@ async function scanPage(): Promise<void> {
               score: res.risk.riskScore,
               signal: res.risk.signal,
               topReason: res.risk.reasons[0]?.text ?? null,
+              rugVerdict: assessRugPotential(res.analysis, res.risk).verdict,
               insufficient: res.risk.insufficientData,
             }
-          : { address: mint, symbol: hint, name: null, score: 0, signal: 'NEUTRAL', topReason: null, insufficient: true },
+          : { address: mint, symbol: hint, name: null, score: 0, signal: 'NEUTRAL', topReason: null, rugVerdict: 'UNVERIFIED', insufficient: true },
       );
       updateScanList();
     }
@@ -602,11 +607,17 @@ function updateScanList(): void {
         : isReplica
           ? 'Shares a symbol with another coin here — possible copycat/rug'
           : (r.topReason ?? 'Lower observed risk — not a buy signal');
+      const rugTag =
+        r.rugVerdict === 'HIGH'
+          ? '<span class="rug-tag high">🚩 RUG RISK</span>'
+          : r.rugVerdict === 'POSSIBLE'
+            ? '<span class="rug-tag poss">🚩 possible</span>'
+            : '';
       return `
         <div class="scan-item" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${esc(sym)}${isReplica ? '<span class="replica">COPYCAT?</span>' : ''}</span>
+            <span class="si-sym">${esc(sym)}${rugTag}${isReplica ? '<span class="replica">COPYCAT?</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
@@ -710,7 +721,11 @@ function updateLiveList(): void {
   if (!list) return;
 
   let rows = [...liveRows];
-  if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && r.signal !== 'AVOID' && r.signal !== 'HIGH_RISK');
+  if (liveSafeOnly) {
+    rows = rows.filter(
+      (r) => !r.insufficientData && r.signal !== 'AVOID' && r.signal !== 'HIGH_RISK' && r.rugVerdict !== 'HIGH',
+    );
+  }
   // "Low caps only" keeps 💎 gem-grade coins visible even above the cap —
   // a strong candidate shouldn't vanish just because it already grew.
   if (liveLowCapOnly) {
@@ -744,11 +759,17 @@ function updateLiveList(): void {
             ? 'Early checks clean — holders/LP not verified yet (click for full scan)'
             : 'No risk factors triggered — still not a buy signal'));
       const gem = isGem(r);
+      const rugTag =
+        r.rugVerdict === 'HIGH'
+          ? '<span class="rug-tag high">🚩 RUG RISK</span>'
+          : r.rugVerdict === 'POSSIBLE'
+            ? '<span class="rug-tag poss">🚩 possible</span>'
+            : '';
       return `
         <div class="scan-item${gem ? ' gem' : ''}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${gem ? '💎 ' : ''}${esc(sym)}
+            <span class="si-sym">${gem ? '💎 ' : ''}${esc(sym)}${rugTag}
               <span class="age">${esc(ageShort(r.ageMinutes))}</span>
               ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ''}
               ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals — not a profit prediction">Q${r.qualityScore}</span>` : ''}
@@ -872,6 +893,7 @@ interface InlineResult {
   topReason: string | null;
   quality: number | null;
   grade: number | null;
+  rugVerdict: 'HIGH' | 'POSSIBLE' | 'LOW' | 'UNVERIFIED';
   insufficient: boolean;
   unverified: boolean;
 }
@@ -995,10 +1017,11 @@ function pumpInlineQueue(): void {
                 topReason: res.risk.reasons[0]?.text ?? null,
                 quality: res.quality.insufficientData ? null : res.quality.qualityScore,
                 grade: computeKingGrade(res.analysis, res.risk, res.quality).grade,
+                rugVerdict: assessRugPotential(res.analysis, res.risk).verdict,
                 insufficient: res.risk.insufficientData,
                 unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === 'unknown',
               }
-            : { score: 0, signal: 'NEUTRAL', topReason: null, quality: null, grade: null, insufficient: true, unverified: true },
+            : { score: 0, signal: 'NEUTRAL', topReason: null, quality: null, grade: null, rugVerdict: 'UNVERIFIED', insufficient: true, unverified: true },
         );
         paintBadges(mint);
       })
@@ -1014,13 +1037,14 @@ function paintBadges(mint: string): void {
   const els = badgeEls.get(mint);
   if (!result || result === 'pending' || !els) return;
   const gc = gradeColors(result.grade);
-  const label = result.insufficient ? '👑 ?' : `👑 ${result.grade}%${result.unverified ? '*' : ''}`;
+  const rugFlag = result.rugVerdict === 'HIGH' ? '🚩' : '';
+  const label = result.insufficient ? '👑 ?' : `${rugFlag}👑 ${result.grade}%${result.unverified ? '*' : ''}`;
   const bg = result.insufficient ? '#3a3f4c' : gc.color;
   const fg = result.insufficient ? '#e6e8ee' : gc.textColor;
   // All numbers same direction as the grade: higher = better.
   const tip = result.insufficient
     ? 'CRYPTO-KING: not enough data — click for details'
-    : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) · safety ${100 - result.score}/100` +
+    : `CRYPTO-KING: ${result.rugVerdict === 'HIGH' ? '🚩 RUG POTENTIAL HIGH · ' : result.rugVerdict === 'POSSIBLE' ? '🚩 rug possible · ' : ''}King Grade ${result.grade}% (${gradeLabel(result.grade)}) · safety ${100 - result.score}/100` +
       `${result.quality !== null ? ` · quality ${result.quality}/100` : ''}` +
       `${result.unverified ? ' — holders/LP not verified yet, grade capped' : ''}` +
       `${result.topReason ? ` — top risk: ${result.topReason}` : ''} · click for full breakdown`;

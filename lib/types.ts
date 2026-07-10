@@ -307,6 +307,8 @@ export interface FeedRow {
   grade: number | null;
   /** true = passed the FULL 💎 background check (lib/gemCriteria.ts) on verified data. */
   gem: boolean;
+  /** Pre-buy rug verdict (lib/rugPotential.ts), computed in the background for EVERY coin. */
+  rugVerdict: 'HIGH' | 'POSSIBLE' | 'LOW' | 'UNVERIFIED';
   /** true = graduated off its bonding curve; null = unknown/not a launchpad coin. */
   graduated: boolean | null;
   /** Informational narrative tags (never scored). */

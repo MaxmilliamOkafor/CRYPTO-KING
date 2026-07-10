@@ -24,6 +24,7 @@ import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } 
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
+import { assessRugPotential } from '../lib/rugPotential.ts';
 import { computeWatchAlerts } from '../lib/watchAlerts.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
@@ -194,6 +195,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       ? { gem: false, blockers: ['Full background check pending.'] }
       : gemBackgroundCheck(entry.analysis, entry.risk, entry.quality);
     const kingGrade = computeKingGrade(entry.analysis, entry.risk, entry.quality);
+    const rug = assessRugPotential(entry.analysis, entry.risk);
 
     const row: FeedRow = {
       address: c.mint,
@@ -208,6 +210,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       qualityScore: entry.quality.insufficientData ? null : entry.quality.qualityScore,
       grade: kingGrade.grade,
       gem: verdict.gem,
+      rugVerdict: rug.verdict,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
       insufficientData: entry.risk.insufficientData,

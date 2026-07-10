@@ -99,16 +99,18 @@ export const PUMPFUN = {
 export const LIVE_FEED = {
   enabled: true,
   /** How many newest coins to pull from the source each poll. */
-  fetchCount: 50,
+  fetchCount: 80,
   /**
    * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
-   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
-   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
-   * key (see SOLANA.rpcUrl) you can raise this substantially.
+   * (mint/freeze authority, the top rug check) + pump.fun. The default is tuned
+   * to move fast on the public RPC without tripping its rate limit; with a
+   * Helius key (see SOLANA.rpcUrl) push this to 30–50 for a real firehose.
    */
-  scanBudgetPerPoll: 6,
+  scanBudgetPerPoll: 14,
+  /** Parallel lite scans per poll (per-host rate limiter still applies). */
+  scanConcurrency: 4,
   /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 15_000,
+  pollIntervalMs: 9_000,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
@@ -152,9 +154,9 @@ export const DEXSCREENER = {
 export const INLINE_BADGES = {
   enabled: true,
   /** Max distinct mints badged per page (protects the RPC budget). */
-  maxPerPage: 80,
+  maxPerPage: 120,
   /** Parallel lite scans for inline badges (per tab; per-host rate limits still apply). */
-  scanConcurrency: 2,
+  scanConcurrency: 4,
 };
 
 export const SOLANA = {

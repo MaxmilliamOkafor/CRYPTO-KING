@@ -9,7 +9,8 @@
  * for that mint address, when available.
  */
 
-import { DISCLAIMER, MOCK_MODE, SIGNAL_META } from '../config.ts';
+import { DISCLAIMER, MOCK_MODE } from '../config.ts';
+import { gradeColors as gradeColorsDash, gradeLabel as gradeLabelDash } from '../lib/kingGrade.ts';
 import type { JournalEntry, RecentResponse, RecentToken } from '../lib/types.ts';
 
 const JOURNAL_KEY = 'ck:journal';
@@ -52,14 +53,14 @@ async function loadAll(): Promise<void> {
 /* ── Recently analyzed ─────────────────────────────────────────────────── */
 
 function activeFilters(): (row: RecentToken) => boolean {
-  const signal = ($('f-signal') as HTMLSelectElement).value;
-  const minScore = numOrNull(($('f-min-score') as HTMLInputElement).value);
+  const gradeBucket = ($('f-signal') as HTMLSelectElement).value; // now a grade label
+  const minGrade = numOrNull(($('f-min-score') as HTMLInputElement).value);
   const maxMcap = numOrNull(($('f-max-mcap') as HTMLInputElement).value);
   const maxAge = numOrNull(($('f-max-age') as HTMLInputElement).value);
 
   return (row) => {
-    if (signal && row.signal !== signal) return false;
-    if (minScore !== null && row.riskScore < minScore) return false;
+    if (gradeBucket && gradeLabelDash(row.grade ?? null) !== gradeBucket) return false;
+    if (minGrade !== null && (row.grade ?? -1) < minGrade) return false;
     if (maxMcap !== null && (row.marketCapEur === null || row.marketCapEur > maxMcap)) return false;
     if (maxAge !== null && (row.ageMinutes === null || row.ageMinutes > maxAge)) return false;
     return true;
@@ -89,20 +90,21 @@ function renderRecent(): void {
     addr.appendChild(link);
     token.append(sym, addr);
 
+    // King Grade — consistent direction (higher = better) everywhere.
     const score = document.createElement('td');
     score.className = 'score';
-    score.textContent = row.insufficientData ? '—' : String(row.riskScore);
+    score.textContent = row.insufficientData || row.grade == null ? '—' : `${row.grade}%`;
 
     const signal = document.createElement('td');
-    if (row.insufficientData) {
+    if (row.insufficientData || row.grade == null) {
       signal.textContent = 'NO DATA';
     } else {
-      const meta = SIGNAL_META[row.signal];
+      const gc = gradeColorsDash(row.grade);
       const badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = meta.label;
-      badge.style.background = meta.color;
-      badge.style.color = meta.textColor;
+      badge.textContent = gradeLabelDash(row.grade);
+      badge.style.background = gc.color;
+      badge.style.color = gc.textColor;
       signal.appendChild(badge);
     }
 

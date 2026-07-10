@@ -2,16 +2,18 @@
 var LIVE_FEED = {
   enabled: true,
   /** How many newest coins to pull from the source each poll. */
-  fetchCount: 50,
+  fetchCount: 80,
   /**
    * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
-   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
-   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
-   * key (see SOLANA.rpcUrl) you can raise this substantially.
+   * (mint/freeze authority, the top rug check) + pump.fun. The default is tuned
+   * to move fast on the public RPC without tripping its rate limit; with a
+   * Helius key (see SOLANA.rpcUrl) push this to 30–50 for a real firehose.
    */
-  scanBudgetPerPoll: 6,
+  scanBudgetPerPoll: 14,
+  /** Parallel lite scans per poll (per-host rate limiter still applies). */
+  scanConcurrency: 4,
   /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 15e3,
+  pollIntervalMs: 9e3,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
@@ -70,13 +72,6 @@ var GEM_CRITERIA = {
   /** No single non-LP wallet may hold more than this % of supply. */
   maxLargestWalletPct: 10
   /** Risk score must be at or below LIVE_FEED.notifyMaxScore, quality at or above LIVE_FEED.gemMinQuality. */
-};
-var SIGNAL_META = {
-  AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe red flags \u2014 likely scam/rug setup." },
-  HIGH_RISK: { color: "#f76b15", textColor: "#ffffff", label: "HIGH RISK", blurb: "Multiple serious red flags." },
-  WATCH: { color: "#ffb224", textColor: "#1b1b18", label: "RISKY", blurb: "Notable red flags \u2014 read them first." },
-  CONSIDER: { color: "#46a758", textColor: "#ffffff", label: "MILD RISK", blurb: "Some red flags found \u2014 not danger-free, not a buy call." },
-  NEUTRAL: { color: "#64748b", textColor: "#ffffff", label: "LOW RISK", blurb: "Few red flags found \u2014 still speculative, not safe." }
 };
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
 
@@ -165,6 +160,11 @@ function gradeLabel(grade) {
   for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.label;
   return "AVOID";
 }
+function gradeColors(grade) {
+  if (grade === null) return { color: "#3a3f4c", textColor: "#e6e8ee" };
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };
+  return { color: "#e5484d", textColor: "#ffffff" };
+}
 
 // popup/popup.ts
 var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
@@ -220,18 +220,19 @@ function render(analysis, risk, quality, mock) {
     return;
   }
   $("result").hidden = false;
-  const meta = SIGNAL_META[risk.signal];
   const addr = analysis.identity.address;
   $("token-symbol").textContent = analysis.identity.symbol ?? "(unknown symbol)";
   $("token-address").textContent = addr;
+  const kg = computeKingGrade(analysis, risk, quality);
+  const gc = gradeColors(kg.grade);
   const badge = $("signal-badge");
-  badge.textContent = meta.label;
-  badge.style.background = meta.color;
-  badge.style.color = meta.textColor;
+  badge.textContent = kg.grade === null ? "NO DATA" : gradeLabel(kg.grade);
+  badge.style.background = gc.color;
+  badge.style.color = gc.textColor;
   const fill = $("score-fill");
-  fill.style.width = `${risk.riskScore}%`;
-  fill.style.background = meta.color;
-  $("score-num").textContent = `${risk.riskScore} / 100`;
+  fill.style.width = `${kg.grade ?? 0}%`;
+  fill.style.background = gc.color;
+  $("score-num").textContent = kg.grade === null ? "\u2014 / 100" : `${kg.grade}% King Grade`;
   const reasons = $("reasons");
   reasons.innerHTML = "";
   if (risk.reasons.length === 0) {
@@ -323,16 +324,16 @@ async function showRecent() {
       return;
     }
     for (const row of res.recent.slice(0, 8)) {
-      const meta = SIGNAL_META[row.signal];
+      const gc = gradeColors(row.grade ?? null);
       const item = document.createElement("li");
       const sym = document.createElement("span");
       sym.className = "sym";
       sym.textContent = row.symbol ?? `${row.address.slice(0, 4)}\u2026${row.address.slice(-4)}`;
       const badge = document.createElement("span");
       badge.className = "badge";
-      badge.textContent = `${row.riskScore} ${meta.label}`;
-      badge.style.background = meta.color;
-      badge.style.color = meta.textColor;
+      badge.textContent = row.grade == null ? "NO DATA" : `${row.grade}% ${gradeLabel(row.grade)}`;
+      badge.style.background = gc.color;
+      badge.style.color = gc.textColor;
       item.append(sym, badge);
       list.appendChild(item);
     }

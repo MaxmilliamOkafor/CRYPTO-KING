@@ -114,11 +114,24 @@ function getLiveFeed(): Promise<LiveFeedResponse> {
 }
 
 async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
-  let coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
-  if (coins.length === 0) {
-    // Fallback: DexScreener fresh Solana tokens (address-only; details fill in on scan).
-    const addrs = await fetchDexscreenerNewSolana(LIVE_FEED.fetchCount);
-    coins = addrs.map((mint) => ({ mint, symbol: null, name: null, createdMs: null }));
+  // Pull fresh launches (pump.fun, newest-created) AND established/migrated
+  // Solana tokens (DexScreener) so the feed covers both brand-new coins and
+  // graduated ones — merged, de-duplicated, pump.fun entries first.
+  const [pumpCoins, dexAddrs] = await Promise.all([
+    fetchPumpfunNewCoins(LIVE_FEED.fetchCount),
+    fetchDexscreenerNewSolana(LIVE_FEED.fetchCount),
+  ]);
+  const seen = new Set<string>();
+  const coins: Array<{ mint: string; symbol: string | null; name: string | null; createdMs: number | null }> = [];
+  for (const c of pumpCoins) {
+    if (seen.has(c.mint)) continue;
+    seen.add(c.mint);
+    coins.push(c);
+  }
+  for (const mint of dexAddrs) {
+    if (seen.has(mint)) continue;
+    seen.add(mint);
+    coins.push({ mint, symbol: null, name: null, createdMs: null });
   }
   if (coins.length === 0 && feed.size === 0) {
     return {
@@ -136,21 +149,29 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
     }
   }
 
-  // Scan newest-first with a per-poll budget of not-yet-scanned coins. Feed
-  // scans are LITE so the sweep fits the poll interval on the public RPC.
-  // Promising lite results get auto-upgraded to FULL background checks
-  // (bounded per poll) — the 💎 gem verdict is only ever computed on full,
-  // verified data.
-  let scannedThisPoll = 0;
+  // Phase 1 — scan not-yet-cached coins LITE, up to the per-poll budget, using
+  // a concurrency pool (the per-host RPC rate limiter still paces the actual
+  // calls, so this parallelizes waiting, not hammering).
+  const toScan = coins
+    .filter((c) => {
+      const cached = cache.get(c.mint);
+      return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
+    })
+    .slice(0, LIVE_FEED.scanBudgetPerPoll);
+  let scannedThisPoll = toScan.length;
+  let next = 0;
+  const worker = async () => {
+    while (next < toScan.length) {
+      const c = toScan[next++];
+      await analyzeToken(c.mint, false, undefined, /*lite*/ true);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(LIVE_FEED.scanConcurrency, toScan.length) }, worker));
+
+  // Phase 2 — build rows; auto-upgrade a bounded number of promising lite
+  // results to FULL background checks so real gems can surface.
   let fullUpgradesThisPoll = 0;
   for (const c of coins) {
-    const cached = cache.get(c.mint);
-    const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
-    if (!fresh) {
-      if (scannedThisPoll >= LIVE_FEED.scanBudgetPerPoll) continue;
-      await analyzeToken(c.mint, false, undefined, /*lite*/ true);
-      scannedThisPoll++;
-    }
     let entry = cache.get(c.mint);
     if (!entry) continue;
 
@@ -158,7 +179,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
     // run the full background check now so a real gem can actually surface.
     if (
       entry.lite &&
-      fullUpgradesThisPoll < 2 &&
+      fullUpgradesThisPoll < 3 &&
       !entry.risk.insufficientData &&
       entry.risk.riskScore <= LIVE_FEED.notifyMaxScore &&
       entry.analysis.launch?.bondingCurveComplete !== false
@@ -305,7 +326,7 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
     // Lite feed sweeps would flush the user's own browsing history out of the
     // dashboard's capped recent list — only full scans are recorded there.
-    if (!lite) await saveRecent(analysis, risk);
+    if (!lite) await saveRecent(analysis, risk, quality);
     return { ok: true, analysis, risk, quality, mock: MOCK_MODE };
   } catch (err) {
     console.error('[CRYPTO-KING] analysis failed:', err);
@@ -614,7 +635,7 @@ async function loadRecent(): Promise<RecentToken[]> {
   return Array.isArray(list) ? (list as RecentToken[]) : [];
 }
 
-async function saveRecent(analysis: TokenAnalysis, risk: RiskResult): Promise<void> {
+async function saveRecent(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResult): Promise<void> {
   const row: RecentToken = {
     address: analysis.identity.address,
     symbol: analysis.identity.symbol,
@@ -625,6 +646,7 @@ async function saveRecent(analysis: TokenAnalysis, risk: RiskResult): Promise<vo
     priceEur: analysis.market?.priceEur ?? null,
     riskScore: risk.riskScore,
     signal: risk.signal,
+    grade: computeKingGrade(analysis, risk, quality).grade,
     insufficientData: risk.insufficientData,
     updatedAt: Date.now(),
   };

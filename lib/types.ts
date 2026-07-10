@@ -220,6 +220,8 @@ export interface RecentToken {
   priceEur: number | null;
   riskScore: number;
   signal: Signal;
+  /** King Grade 0–100% (higher = better) — the consistent headline metric. */
+  grade: number | null;
   insufficientData: boolean;
   updatedAt: number; // epoch ms
 }

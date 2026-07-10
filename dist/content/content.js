@@ -38,16 +38,18 @@ var GMGN = {
 var LIVE_FEED = {
   enabled: true,
   /** How many newest coins to pull from the source each poll. */
-  fetchCount: 50,
+  fetchCount: 80,
   /**
    * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
-   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
-   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
-   * key (see SOLANA.rpcUrl) you can raise this substantially.
+   * (mint/freeze authority, the top rug check) + pump.fun. The default is tuned
+   * to move fast on the public RPC without tripping its rate limit; with a
+   * Helius key (see SOLANA.rpcUrl) push this to 30–50 for a real firehose.
    */
-  scanBudgetPerPoll: 6,
+  scanBudgetPerPoll: 14,
+  /** Parallel lite scans per poll (per-host rate limiter still applies). */
+  scanConcurrency: 4,
   /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 15e3,
+  pollIntervalMs: 9e3,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
@@ -73,9 +75,9 @@ var LIVE_FEED = {
 var INLINE_BADGES = {
   enabled: true,
   /** Max distinct mints badged per page (protects the RPC budget). */
-  maxPerPage: 80,
+  maxPerPage: 120,
   /** Parallel lite scans for inline badges (per tab; per-host rate limits still apply). */
-  scanConcurrency: 2
+  scanConcurrency: 4
 };
 var RATE_LIMITS_MS = {
   default: 1100,
@@ -559,12 +561,16 @@ var STYLES = `
     font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   .card {
-    width: 330px; max-width: calc(100vw - 32px);
+    width: 360px; max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 32px);
+    display: flex; flex-direction: column;
     background: #16181d; color: #e6e8ee;
     border: 1px solid #2c303a; border-radius: 14px;
     box-shadow: 0 10px 34px rgba(0,0,0,.5);
     overflow: hidden;
   }
+  .body { flex: 1 1 auto; overflow-y: auto; }
+  .titlebar { flex: 0 0 auto; }
   .titlebar {
     display: flex; align-items: center; gap: 8px; padding: 9px 10px 9px 12px;
     background: linear-gradient(90deg,#1d2027,#16181d); border-bottom: 1px solid #2c303a;
@@ -648,7 +654,7 @@ var STYLES = `
   .scan-head .t { font-weight: 700; font-size: 11.5px; letter-spacing: .04em; flex: 1; color: #cfd3dc; }
   .scan-head .rescan { color: #7aa2ff; font-size: 11px; }
   .scan-status { color: #8a91a0; font-size: 11px; margin-bottom: 6px; }
-  .scanlist { max-height: 260px; overflow-y: auto; margin: 0 -4px; }
+  .scanlist { max-height: 34vh; overflow-y: auto; margin: 0 -4px; }
   .scan-item {
     display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: 8px; cursor: pointer;
   }
@@ -664,7 +670,7 @@ var STYLES = `
   .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 0 0 rgba(255,77,77,.6); animation: pulse 1.6s infinite; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,77,77,.6); } 70% { box-shadow: 0 0 0 6px rgba(255,77,77,0); } 100% { box-shadow: 0 0 0 0 rgba(255,77,77,0); } }
   .live-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
-  .livelist { max-height: 300px; overflow-y: auto; margin: 0 -4px; }
+  .livelist { max-height: 52vh; overflow-y: auto; margin: 0 -4px; }
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
@@ -979,7 +985,7 @@ var liveSafeOnly = false;
 var liveLowCapOnly = false;
 var liveFreshOnly = false;
 var liveGraduatedOnly = false;
-var liveSortBest = false;
+var liveSortBest = true;
 function startLiveFeed() {
   if (liveTimer) return;
   void pollLiveFeed();
@@ -1279,12 +1285,11 @@ function paintBadges(mint) {
   const result = inlineResults.get(mint);
   const els = badgeEls.get(mint);
   if (!result || result === "pending" || !els) return;
-  const meta = SIGNAL_META[result.signal];
   const gc = gradeColors(result.grade);
   const label = result.insufficient ? "\u{1F451} ?" : `\u{1F451} ${result.grade}%${result.unverified ? "*" : ""}`;
   const bg = result.insufficient ? "#3a3f4c" : gc.color;
   const fg = result.insufficient ? "#e6e8ee" : gc.textColor;
-  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 risk ${result.score}/100 ${meta.label}${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 ${result.topReason}` : ""} \xB7 click for full breakdown`;
+  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 safety ${100 - result.score}/100${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 top risk: ${result.topReason}` : ""} \xB7 click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
       els.delete(el);
@@ -1334,7 +1339,7 @@ function render(analysis, risk, quality, mock) {
   const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? "No individual risk factors triggered \u2014 low observed risk \u2260 safe.";
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
-  const subLine = quality.insufficientData ? "" : `<div class="quality-line">Risk <b>${risk.riskScore}/100</b> (${esc(meta.label)}) \xB7 Quality <b>${quality.qualityScore}/100</b> \xB7 Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
+  const subLine = quality.insufficientData ? "" : `<div class="quality-line">Safety <b>${Math.round(kg.parts.safety)}/100</b> \xB7 Quality <b>${quality.qualityScore}/100</b> \xB7 Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
   body.innerHTML = `
     <div class="head">
       <span class="badge" style="background:${gc.color};color:${gc.textColor}">${esc(kg.label)}</span>

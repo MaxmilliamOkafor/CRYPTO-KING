@@ -19,17 +19,17 @@
         <div class="section-head">
           <h2>Recently analyzed</h2>
           <div class="filters">
-            <label>Signal
+            <label>Grade
               <select id="f-signal">
                 <option value="">All</option>
+                <option>GEM GRADE</option>
+                <option>STRONG</option>
+                <option>MIXED</option>
+                <option>WEAK</option>
                 <option>AVOID</option>
-                <option>HIGH_RISK</option>
-                <option>WATCH</option>
-                <option>CONSIDER</option>
-                <option>NEUTRAL</option>
               </select>
             </label>
-            <label>Min score <input id="f-min-score" type="number" min="0" max="100" placeholder="0" /></label>
+            <label>Min grade % <input id="f-min-score" type="number" min="0" max="100" placeholder="0" /></label>
             <label>Max mcap € <input id="f-max-mcap" type="number" min="0" placeholder="∞" /></label>
             <label>Max age (min) <input id="f-max-age" type="number" min="0" placeholder="∞" /></label>
             <button id="clear-recent" class="ghost">Clear history</button>
@@ -39,13 +39,13 @@
           <thead>
             <tr>
               <th>Token</th><th>Age</th><th>Mcap</th><th>Liquidity</th>
-              <th>Score</th><th>Signal</th><th>Last updated</th><th></th>
+              <th>Grade</th><th>Rating</th><th>Last updated</th><th></th>
             </tr>
           </thead>
           <tbody id="recent-body"></tbody>
         </table>
         <p id="recent-empty" class="empty" hidden>Nothing analyzed yet — browse token pages on gmgn.ai with the extension enabled.</p>
-        <p class="legend">Labels describe <b>danger level only</b>: AVOID · HIGH RISK · RISKY · MILD RISK · LOW RISK. "LOW RISK" means few red flags were found — it is <b>not</b> a buy signal, and never means safe.</p>
+        <p class="legend"><b>King Grade — one number, higher = better:</b> GEM GRADE ≥80% · STRONG ≥60% · MIXED ≥40% · WEAK ≥20% · AVOID &lt;20%. 100% = passed every audit we can run; it is <b>not</b> a buy signal and never means safe — even top-grade meme coins can go to zero.</p>
       </section>
 
       <section>

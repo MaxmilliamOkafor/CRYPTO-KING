@@ -141,12 +141,16 @@ const STYLES = `
     font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   .card {
-    width: 330px; max-width: calc(100vw - 32px);
+    width: 360px; max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 32px);
+    display: flex; flex-direction: column;
     background: #16181d; color: #e6e8ee;
     border: 1px solid #2c303a; border-radius: 14px;
     box-shadow: 0 10px 34px rgba(0,0,0,.5);
     overflow: hidden;
   }
+  .body { flex: 1 1 auto; overflow-y: auto; }
+  .titlebar { flex: 0 0 auto; }
   .titlebar {
     display: flex; align-items: center; gap: 8px; padding: 9px 10px 9px 12px;
     background: linear-gradient(90deg,#1d2027,#16181d); border-bottom: 1px solid #2c303a;
@@ -230,7 +234,7 @@ const STYLES = `
   .scan-head .t { font-weight: 700; font-size: 11.5px; letter-spacing: .04em; flex: 1; color: #cfd3dc; }
   .scan-head .rescan { color: #7aa2ff; font-size: 11px; }
   .scan-status { color: #8a91a0; font-size: 11px; margin-bottom: 6px; }
-  .scanlist { max-height: 260px; overflow-y: auto; margin: 0 -4px; }
+  .scanlist { max-height: 34vh; overflow-y: auto; margin: 0 -4px; }
   .scan-item {
     display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: 8px; cursor: pointer;
   }
@@ -246,7 +250,7 @@ const STYLES = `
   .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 0 0 rgba(255,77,77,.6); animation: pulse 1.6s infinite; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,77,77,.6); } 70% { box-shadow: 0 0 0 6px rgba(255,77,77,0); } 100% { box-shadow: 0 0 0 0 rgba(255,77,77,0); } }
   .live-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
-  .livelist { max-height: 300px; overflow-y: auto; margin: 0 -4px; }
+  .livelist { max-height: 52vh; overflow-y: auto; margin: 0 -4px; }
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
@@ -611,7 +615,7 @@ let liveSafeOnly = false;
 let liveLowCapOnly = false;
 let liveFreshOnly = false;
 let liveGraduatedOnly = false;
-let liveSortBest = false;
+let liveSortBest = true; // default: best King Grade at the top
 
 function startLiveFeed(): void {
   if (liveTimer) return; // already running
@@ -998,17 +1002,17 @@ function paintBadges(mint: string): void {
   const result = inlineResults.get(mint);
   const els = badgeEls.get(mint);
   if (!result || result === 'pending' || !els) return;
-  const meta = SIGNAL_META[result.signal];
   const gc = gradeColors(result.grade);
   const label = result.insufficient ? '👑 ?' : `👑 ${result.grade}%${result.unverified ? '*' : ''}`;
   const bg = result.insufficient ? '#3a3f4c' : gc.color;
   const fg = result.insufficient ? '#e6e8ee' : gc.textColor;
+  // All numbers same direction as the grade: higher = better.
   const tip = result.insufficient
     ? 'CRYPTO-KING: not enough data — click for details'
-    : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) · risk ${result.score}/100 ${meta.label}` +
+    : `CRYPTO-KING: King Grade ${result.grade}% (${gradeLabel(result.grade)}) · safety ${100 - result.score}/100` +
       `${result.quality !== null ? ` · quality ${result.quality}/100` : ''}` +
       `${result.unverified ? ' — holders/LP not verified yet, grade capped' : ''}` +
-      `${result.topReason ? ` — ${result.topReason}` : ''} · click for full breakdown`;
+      `${result.topReason ? ` — top risk: ${result.topReason}` : ''} · click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
       els.delete(el);
@@ -1063,9 +1067,10 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? 'No individual risk factors triggered — low observed risk ≠ safe.';
   const sym = analysis.identity.symbol ?? short(analysis.identity.address);
+  // Everything here reads the SAME direction as the grade: higher = better.
   const subLine = quality.insufficientData
     ? ''
-    : `<div class="quality-line">Risk <b>${risk.riskScore}/100</b> (${esc(meta.label)}) · Quality <b>${quality.qualityScore}/100</b> · Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
+    : `<div class="quality-line">Safety <b>${Math.round(kg.parts.safety)}/100</b> · Quality <b>${quality.qualityScore}/100</b> · Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
 
   body.innerHTML = `
     <div class="head">

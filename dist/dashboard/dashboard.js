@@ -1,14 +1,26 @@
 // config.ts
 var MOCK_MODE = false;
 var CACHE_TTL_MS = 5 * 6e4;
-var SIGNAL_META = {
-  AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe red flags \u2014 likely scam/rug setup." },
-  HIGH_RISK: { color: "#f76b15", textColor: "#ffffff", label: "HIGH RISK", blurb: "Multiple serious red flags." },
-  WATCH: { color: "#ffb224", textColor: "#1b1b18", label: "RISKY", blurb: "Notable red flags \u2014 read them first." },
-  CONSIDER: { color: "#46a758", textColor: "#ffffff", label: "MILD RISK", blurb: "Some red flags found \u2014 not danger-free, not a buy call." },
-  NEUTRAL: { color: "#64748b", textColor: "#ffffff", label: "LOW RISK", blurb: "Few red flags found \u2014 still speculative, not safe." }
-};
+var GRADE_META = [
+  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
+  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
+  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
+  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
+  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+];
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
+
+// lib/kingGrade.ts
+function gradeLabel(grade) {
+  if (grade === null) return "NO DATA";
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.label;
+  return "AVOID";
+}
+function gradeColors(grade) {
+  if (grade === null) return { color: "#3a3f4c", textColor: "#e6e8ee" };
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };
+  return { color: "#e5484d", textColor: "#ffffff" };
+}
 
 // dashboard/dashboard.ts
 var JOURNAL_KEY = "ck:journal";
@@ -43,13 +55,13 @@ async function loadAll() {
   renderJournal();
 }
 function activeFilters() {
-  const signal = $("f-signal").value;
-  const minScore = numOrNull($("f-min-score").value);
+  const gradeBucket = $("f-signal").value;
+  const minGrade = numOrNull($("f-min-score").value);
   const maxMcap = numOrNull($("f-max-mcap").value);
   const maxAge = numOrNull($("f-max-age").value);
   return (row) => {
-    if (signal && row.signal !== signal) return false;
-    if (minScore !== null && row.riskScore < minScore) return false;
+    if (gradeBucket && gradeLabel(row.grade ?? null) !== gradeBucket) return false;
+    if (minGrade !== null && (row.grade ?? -1) < minGrade) return false;
     if (maxMcap !== null && (row.marketCapEur === null || row.marketCapEur > maxMcap)) return false;
     if (maxAge !== null && (row.ageMinutes === null || row.ageMinutes > maxAge)) return false;
     return true;
@@ -77,17 +89,17 @@ function renderRecent() {
     token.append(sym, addr);
     const score = document.createElement("td");
     score.className = "score";
-    score.textContent = row.insufficientData ? "\u2014" : String(row.riskScore);
+    score.textContent = row.insufficientData || row.grade == null ? "\u2014" : `${row.grade}%`;
     const signal = document.createElement("td");
-    if (row.insufficientData) {
+    if (row.insufficientData || row.grade == null) {
       signal.textContent = "NO DATA";
     } else {
-      const meta = SIGNAL_META[row.signal];
+      const gc = gradeColors(row.grade);
       const badge = document.createElement("span");
       badge.className = "badge";
-      badge.textContent = meta.label;
-      badge.style.background = meta.color;
-      badge.style.color = meta.textColor;
+      badge.textContent = gradeLabel(row.grade);
+      badge.style.background = gc.color;
+      badge.style.color = gc.textColor;
       signal.appendChild(badge);
     }
     tr.append(

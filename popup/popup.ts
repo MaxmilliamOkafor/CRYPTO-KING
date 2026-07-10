@@ -4,8 +4,8 @@
  * All data comes from the background worker; the popup never fetches.
  */
 
-import { DISCLAIMER, SIGNAL_META } from '../config.ts';
-import { computeKingGrade, gradeLabel } from '../lib/kingGrade.ts';
+import { DISCLAIMER } from '../config.ts';
+import { computeKingGrade, gradeColors as gradeColorsPopup, gradeLabel } from '../lib/kingGrade.ts';
 import type { AnalyzeResponse, QualityResult, RecentResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
@@ -72,21 +72,24 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   }
 
   $('result').hidden = false;
-  const meta = SIGNAL_META[risk.signal];
   const addr = analysis.identity.address;
 
   $('token-symbol').textContent = analysis.identity.symbol ?? '(unknown symbol)';
   $('token-address').textContent = addr;
 
+  // Lead with the King Grade so the popup reads the SAME direction as the rest
+  // of the extension: higher = better. (No opposite-direction risk number.)
+  const kg = computeKingGrade(analysis, risk, quality);
+  const gc = gradeColorsPopup(kg.grade);
   const badge = $('signal-badge');
-  badge.textContent = meta.label;
-  badge.style.background = meta.color;
-  badge.style.color = meta.textColor;
+  badge.textContent = kg.grade === null ? 'NO DATA' : gradeLabel(kg.grade);
+  badge.style.background = gc.color;
+  badge.style.color = gc.textColor;
 
   const fill = $('score-fill');
-  fill.style.width = `${risk.riskScore}%`;
-  fill.style.background = meta.color;
-  $('score-num').textContent = `${risk.riskScore} / 100`;
+  fill.style.width = `${kg.grade ?? 0}%`;
+  fill.style.background = gc.color;
+  $('score-num').textContent = kg.grade === null ? '— / 100' : `${kg.grade}% King Grade`;
 
   const reasons = $('reasons');
   reasons.innerHTML = '';
@@ -191,16 +194,16 @@ async function showRecent(): Promise<void> {
       return;
     }
     for (const row of res.recent.slice(0, 8)) {
-      const meta = SIGNAL_META[row.signal];
+      const gc = gradeColorsPopup(row.grade ?? null);
       const item = document.createElement('li');
       const sym = document.createElement('span');
       sym.className = 'sym';
       sym.textContent = row.symbol ?? `${row.address.slice(0, 4)}…${row.address.slice(-4)}`;
       const badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = `${row.riskScore} ${meta.label}`;
-      badge.style.background = meta.color;
-      badge.style.color = meta.textColor;
+      badge.textContent = row.grade == null ? 'NO DATA' : `${row.grade}% ${gradeLabel(row.grade)}`;
+      badge.style.background = gc.color;
+      badge.style.color = gc.textColor;
       item.append(sym, badge);
       list.appendChild(item);
     }

@@ -49,16 +49,18 @@ var PUMPFUN = {
 var LIVE_FEED = {
   enabled: true,
   /** How many newest coins to pull from the source each poll. */
-  fetchCount: 50,
+  fetchCount: 80,
   /**
    * Max NEW coins to risk-scan per poll. Feed scans are LITE — one RPC call
-   * (mint/freeze authority, the top rug check) + pump.fun — so the default fits
-   * the public RPC; opening a coin upgrades it to the full scan. With a Helius
-   * key (see SOLANA.rpcUrl) you can raise this substantially.
+   * (mint/freeze authority, the top rug check) + pump.fun. The default is tuned
+   * to move fast on the public RPC without tripping its rate limit; with a
+   * Helius key (see SOLANA.rpcUrl) push this to 30–50 for a real firehose.
    */
-  scanBudgetPerPoll: 6,
+  scanBudgetPerPoll: 14,
+  /** Parallel lite scans per poll (per-host rate limiter still applies). */
+  scanConcurrency: 4,
   /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 15e3,
+  pollIntervalMs: 9e3,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
@@ -1687,10 +1689,21 @@ function getLiveFeed() {
   return feedInFlight;
 }
 async function doLiveFeedSweep() {
-  let coins = await fetchPumpfunNewCoins(LIVE_FEED.fetchCount);
-  if (coins.length === 0) {
-    const addrs = await fetchDexscreenerNewSolana(LIVE_FEED.fetchCount);
-    coins = addrs.map((mint) => ({ mint, symbol: null, name: null, createdMs: null }));
+  const [pumpCoins, dexAddrs] = await Promise.all([
+    fetchPumpfunNewCoins(LIVE_FEED.fetchCount),
+    fetchDexscreenerNewSolana(LIVE_FEED.fetchCount)
+  ]);
+  const seen = /* @__PURE__ */ new Set();
+  const coins = [];
+  for (const c of pumpCoins) {
+    if (seen.has(c.mint)) continue;
+    seen.add(c.mint);
+    coins.push(c);
+  }
+  for (const mint of dexAddrs) {
+    if (seen.has(mint)) continue;
+    seen.add(mint);
+    coins.push({ mint, symbol: null, name: null, createdMs: null });
   }
   if (coins.length === 0 && feed.size === 0) {
     return {
@@ -1705,13 +1718,15 @@ async function doLiveFeedSweep() {
       if (row.ageMinutes > LIVE_FEED.maxAgeMinutes) feed.delete(mint);
     }
   }
-  let scannedThisPoll = 0;
-  let fullUpgradesThisPoll = 0;
-  for (const c of coins) {
+  const toScan = coins.filter((c) => {
     const cached = cache.get(c.mint);
-    const fresh = cached && Date.now() - cached.at < CACHE_TTL_MS;
-    if (!fresh) {
-      if (scannedThisPoll >= LIVE_FEED.scanBudgetPerPoll) continue;
+    return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
+  }).slice(0, LIVE_FEED.scanBudgetPerPoll);
+  let scannedThisPoll = toScan.length;
+  let next = 0;
+  const worker = async () => {
+    while (next < toScan.length) {
+      const c = toScan[next++];
       await analyzeToken(
         c.mint,
         false,
@@ -1719,11 +1734,14 @@ async function doLiveFeedSweep() {
         /*lite*/
         true
       );
-      scannedThisPoll++;
     }
+  };
+  await Promise.all(Array.from({ length: Math.min(LIVE_FEED.scanConcurrency, toScan.length) }, worker));
+  let fullUpgradesThisPoll = 0;
+  for (const c of coins) {
     let entry = cache.get(c.mint);
     if (!entry) continue;
-    if (entry.lite && fullUpgradesThisPoll < 2 && !entry.risk.insufficientData && entry.risk.riskScore <= LIVE_FEED.notifyMaxScore && entry.analysis.launch?.bondingCurveComplete !== false) {
+    if (entry.lite && fullUpgradesThisPoll < 3 && !entry.risk.insufficientData && entry.risk.riskScore <= LIVE_FEED.notifyMaxScore && entry.analysis.launch?.bondingCurveComplete !== false) {
       fullUpgradesThisPoll++;
       await analyzeToken(
         c.mint,
@@ -1819,7 +1837,7 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     const risk = scoreToken(analysis);
     const quality = scoreQuality(analysis);
     cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
-    if (!lite) await saveRecent(analysis, risk);
+    if (!lite) await saveRecent(analysis, risk, quality);
     return { ok: true, analysis, risk, quality, mock: MOCK_MODE };
   } catch (err) {
     console.error("[CRYPTO-KING] analysis failed:", err);
@@ -2039,7 +2057,7 @@ async function loadRecent() {
   const list = data[RECENT_KEY];
   return Array.isArray(list) ? list : [];
 }
-async function saveRecent(analysis, risk) {
+async function saveRecent(analysis, risk, quality) {
   const row = {
     address: analysis.identity.address,
     symbol: analysis.identity.symbol,
@@ -2050,6 +2068,7 @@ async function saveRecent(analysis, risk) {
     priceEur: analysis.market?.priceEur ?? null,
     riskScore: risk.riskScore,
     signal: risk.signal,
+    grade: computeKingGrade(analysis, risk, quality).grade,
     insufficientData: risk.insufficientData,
     updatedAt: Date.now()
   };

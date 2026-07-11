@@ -14,7 +14,7 @@
  * Read-only by design: no keys, no wallets, no signing, no trading.
  */
 
-import { CACHE_TTL_MS, LIVE_FEED, MOCK_MODE, RECENT_MAX, WATCHLIST } from '../config.ts';
+import { CACHE_TTL_MS, EUR_PER_USD, LIVE_FEED, MOCK_MODE, RECENT_MAX, WATCHLIST } from '../config.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
@@ -152,12 +152,15 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
 
   // Phase 1 — scan not-yet-cached coins LITE, up to the per-poll budget, using
   // a concurrency pool (the per-host RPC rate limiter still paces the actual
-  // calls, so this parallelizes waiting, not hammering).
+  // calls, so this parallelizes waiting, not hammering). NEWEST coins win the
+  // budget first — a launch seconds old gets scanned within one poll, so you
+  // catch it while it's still fresh instead of after a backlog of older coins.
   const toScan = coins
     .filter((c) => {
       const cached = cache.get(c.mint);
       return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
     })
+    .sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0))
     .slice(0, LIVE_FEED.scanBudgetPerPoll);
   let scannedThisPoll = toScan.length;
   let next = 0;
@@ -204,6 +207,8 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       ageMinutes:
         entry.analysis.identity.ageMinutes ?? (c.createdMs ? Math.max(0, (Date.now() - c.createdMs) / 60_000) : null),
       marketCapEur: entry.analysis.market?.marketCapEur ?? null,
+      priceUsd:
+        entry.analysis.market?.priceEur != null ? entry.analysis.market.priceEur / EUR_PER_USD : null,
       riskScore: entry.risk.riskScore,
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
@@ -406,7 +411,7 @@ function mergeSources(
     gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== 'unknown';
   const market: MarketInfo | null = hasMarket
     ? {
-        priceEur: gmgn.priceEur,
+        priceEur: gmgn.priceEur ?? pumpfun.priceEur,
         marketCapEur: gmgn.marketCapEur ?? pumpfun.marketCapEur,
         liquidityEur: gmgn.liquidityEur,
         volume24hEur: gmgn.volume24hEur,

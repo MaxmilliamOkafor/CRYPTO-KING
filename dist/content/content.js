@@ -48,8 +48,10 @@ var LIVE_FEED = {
   scanBudgetPerPoll: 14,
   /** Parallel lite scans per poll (per-host rate limiter still applies). */
   scanConcurrency: 4,
-  /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 9e3,
+  /** Panel auto-refresh / poll interval in ms. Lower = catch launches sooner
+   *  (newest coins are scanned first each poll). 6s is aggressive but safe on
+   *  the public RPC with lite scans; drop to 3–4s once you add a Helius key. */
+  pollIntervalMs: 6e3,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
@@ -643,8 +645,8 @@ var STYLES = `
     font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   .card {
-    width: 360px; max-width: calc(100vw - 32px);
-    max-height: calc(100vh - 32px);
+    width: 430px; max-width: calc(100vw - 32px);
+    max-height: calc(100vh - 24px);
     display: flex; flex-direction: column;
     background: #16181d; color: #e6e8ee;
     border: 1px solid #2c303a; border-radius: 14px;
@@ -693,7 +695,7 @@ var STYLES = `
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
   .watch-btn:hover { border-color: #ffc83c; }
   .watch-btn:disabled { opacity: .7; cursor: default; }
-  .panel { border-top: 1px solid #2c303a; margin-top: 10px; padding-top: 10px; max-height: 280px; overflow-y: auto; }
+  .panel { border-top: 1px solid #2c303a; margin-top: 10px; padding-top: 10px; max-height: 48vh; overflow-y: auto; }
   .panel h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
   .panel h4:first-child { margin-top: 0; }
   .panel li { list-style: none; padding: 2px 0; display: flex; gap: 6px; }
@@ -738,7 +740,7 @@ var STYLES = `
   .scan-head .t { font-weight: 700; font-size: 11.5px; letter-spacing: .04em; flex: 1; color: #cfd3dc; }
   .scan-head .rescan { color: #7aa2ff; font-size: 11px; }
   .scan-status { color: #8a91a0; font-size: 11px; margin-bottom: 6px; }
-  .scanlist { max-height: 34vh; overflow-y: auto; margin: 0 -4px; }
+  .scanlist { max-height: 42vh; overflow-y: auto; margin: 0 -4px; }
   .scan-item {
     display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: 8px; cursor: pointer;
   }
@@ -754,7 +756,7 @@ var STYLES = `
   .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 0 0 rgba(255,77,77,.6); animation: pulse 1.6s infinite; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,77,77,.6); } 70% { box-shadow: 0 0 0 6px rgba(255,77,77,0); } 100% { box-shadow: 0 0 0 0 rgba(255,77,77,0); } }
   .live-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
-  .livelist { max-height: 52vh; overflow-y: auto; margin: 0 -4px; }
+  .livelist { max-height: 62vh; overflow-y: auto; margin: 0 -4px; }
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
   .age { color: #6b7280; font-size: 10px; font-weight: 500; }
@@ -762,6 +764,9 @@ var STYLES = `
   .sort-toggle { color: #7aa2ff; font-size: 10.5px; padding: 1px 6px; border: 1px solid #2c303a; border-radius: 6px; }
   .sort-toggle:hover { border-color: #7aa2ff; }
   .mcap { color: #b8c0cf; font-size: 10px; font-weight: 600; }
+  .price { color: #6fd08c; font-size: 10px; font-weight: 700; }
+  .new-flash { background: #2f6df6; color: #fff; font-size: 8.5px; font-weight: 800; padding: 1px 4px; border-radius: 4px; letter-spacing: .04em; animation: newpulse 1s ease-in-out infinite; }
+  @keyframes newpulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
   .qchip { background: #143024; color: #6fd08c; border: 1px solid #245c3f; font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; }
   .ntag { background: #221a33; color: #b79bff; border: 1px solid #45348a; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; }
   .rug-tag { font-size: 9px; font-weight: 800; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
@@ -1168,8 +1173,9 @@ function updateLiveList() {
         <div class="scan-item${gem ? " gem" : ""}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${gem ? "\u{1F48E} " : ""}${esc(sym)}${rugTag}
+            <span class="si-sym">${r.ageMinutes !== null && r.ageMinutes < 2 ? '<span class="new-flash">NEW</span> ' : ""}${gem ? "\u{1F48E} " : ""}${esc(sym)}${rugTag}
               <span class="age">${esc(ageShort(r.ageMinutes))}</span>
+              ${r.priceUsd !== null ? `<span class="price">${esc(fmtPrice(r.priceUsd))}</span>` : ""}
               ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ""}
               ${r.qualityScore !== null && r.qualityScore > 0 ? `<span class="qchip" title="Quality signals \u2014 not a profit prediction">Q${r.qualityScore}</span>` : ""}
               ${r.narratives.length > 0 ? `<span class="ntag" title="Narrative tag \u2014 informational only, scammers ride trends too">${esc(r.narratives.slice(0, 2).join("\xB7"))}</span>` : ""}
@@ -1220,6 +1226,15 @@ function refreshWatchlistBox() {
       });
     });
   });
+}
+function fmtPrice(v) {
+  if (v <= 0) return "";
+  if (v >= 1) return `$${v.toFixed(v >= 100 ? 2 : 4)}`;
+  const s = v.toFixed(20);
+  const m = s.match(/^0\.(0*)(\d{1,4})/);
+  if (!m) return `$${v.toPrecision(3)}`;
+  const zeros = m[1].length;
+  return zeros >= 4 ? `$0.0(${zeros})${m[2]}` : `$0.${m[1]}${m[2]}`;
 }
 function eurShort(v) {
   if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(1)}M`;

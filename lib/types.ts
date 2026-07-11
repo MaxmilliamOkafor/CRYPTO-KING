@@ -298,6 +298,8 @@ export interface FeedRow {
   name: string | null;
   ageMinutes: number | null;
   marketCapEur: number | null;
+  /** Live price in USD (meme prices are universally quoted in $). */
+  priceUsd: number | null;
   riskScore: number;
   signal: Signal;
   topReason: string | null;

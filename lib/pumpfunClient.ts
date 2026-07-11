@@ -23,6 +23,8 @@ export interface PumpfunData {
   name: string | null;
   ageMinutes: number | null;
   marketCapEur: number | null;
+  /** Derived price (mcap ÷ token supply) so even lite feed scans show a live price. */
+  priceEur: number | null;
   /** true = bonding curve graduated (token migrated to an AMM pool). */
   bondingCurveComplete: boolean | null;
   /** Coin banned on pump.fun — strong negative context, surfaced via behavior. */
@@ -47,6 +49,7 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
       name: f.identity.name,
       ageMinutes: f.identity.ageMinutes,
       marketCapEur: f.market?.marketCapEur ?? null,
+      priceEur: f.market?.priceEur ?? null,
       bondingCurveComplete: true,
       isBanned: false,
       isToken2022: f.mint?.isToken2022 ?? null,
@@ -75,6 +78,10 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
     name: asString(pick(json, ['name'])),
     ageMinutes: createdMs !== null ? Math.max(0, (Date.now() - createdMs) / 60_000) : null,
     marketCapEur: usdToEur(asNumber(pick(json, ['usd_market_cap', 'market_cap']))),
+    priceEur: derivePriceEur(
+      asNumber(pick(json, ['usd_market_cap', 'market_cap'])),
+      asNumber(pick(json, ['total_supply'])),
+    ),
     bondingCurveComplete: asBoolLoose(pick(json, ['complete'])),
     isBanned: asBoolLoose(pick(json, ['is_banned'])),
     isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
@@ -160,6 +167,18 @@ export async function fetchCreatorCoins(creator: string): Promise<CreatorCoin[] 
 
 const usdToEur = (v: number | null) => (v === null ? null : v * EUR_PER_USD);
 
+/**
+ * Price = market cap ÷ circulating tokens. pump.fun's total_supply is in raw
+ * base units (6 decimals — a standard 1B-coin reads as 1e15); values that big
+ * are scaled down, smaller values are assumed to already be token counts.
+ */
+function derivePriceEur(usdMarketCap: number | null, totalSupplyRaw: number | null): number | null {
+  if (usdMarketCap === null || totalSupplyRaw === null || totalSupplyRaw <= 0) return null;
+  const tokens = totalSupplyRaw > 1e12 ? totalSupplyRaw / 1e6 : totalSupplyRaw;
+  if (tokens <= 0) return null;
+  return (usdMarketCap / tokens) * EUR_PER_USD;
+}
+
 function asBoolLoose(v: unknown): boolean | null {
   if (typeof v === 'boolean') return v;
   if (v === 1 || v === '1') return true;
@@ -173,6 +192,7 @@ const EMPTY: PumpfunData = {
   name: null,
   ageMinutes: null,
   marketCapEur: null,
+  priceEur: null,
   bondingCurveComplete: null,
   isBanned: null,
   isToken2022: null,

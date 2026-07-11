@@ -109,8 +109,10 @@ export const LIVE_FEED = {
   scanBudgetPerPoll: 14,
   /** Parallel lite scans per poll (per-host rate limiter still applies). */
   scanConcurrency: 4,
-  /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 9_000,
+  /** Panel auto-refresh / poll interval in ms. Lower = catch launches sooner
+   *  (newest coins are scanned first each poll). 6s is aggressive but safe on
+   *  the public RPC with lite scans; drop to 3–4s once you add a Helius key. */
+  pollIntervalMs: 6_000,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */

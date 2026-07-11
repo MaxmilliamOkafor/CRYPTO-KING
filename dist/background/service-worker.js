@@ -59,8 +59,10 @@ var LIVE_FEED = {
   scanBudgetPerPoll: 14,
   /** Parallel lite scans per poll (per-host rate limiter still applies). */
   scanConcurrency: 4,
-  /** Panel auto-refresh / poll interval in ms. */
-  pollIntervalMs: 9e3,
+  /** Panel auto-refresh / poll interval in ms. Lower = catch launches sooner
+   *  (newest coins are scanned first each poll). 6s is aggressive but safe on
+   *  the public RPC with lite scans; drop to 3–4s once you add a Helius key. */
+  pollIntervalMs: 6e3,
   /** Drop coins older than this many minutes from the feed (keep it "fresh launches"). */
   maxAgeMinutes: 180,
   /** Feed cache size. */
@@ -653,6 +655,7 @@ async function fetchPumpfunData(address) {
       name: f.identity.name,
       ageMinutes: f.identity.ageMinutes,
       marketCapEur: f.market?.marketCapEur ?? null,
+      priceEur: f.market?.priceEur ?? null,
       bondingCurveComplete: true,
       isBanned: false,
       isToken2022: f.mint?.isToken2022 ?? null,
@@ -677,6 +680,10 @@ async function fetchPumpfunData(address) {
     name: asString(pick(json, ["name"])),
     ageMinutes: createdMs !== null ? Math.max(0, (Date.now() - createdMs) / 6e4) : null,
     marketCapEur: usdToEur(asNumber(pick(json, ["usd_market_cap", "market_cap"]))),
+    priceEur: derivePriceEur(
+      asNumber(pick(json, ["usd_market_cap", "market_cap"])),
+      asNumber(pick(json, ["total_supply"]))
+    ),
     bondingCurveComplete: asBoolLoose(pick(json, ["complete"])),
     isBanned: asBoolLoose(pick(json, ["is_banned"])),
     isToken2022: tokenProgram !== null ? tokenProgram === TOKEN_2022_PROGRAM : null,
@@ -731,6 +738,12 @@ async function fetchCreatorCoins(creator) {
   return out;
 }
 var usdToEur = (v) => v === null ? null : v * EUR_PER_USD;
+function derivePriceEur(usdMarketCap, totalSupplyRaw) {
+  if (usdMarketCap === null || totalSupplyRaw === null || totalSupplyRaw <= 0) return null;
+  const tokens = totalSupplyRaw > 1e12 ? totalSupplyRaw / 1e6 : totalSupplyRaw;
+  if (tokens <= 0) return null;
+  return usdMarketCap / tokens * EUR_PER_USD;
+}
 function asBoolLoose(v) {
   if (typeof v === "boolean") return v;
   if (v === 1 || v === "1") return true;
@@ -743,6 +756,7 @@ var EMPTY = {
   name: null,
   ageMinutes: null,
   marketCapEur: null,
+  priceEur: null,
   bondingCurveComplete: null,
   isBanned: null,
   isToken2022: null,
@@ -1767,7 +1781,7 @@ async function doLiveFeedSweep() {
   const toScan = coins.filter((c) => {
     const cached = cache.get(c.mint);
     return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
-  }).slice(0, LIVE_FEED.scanBudgetPerPoll);
+  }).sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0)).slice(0, LIVE_FEED.scanBudgetPerPoll);
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -1807,6 +1821,7 @@ async function doLiveFeedSweep() {
       name: entry.analysis.identity.name ?? c.name,
       ageMinutes: entry.analysis.identity.ageMinutes ?? (c.createdMs ? Math.max(0, (Date.now() - c.createdMs) / 6e4) : null),
       marketCapEur: entry.analysis.market?.marketCapEur ?? null,
+      priceUsd: entry.analysis.market?.priceEur != null ? entry.analysis.market.priceEur / EUR_PER_USD : null,
       riskScore: entry.risk.riskScore,
       signal: entry.risk.signal,
       topReason: entry.risk.reasons[0]?.text ?? null,
@@ -1929,7 +1944,7 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
   const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
   const hasMarket = gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== "unknown";
   const market = hasMarket ? {
-    priceEur: gmgn.priceEur,
+    priceEur: gmgn.priceEur ?? pumpfun.priceEur,
     marketCapEur: gmgn.marketCapEur ?? pumpfun.marketCapEur,
     liquidityEur: gmgn.liquidityEur,
     volume24hEur: gmgn.volume24hEur,

@@ -180,8 +180,37 @@ document.addEventListener("DOMContentLoaded", () => {
   $("open-dashboard").addEventListener("click", () => {
     chrome.tabs.create({ url: chrome.runtime.getURL("dashboard/dashboard.html") });
   });
+  initSettings();
   void init();
 });
+function initSettings() {
+  const input = $("helius-key");
+  const status = $("turbo-status");
+  const msg = $("settings-msg");
+  const paint = (res) => {
+    const on = !!res && res.ok && res.hasHelius;
+    status.textContent = on ? "ON" : "off";
+    status.className = on ? "turbo-on" : "turbo-off";
+    if (on) input.placeholder = "Helius key saved \u2713 (paste a new one to change)";
+  };
+  chrome.runtime.sendMessage({ type: "GET_SETTINGS" }, paint);
+  $("save-key").addEventListener("click", () => {
+    const key = input.value.trim();
+    msg.textContent = "Saving\u2026";
+    msg.className = "settings-msg";
+    chrome.runtime.sendMessage({ type: "SET_SETTINGS", heliusKey: key || null }, (res) => {
+      if (chrome.runtime.lastError || !res || !res.ok) {
+        msg.textContent = "Could not save.";
+        msg.className = "settings-msg err";
+        return;
+      }
+      input.value = "";
+      paint(res);
+      msg.textContent = res.hasHelius ? "\u26A1 Turbo ON \u2014 scanning 3\xD7 more coins, faster. Re-scan of everything started." : "Key cleared \u2014 back to the free public RPC.";
+      msg.className = "settings-msg ok";
+    });
+  });
+}
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const address = extractAddress(tab?.url ?? "");

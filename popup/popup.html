@@ -59,6 +59,16 @@
         <ul id="recent-list" class="recent"></ul>
       </section>
 
+      <section id="settings" class="settings">
+        <h2>⚡ Turbo mode <span id="turbo-status" class="turbo-off">off</span></h2>
+        <p class="settings-hint">Paste a <b>free</b> Helius RPC key to unlock 3× more coins scanned per refresh, faster launch-catching, and the metadata-mutability audit. Get one in 2 min at <b>helius.dev</b> → API Keys.</p>
+        <div class="settings-row">
+          <input id="helius-key" type="password" placeholder="Helius API key" spellcheck="false" autocomplete="off" />
+          <button id="save-key">Save</button>
+        </div>
+        <div id="settings-msg" class="settings-msg"></div>
+      </section>
+
       <button id="open-dashboard">Open dashboard</button>
     </main>
 

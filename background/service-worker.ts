@@ -25,6 +25,14 @@ import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib
 import { scoreQuality } from '../lib/qualityScorer.ts';
 import { scoreToken } from '../lib/riskScorer.ts';
 import { assessRugPotential } from '../lib/rugPotential.ts';
+import {
+  effectiveConcurrency,
+  effectiveScanBudget,
+  getSettings,
+  hasHelius,
+  loadSettings,
+  setSettings,
+} from '../lib/settings.ts';
 import { computeWatchAlerts } from '../lib/watchAlerts.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
@@ -40,6 +48,7 @@ import type {
   RecentToken,
   ResolvePairsResponse,
   RiskResult,
+  SettingsResponse,
   TokenAnalysis,
   WatchedCoin,
   WatchlistResponse,
@@ -70,7 +79,9 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
 
 async function handle(
   msg: BgRequest,
-): Promise<AnalyzeResponse | RecentResponse | LiveFeedResponse | ResolvePairsResponse | WatchlistResponse> {
+): Promise<
+  AnalyzeResponse | RecentResponse | LiveFeedResponse | ResolvePairsResponse | WatchlistResponse | SettingsResponse
+> {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
       return analyzeToken(msg.address, msg.force === true, msg.rawGmgn);
@@ -93,6 +104,14 @@ async function handle(
       return unwatchToken(msg.address);
     case 'GET_WATCHLIST':
       return { ok: true, watchlist: await loadWatchlist() };
+    case 'GET_SETTINGS':
+      await loadSettings();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+    case 'SET_SETTINGS': {
+      await setSettings({ heliusKey: msg.heliusKey });
+      cache.clear(); // re-scan everything through the new RPC
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+    }
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };
   }
@@ -161,7 +180,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
     })
     .sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0))
-    .slice(0, LIVE_FEED.scanBudgetPerPoll);
+    .slice(0, effectiveScanBudget()); // 3× more coins per poll when a Helius key is set
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -170,7 +189,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       await analyzeToken(c.mint, false, undefined, /*lite*/ true);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(LIVE_FEED.scanConcurrency, toScan.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(effectiveConcurrency(), toScan.length) }, worker));
 
   // Phase 2 — build rows; auto-upgrade a bounded number of promising lite
   // results to FULL background checks so real gems can surface.
@@ -627,6 +646,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
+// Load user settings (Helius key) as soon as the service worker wakes.
+void loadSettings();
 
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith('ck-watch-')) return;

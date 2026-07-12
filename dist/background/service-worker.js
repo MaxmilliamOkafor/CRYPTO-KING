@@ -1497,40 +1497,73 @@ function assessRugPotential(a, risk) {
   return { verdict, vectors: [...hard, ...soft], unverified };
 }
 
+// lib/settings.ts
+var KEY = "ck:settings";
+var current = { heliusKey: null };
+async function loadSettings() {
+  const d = await chrome.storage.local.get(KEY);
+  const s = d[KEY];
+  if (s) current = { heliusKey: typeof s.heliusKey === "string" && s.heliusKey.trim() ? s.heliusKey.trim() : null };
+}
+async function setSettings(patch) {
+  const key = typeof patch.heliusKey === "string" ? patch.heliusKey.trim() : current.heliusKey;
+  current = { heliusKey: key && key.length > 0 ? key : null };
+  await chrome.storage.local.set({ [KEY]: current });
+  return current;
+}
+function getSettings() {
+  return current;
+}
+function hasHelius() {
+  return Boolean(current.heliusKey);
+}
+function activeRpcUrl() {
+  return current.heliusKey ? `https://mainnet.helius-rpc.com/?api-key=${current.heliusKey}` : SOLANA.rpcUrl;
+}
+function activeSupportsDas() {
+  return hasHelius() || SOLANA.supportsDas;
+}
+function effectiveScanBudget() {
+  return hasHelius() ? LIVE_FEED.scanBudgetPerPoll * 3 : LIVE_FEED.scanBudgetPerPoll;
+}
+function effectiveConcurrency() {
+  return hasHelius() ? LIVE_FEED.scanConcurrency * 2 : LIVE_FEED.scanConcurrency;
+}
+
 // lib/watchAlerts.ts
-function computeWatchAlerts(baseline, current) {
+function computeWatchAlerts(baseline, current2) {
   const alerts = [];
   const t = WATCHLIST.alerts;
   const lpWasSecured = baseline.lpStatus === "burned" || baseline.lpStatus === "locked";
-  const lpNowSecured = current.lpStatus === "burned" || current.lpStatus === "locked";
-  if (lpWasSecured && !lpNowSecured && current.lpStatus !== "unknown") {
+  const lpNowSecured = current2.lpStatus === "burned" || current2.lpStatus === "locked";
+  if (lpWasSecured && !lpNowSecured && current2.lpStatus !== "unknown") {
     alerts.push({
       kind: "lp-unsecured",
-      message: `LP is no longer ${baseline.lpStatus} (now ${current.lpStatus.replace("_", " ")}) \u2014 rug risk changed.`
+      message: `LP is no longer ${baseline.lpStatus} (now ${current2.lpStatus.replace("_", " ")}) \u2014 rug risk changed.`
     });
   }
-  if (baseline.liquidityEur !== null && current.liquidityEur !== null && baseline.liquidityEur > 0) {
-    const dropPct = (1 - current.liquidityEur / baseline.liquidityEur) * 100;
+  if (baseline.liquidityEur !== null && current2.liquidityEur !== null && baseline.liquidityEur > 0) {
+    const dropPct = (1 - current2.liquidityEur / baseline.liquidityEur) * 100;
     if (dropPct >= t.liquidityDropPct) {
       alerts.push({ kind: "liquidity-drop", message: `Liquidity down ${dropPct.toFixed(0)}% since you started watching.` });
     }
   }
-  if (baseline.marketCapEur !== null && current.marketCapEur !== null && baseline.marketCapEur > 0) {
-    const dropPct = (1 - current.marketCapEur / baseline.marketCapEur) * 100;
+  if (baseline.marketCapEur !== null && current2.marketCapEur !== null && baseline.marketCapEur > 0) {
+    const dropPct = (1 - current2.marketCapEur / baseline.marketCapEur) * 100;
     if (dropPct >= t.marketCapDropPct) {
       alerts.push({ kind: "mcap-drop", message: `Market cap down ${dropPct.toFixed(0)}% since you started watching.` });
     }
   }
-  if (baseline.devHoldsPct !== null && current.devHoldsPct !== null && baseline.devHoldsPct - current.devHoldsPct >= t.devSoldPointsDrop) {
+  if (baseline.devHoldsPct !== null && current2.devHoldsPct !== null && baseline.devHoldsPct - current2.devHoldsPct >= t.devSoldPointsDrop) {
     alerts.push({
       kind: "dev-selling",
-      message: `Dev wallet cut holdings from ${baseline.devHoldsPct.toFixed(1)}% to ${current.devHoldsPct.toFixed(1)}% \u2014 dev is selling.`
+      message: `Dev wallet cut holdings from ${baseline.devHoldsPct.toFixed(1)}% to ${current2.devHoldsPct.toFixed(1)}% \u2014 dev is selling.`
     });
   }
-  if (baseline.grade !== null && current.grade !== null && baseline.grade - current.grade >= t.gradeDrop) {
+  if (baseline.grade !== null && current2.grade !== null && baseline.grade - current2.grade >= t.gradeDrop) {
     alerts.push({
       kind: "grade-collapse",
-      message: `King Grade fell ${baseline.grade}% \u2192 ${current.grade}% \u2014 risk profile worsened.`
+      message: `King Grade fell ${baseline.grade}% \u2192 ${current2.grade}% \u2014 risk profile worsened.`
     });
   }
   return alerts;
@@ -1574,7 +1607,7 @@ async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [],
   return { mint, holders, status };
 }
 async function fetchMintInfo(address) {
-  const result = await rpcCall(SOLANA.rpcUrl, "getAccountInfo", [
+  const result = await rpcCall(activeRpcUrl(), "getAccountInfo", [
     address,
     { encoding: "jsonParsed", commitment: "confirmed" }
   ]);
@@ -1630,14 +1663,14 @@ async function fetchMintInfo(address) {
   };
 }
 async function fetchMetadataMutable(address) {
-  if (!SOLANA.supportsDas) return null;
-  const asset = await rpcCall(SOLANA.rpcUrl, "getAsset", { id: address });
+  if (!activeSupportsDas()) return null;
+  const asset = await rpcCall(activeRpcUrl(), "getAsset", { id: address });
   return typeof asset?.mutable === "boolean" ? asset.mutable : null;
 }
 async function fetchHolderInfo(address, creatorAddress = null) {
   const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(SOLANA.rpcUrl, "getTokenSupply", [address, { commitment: "confirmed" }]),
-    rpcCall(SOLANA.rpcUrl, "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
+    rpcCall(activeRpcUrl(), "getTokenSupply", [address, { commitment: "confirmed" }]),
+    rpcCall(activeRpcUrl(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
   ]);
   const supply = asNumber(supplyRes?.value?.uiAmount);
   const accounts = (largestRes?.value ?? []).map((a) => ({ address: a.address ?? "", amount: asNumber(a.uiAmount) ?? 0 })).filter((a) => a.address && a.amount > 0);
@@ -1672,8 +1705,8 @@ async function fetchHolderInfo(address, creatorAddress = null) {
 }
 async function fetchHolderInfoLite(address, excludeTokenAccounts) {
   const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(SOLANA.rpcUrl, "getTokenSupply", [address, { commitment: "confirmed" }]),
-    rpcCall(SOLANA.rpcUrl, "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
+    rpcCall(activeRpcUrl(), "getTokenSupply", [address, { commitment: "confirmed" }]),
+    rpcCall(activeRpcUrl(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
   ]);
   const supply = asNumber(supplyRes?.value?.uiAmount);
   const excluded = new Set(excludeTokenAccounts);
@@ -1693,7 +1726,7 @@ async function fetchHolderInfoLite(address, excludeTokenAccounts) {
   };
 }
 async function fetchOwners(tokenAccounts) {
-  const result = await rpcCall(SOLANA.rpcUrl, "getMultipleAccounts", [
+  const result = await rpcCall(activeRpcUrl(), "getMultipleAccounts", [
     tokenAccounts,
     { encoding: "jsonParsed", commitment: "confirmed" }
   ]);
@@ -1733,6 +1766,14 @@ async function handle(msg) {
       return unwatchToken(msg.address);
     case "GET_WATCHLIST":
       return { ok: true, watchlist: await loadWatchlist() };
+    case "GET_SETTINGS":
+      await loadSettings();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+    case "SET_SETTINGS": {
+      await setSettings({ heliusKey: msg.heliusKey });
+      cache.clear();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+    }
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
@@ -1781,7 +1822,7 @@ async function doLiveFeedSweep() {
   const toScan = coins.filter((c) => {
     const cached = cache.get(c.mint);
     return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
-  }).sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0)).slice(0, LIVE_FEED.scanBudgetPerPoll);
+  }).sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0)).slice(0, effectiveScanBudget());
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -1796,7 +1837,7 @@ async function doLiveFeedSweep() {
       );
     }
   };
-  await Promise.all(Array.from({ length: Math.min(LIVE_FEED.scanConcurrency, toScan.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(effectiveConcurrency(), toScan.length) }, worker));
   let fullUpgradesThisPoll = 0;
   for (const c of coins) {
     let entry = cache.get(c.mint);
@@ -2109,6 +2150,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
+void loadSettings();
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith("ck-watch-")) return;
   const address = id.slice("ck-watch-".length).split("-")[0];

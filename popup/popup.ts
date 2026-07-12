@@ -6,7 +6,14 @@
 
 import { DISCLAIMER } from '../config.ts';
 import { computeKingGrade, gradeColors as gradeColorsPopup, gradeLabel } from '../lib/kingGrade.ts';
-import type { AnalyzeResponse, QualityResult, RecentResponse, RiskResult, TokenAnalysis } from '../lib/types.ts';
+import type {
+  AnalyzeResponse,
+  QualityResult,
+  RecentResponse,
+  RiskResult,
+  SettingsResponse,
+  TokenAnalysis,
+} from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
 const URL_PATTERNS = [
@@ -21,8 +28,44 @@ document.addEventListener('DOMContentLoaded', () => {
   $('open-dashboard').addEventListener('click', () => {
     chrome.tabs.create({ url: chrome.runtime.getURL('dashboard/dashboard.html') });
   });
+  initSettings();
   void init();
 });
+
+/* ── ⚡ Turbo mode (Helius key) settings ────────────────────────────────── */
+function initSettings(): void {
+  const input = $('helius-key') as HTMLInputElement;
+  const status = $('turbo-status');
+  const msg = $('settings-msg');
+
+  const paint = (res: SettingsResponse | undefined) => {
+    const on = !!res && res.ok && res.hasHelius;
+    status.textContent = on ? 'ON' : 'off';
+    status.className = on ? 'turbo-on' : 'turbo-off';
+    if (on) input.placeholder = 'Helius key saved ✓ (paste a new one to change)';
+  };
+
+  chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }, paint);
+
+  $('save-key').addEventListener('click', () => {
+    const key = input.value.trim();
+    msg.textContent = 'Saving…';
+    msg.className = 'settings-msg';
+    chrome.runtime.sendMessage({ type: 'SET_SETTINGS', heliusKey: key || null }, (res: SettingsResponse | undefined) => {
+      if (chrome.runtime.lastError || !res || !res.ok) {
+        msg.textContent = 'Could not save.';
+        msg.className = 'settings-msg err';
+        return;
+      }
+      input.value = '';
+      paint(res);
+      msg.textContent = res.hasHelius
+        ? '⚡ Turbo ON — scanning 3× more coins, faster. Re-scan of everything started.'
+        : 'Key cleared — back to the free public RPC.';
+      msg.className = 'settings-msg ok';
+    });
+  });
+}
 
 async function init(): Promise<void> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });

@@ -16,7 +16,7 @@
 import { MOCK_MODE, SMART_MONEY_WALLETS, SOLANA } from '../config.ts';
 import { fixtureForAddress } from '../mock/fixtures.ts';
 import { asNumber, rpcCall } from './http.ts';
-import { activeRpcUrl, activeSupportsDas } from './settings.ts';
+import { activeSupportsDas, rpcUrlPool } from './settings.ts';
 import type { HolderInfo, MintInfo } from './types.ts';
 
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -59,7 +59,7 @@ export async function fetchSolanaData(
 /* ── Mint account: authorities + Token-2022 extensions ─────────────────── */
 
 async function fetchMintInfo(address: string): Promise<MintInfo | null> {
-  const result = (await rpcCall(activeRpcUrl(), 'getAccountInfo', [
+  const result = (await rpcCall(rpcUrlPool(), 'getAccountInfo', [
     address,
     { encoding: 'jsonParsed', commitment: 'confirmed' },
   ])) as { value?: { owner?: string; data?: { parsed?: { type?: string; info?: Record<string, unknown> } } } } | null;
@@ -126,7 +126,7 @@ async function fetchMintInfo(address: string): Promise<MintInfo | null> {
 /** Metadata mutability via DAS getAsset — Helius-style RPCs only. */
 async function fetchMetadataMutable(address: string): Promise<boolean | null> {
   if (!activeSupportsDas()) return null; // honest "unknown" on plain RPC
-  const asset = (await rpcCall(activeRpcUrl(), 'getAsset', { id: address })) as { mutable?: boolean } | null;
+  const asset = (await rpcCall(rpcUrlPool(), 'getAsset', { id: address })) as { mutable?: boolean } | null;
   return typeof asset?.mutable === 'boolean' ? asset.mutable : null;
 }
 
@@ -134,8 +134,8 @@ async function fetchMetadataMutable(address: string): Promise<boolean | null> {
 
 async function fetchHolderInfo(address: string, creatorAddress: string | null = null): Promise<HolderInfo | null> {
   const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(activeRpcUrl(), 'getTokenSupply', [address, { commitment: 'confirmed' }]),
-    rpcCall(activeRpcUrl(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
+    rpcCall(rpcUrlPool(), 'getTokenSupply', [address, { commitment: 'confirmed' }]),
+    rpcCall(rpcUrlPool(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
   ]);
 
   const supply = asNumber((supplyRes as { value?: { uiAmount?: unknown } } | null)?.value?.uiAmount);
@@ -199,8 +199,8 @@ async function fetchHolderInfo(address: string, creatorAddress: string | null = 
  */
 async function fetchHolderInfoLite(address: string, excludeTokenAccounts: string[]): Promise<HolderInfo | null> {
   const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(activeRpcUrl(), 'getTokenSupply', [address, { commitment: 'confirmed' }]),
-    rpcCall(activeRpcUrl(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
+    rpcCall(rpcUrlPool(), 'getTokenSupply', [address, { commitment: 'confirmed' }]),
+    rpcCall(rpcUrlPool(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
   ]);
 
   const supply = asNumber((supplyRes as { value?: { uiAmount?: unknown } } | null)?.value?.uiAmount);
@@ -226,7 +226,7 @@ async function fetchHolderInfoLite(address: string, excludeTokenAccounts: string
 }
 
 async function fetchOwners(tokenAccounts: string[]): Promise<Array<string | null>> {
-  const result = (await rpcCall(activeRpcUrl(), 'getMultipleAccounts', [
+  const result = (await rpcCall(rpcUrlPool(), 'getMultipleAccounts', [
     tokenAccounts,
     { encoding: 'jsonParsed', commitment: 'confirmed' },
   ])) as { value?: Array<{ data?: { parsed?: { info?: { owner?: string } } } } | null> } | null;

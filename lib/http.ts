@@ -75,16 +75,24 @@ export async function fetchJson(url: string, init?: RequestInit): Promise<unknow
   return run;
 }
 
-/** Rate-limited JSON-RPC POST helper (Solana RPC / Helius DAS). */
-export async function rpcCall(rpcUrl: string, method: string, params: unknown): Promise<unknown | null> {
+/**
+ * Rate-limited JSON-RPC POST helper (Solana RPC / Helius DAS). Accepts one URL
+ * or a FAILOVER POOL: endpoints are tried in order until one returns a result,
+ * so a single rate-limited/keyless endpoint doesn't stall the scan.
+ */
+export async function rpcCall(rpcUrl: string | string[], method: string, params: unknown): Promise<unknown | null> {
+  const urls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
   const body = JSON.stringify({ jsonrpc: '2.0', id: 'crypto-king', method, params });
-  const json = await fetchJson(rpcUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body,
-  });
-  if (json && typeof json === 'object' && 'result' in (json as Record<string, unknown>)) {
-    return (json as Record<string, unknown>).result ?? null;
+  for (const url of urls) {
+    const json = await fetchJson(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    });
+    if (json && typeof json === 'object' && 'result' in (json as Record<string, unknown>)) {
+      return (json as Record<string, unknown>).result ?? null;
+    }
+    // else: this endpoint failed/rate-limited → try the next in the pool
   }
   return null;
 }

@@ -101,6 +101,15 @@ var SOLANA = {
    *   → 'https://mainnet.helius-rpc.com/?api-key=YOUR_KEY'
    */
   rpcUrl: "https://api.mainnet-beta.solana.com",
+  /**
+   * Extra FREE, no-signup RPC endpoints to spread load across (failover order).
+   * The scanner tries the primary first, then these — so one endpoint being
+   * rate-limited doesn't stall a scan. Empty by default (the tool works fine on
+   * the single public endpoint); paste any keyless Solana RPCs you trust here
+   * to speed up without ever creating an account. A Helius key, if set, takes
+   * priority over this whole list.
+   */
+  fallbackRpcUrls: [],
   /** DAS (getAsset) is only available on Helius-style RPCs. Auto-detected from the URL. */
   get supportsDas() {
     return this.rpcUrl.includes("helius");
@@ -605,14 +614,17 @@ async function fetchJson(url, init) {
   return run;
 }
 async function rpcCall(rpcUrl, method, params) {
+  const urls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
   const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
-  const json = await fetchJson(rpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body
-  });
-  if (json && typeof json === "object" && "result" in json) {
-    return json.result ?? null;
+  for (const url of urls) {
+    const json = await fetchJson(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body
+    });
+    if (json && typeof json === "object" && "result" in json) {
+      return json.result ?? null;
+    }
   }
   return null;
 }
@@ -1526,8 +1538,9 @@ function xBearerToken() {
 function hasX() {
   return Boolean(current.xBearerToken);
 }
-function activeRpcUrl() {
-  return current.heliusKey ? `https://mainnet.helius-rpc.com/?api-key=${current.heliusKey}` : SOLANA.rpcUrl;
+function rpcUrlPool() {
+  if (current.heliusKey) return [`https://mainnet.helius-rpc.com/?api-key=${current.heliusKey}`];
+  return [SOLANA.rpcUrl, ...SOLANA.fallbackRpcUrls];
 }
 function activeSupportsDas() {
   return hasHelius() || SOLANA.supportsDas;
@@ -1642,7 +1655,7 @@ async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [],
   return { mint, holders, status };
 }
 async function fetchMintInfo(address) {
-  const result = await rpcCall(activeRpcUrl(), "getAccountInfo", [
+  const result = await rpcCall(rpcUrlPool(), "getAccountInfo", [
     address,
     { encoding: "jsonParsed", commitment: "confirmed" }
   ]);
@@ -1699,13 +1712,13 @@ async function fetchMintInfo(address) {
 }
 async function fetchMetadataMutable(address) {
   if (!activeSupportsDas()) return null;
-  const asset = await rpcCall(activeRpcUrl(), "getAsset", { id: address });
+  const asset = await rpcCall(rpcUrlPool(), "getAsset", { id: address });
   return typeof asset?.mutable === "boolean" ? asset.mutable : null;
 }
 async function fetchHolderInfo(address, creatorAddress = null) {
   const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(activeRpcUrl(), "getTokenSupply", [address, { commitment: "confirmed" }]),
-    rpcCall(activeRpcUrl(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
+    rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]),
+    rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
   ]);
   const supply = asNumber(supplyRes?.value?.uiAmount);
   const accounts = (largestRes?.value ?? []).map((a) => ({ address: a.address ?? "", amount: asNumber(a.uiAmount) ?? 0 })).filter((a) => a.address && a.amount > 0);
@@ -1740,8 +1753,8 @@ async function fetchHolderInfo(address, creatorAddress = null) {
 }
 async function fetchHolderInfoLite(address, excludeTokenAccounts) {
   const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(activeRpcUrl(), "getTokenSupply", [address, { commitment: "confirmed" }]),
-    rpcCall(activeRpcUrl(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
+    rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]),
+    rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
   ]);
   const supply = asNumber(supplyRes?.value?.uiAmount);
   const excluded = new Set(excludeTokenAccounts);
@@ -1761,7 +1774,7 @@ async function fetchHolderInfoLite(address, excludeTokenAccounts) {
   };
 }
 async function fetchOwners(tokenAccounts) {
-  const result = await rpcCall(activeRpcUrl(), "getMultipleAccounts", [
+  const result = await rpcCall(rpcUrlPool(), "getMultipleAccounts", [
     tokenAccounts,
     { encoding: "jsonParsed", commitment: "confirmed" }
   ]);

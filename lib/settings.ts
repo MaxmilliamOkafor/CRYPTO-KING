@@ -57,6 +57,16 @@ export function activeRpcUrl(): string {
   return current.heliusKey ? `https://mainnet.helius-rpc.com/?api-key=${current.heliusKey}` : SOLANA.rpcUrl;
 }
 
+/**
+ * Ordered RPC endpoints to try (failover). Helius key wins outright; otherwise
+ * the free public endpoint plus any user-added keyless fallbacks. A dead/
+ * rate-limited endpoint is skipped for the next, so keyless scans are steadier.
+ */
+export function rpcUrlPool(): string[] {
+  if (current.heliusKey) return [`https://mainnet.helius-rpc.com/?api-key=${current.heliusKey}`];
+  return [SOLANA.rpcUrl, ...SOLANA.fallbackRpcUrls];
+}
+
 /** DAS getAsset (metadata mutability) works on Helius; auto-enabled with a key. */
 export function activeSupportsDas(): boolean {
   return hasHelius() || SOLANA.supportsDas;

@@ -170,6 +170,15 @@ export const SOLANA = {
    *   → 'https://mainnet.helius-rpc.com/?api-key=YOUR_KEY'
    */
   rpcUrl: 'https://api.mainnet-beta.solana.com',
+  /**
+   * Extra FREE, no-signup RPC endpoints to spread load across (failover order).
+   * The scanner tries the primary first, then these — so one endpoint being
+   * rate-limited doesn't stall a scan. Empty by default (the tool works fine on
+   * the single public endpoint); paste any keyless Solana RPCs you trust here
+   * to speed up without ever creating an account. A Helius key, if set, takes
+   * priority over this whole list.
+   */
+  fallbackRpcUrls: [] as string[],
   /** DAS (getAsset) is only available on Helius-style RPCs. Auto-detected from the URL. */
   get supportsDas(): boolean {
     return this.rpcUrl.includes('helius');

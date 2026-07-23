@@ -187,11 +187,17 @@ function initSettings() {
   const input = $("helius-key");
   const status = $("turbo-status");
   const msg = $("settings-msg");
+  const xInput = $("x-token");
+  const xStatus = $("x-status");
+  const xMsg = $("x-msg");
   const paint = (res) => {
-    const on = !!res && res.ok && res.hasHelius;
-    status.textContent = on ? "ON" : "off";
-    status.className = on ? "turbo-on" : "turbo-off";
-    if (on) input.placeholder = "Helius key saved \u2713 (paste a new one to change)";
+    if (!res || !res.ok) return;
+    status.textContent = res.hasHelius ? "ON" : "off";
+    status.className = res.hasHelius ? "turbo-on" : "turbo-off";
+    if (res.hasHelius) input.placeholder = "Helius key saved \u2713 (paste a new one to change)";
+    xStatus.textContent = res.hasX ? "ON" : "off";
+    xStatus.className = res.hasX ? "turbo-on" : "turbo-off";
+    if (res.hasX) xInput.placeholder = "X token saved \u2713 (paste a new one to change)";
   };
   chrome.runtime.sendMessage({ type: "GET_SETTINGS" }, paint);
   $("save-key").addEventListener("click", () => {
@@ -208,6 +214,22 @@ function initSettings() {
       paint(res);
       msg.textContent = res.hasHelius ? "\u26A1 Turbo ON \u2014 scanning 3\xD7 more coins, faster. Re-scan of everything started." : "Key cleared \u2014 back to the free public RPC.";
       msg.className = "settings-msg ok";
+    });
+  });
+  $("save-x").addEventListener("click", () => {
+    const token = xInput.value.trim();
+    xMsg.textContent = "Saving\u2026";
+    xMsg.className = "settings-msg";
+    chrome.runtime.sendMessage({ type: "SET_SETTINGS", xBearerToken: token || null }, (res) => {
+      if (chrome.runtime.lastError || !res || !res.ok) {
+        xMsg.textContent = "Could not save.";
+        xMsg.className = "settings-msg err";
+        return;
+      }
+      xInput.value = "";
+      paint(res);
+      xMsg.textContent = res.hasX ? "\u{1D54F} automated buzz ON." : "X token cleared \u2014 live search still works.";
+      xMsg.className = "settings-msg ok";
     });
   });
 }

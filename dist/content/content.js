@@ -303,6 +303,60 @@ var RUG_VERDICT_META = {
   UNVERIFIED: { color: "#3a3f4c", textColor: "#e6e8ee", label: "RUG CHECK: not fully verified yet" }
 };
 
+// lib/http.ts
+function rateLimitFor(host2) {
+  const bare = host2.replace(/^www\./, "");
+  return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
+}
+var hostState = /* @__PURE__ */ new Map();
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid";
+  }
+}
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function fetchJson(url, init) {
+  const host2 = hostOf(url);
+  let st = hostState.get(host2);
+  if (!st) {
+    st = { nextAt: 0, chain: Promise.resolve() };
+    hostState.set(host2, st);
+  }
+  const run = st.chain.then(async () => {
+    const wait = st.nextAt - Date.now();
+    if (wait > 0) await sleep(wait);
+    st.nextAt = Date.now() + rateLimitFor(host2);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      if (!res.ok) {
+        console.warn(`[CRYPTO-KING] ${host2} responded ${res.status} for ${url}`);
+        return null;
+      }
+      return await res.json();
+    } catch (err) {
+      console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  st.chain = run.catch(() => void 0);
+  return run;
+}
+
+// lib/twitterClient.ts
+function xSearchUrl(query, live = true) {
+  return `https://x.com/search?q=${encodeURIComponent(query)}${live ? "&f=live" : ""}`;
+}
+function xMonitorQuery(symbol, address) {
+  const sym = (symbol ?? "").replace(/[^A-Za-z0-9]/g, "");
+  return sym ? `$${sym}` : address;
+}
+
 // mock/fixtures.ts
 var now = () => Date.now();
 var FIXTURE_AVOID = {
@@ -486,51 +540,6 @@ var FIXTURE_NEUTRAL = {
   fetchedAt: now()
 };
 
-// lib/http.ts
-function rateLimitFor(host2) {
-  const bare = host2.replace(/^www\./, "");
-  return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
-}
-var hostState = /* @__PURE__ */ new Map();
-function hostOf(url) {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "invalid";
-  }
-}
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function fetchJson(url, init) {
-  const host2 = hostOf(url);
-  let st = hostState.get(host2);
-  if (!st) {
-    st = { nextAt: 0, chain: Promise.resolve() };
-    hostState.set(host2, st);
-  }
-  const run = st.chain.then(async () => {
-    const wait = st.nextAt - Date.now();
-    if (wait > 0) await sleep(wait);
-    st.nextAt = Date.now() + rateLimitFor(host2);
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { ...init, signal: ctrl.signal });
-      if (!res.ok) {
-        console.warn(`[CRYPTO-KING] ${host2} responded ${res.status} for ${url}`);
-        return null;
-      }
-      return await res.json();
-    } catch (err) {
-      console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-  st.chain = run.catch(() => void 0);
-  return run;
-}
-
 // lib/gmgnClient.ts
 async function fetchGmgnRaw(address, lite = false) {
   if (lite) {
@@ -690,6 +699,10 @@ var STYLES = `
   .row { display: flex; justify-content: space-between; align-items: center; }
   .details-btn { color: #7aa2ff; font-size: 12px; }
   .back-btn { color: #7aa2ff; font-size: 12px; padding: 2px 0; }
+  .x-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .x-link { color: #7aa2ff; text-decoration: none; font-size: 12px; }
+  .x-link:hover { text-decoration: underline; }
+  .x-warn { color: #ffb076; font-size: 11px; }
   .rug-banner { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 8px; margin-bottom: 8px; font-size: 11.5px; }
   .rug-banner span { font-weight: 400; opacity: .92; }
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
@@ -1474,6 +1487,7 @@ function render(analysis, risk, quality, mock) {
       <button class="details-btn">Details \u25BE</button>
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
     </div>
+    <div class="x-monitor"></div>
     <div class="panel" hidden></div>
     <div class="row" style="margin-top:10px">
       <button class="back-btn">\u2190 Scan another token</button>
@@ -1482,6 +1496,7 @@ function render(analysis, risk, quality, mock) {
   body.querySelector(".back-btn")?.addEventListener("click", backToHome);
   const copyBtn = body.querySelector(".copy");
   copyBtn?.addEventListener("click", () => copyToClipboard(analysis.identity.address, copyBtn));
+  renderXMonitor(body.querySelector(".x-monitor"), analysis);
   const watchBtn = body.querySelector(".watch-btn");
   watchBtn?.addEventListener("click", () => {
     watchBtn.disabled = true;
@@ -1512,6 +1527,39 @@ function backToHome() {
   currentAddress = null;
   view = "home";
   renderHome();
+}
+function renderXMonitor(box, analysis) {
+  if (!box) return;
+  const sym = analysis.identity.symbol;
+  const addr = analysis.identity.address;
+  const query = xMonitorQuery(sym, addr);
+  const handle = analysis.socials?.twitter ?? null;
+  const handleUrl = handle ? handle.startsWith("http") ? handle : `https://x.com/${handle.replace(/^@/, "")}` : null;
+  box.innerHTML = `
+    <h4 style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#9aa1af;margin:10px 0 4px">\u{1D54F} Monitor</h4>
+    <div class="x-row">
+      <a class="x-link" href="${esc(xSearchUrl(query, true))}" target="_blank" rel="noreferrer">\u{1F50D} Watch ${esc(query)} live on X \u2197</a>
+      ${handleUrl ? `<a class="x-link" href="${esc(handleUrl)}" target="_blank" rel="noreferrer">Token's X \u2197</a>` : '<span class="x-warn">no X account linked</span>'}
+    </div>
+    <div class="x-buzz muted" style="font-size:11px;margin-top:4px">checking recent X activity\u2026</div>`;
+  const buzzEl = box.querySelector(".x-buzz");
+  chrome.runtime.sendMessage({ type: "CHECK_X", symbol: sym, address: addr }, (res) => {
+    if (!buzzEl) return;
+    if (!res || !res.ok) {
+      buzzEl.textContent = "";
+      return;
+    }
+    if (!res.hasToken) {
+      buzzEl.innerHTML = `<span class="muted">Automated buzz needs an X API token (Settings) \u2014 use the live search above meanwhile.</span>`;
+      return;
+    }
+    if (!res.buzz) {
+      buzzEl.innerHTML = `<span class="muted">X buzz unavailable (rate-limited or no recent posts).</span>`;
+      return;
+    }
+    const n = res.buzz.notableAuthors;
+    buzzEl.innerHTML = `<b>${res.buzz.tweetCount}+</b> recent posts` + (n.length ? ` \xB7 notable: ${esc(n.slice(0, 3).join(", "))}` : "") + ` <span class="muted">(hype \u2260 value \u2014 bots fake this)</span>`;
+  });
 }
 function fillPanel(panel, analysis, risk, quality) {
   const addr = analysis.identity.address;

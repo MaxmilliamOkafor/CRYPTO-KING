@@ -12,20 +12,26 @@ import { LIVE_FEED, SOLANA } from '../config.ts';
 
 export interface Settings {
   heliusKey: string | null;
+  /** Optional X (Twitter) API v2 bearer token for automated tweet-buzz. */
+  xBearerToken: string | null;
 }
 
 const KEY = 'ck:settings';
-let current: Settings = { heliusKey: null };
+let current: Settings = { heliusKey: null, xBearerToken: null };
+
+const clean = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
 
 export async function loadSettings(): Promise<void> {
   const d = await chrome.storage.local.get(KEY);
   const s = d[KEY] as Partial<Settings> | undefined;
-  if (s) current = { heliusKey: typeof s.heliusKey === 'string' && s.heliusKey.trim() ? s.heliusKey.trim() : null };
+  if (s) current = { heliusKey: clean(s.heliusKey), xBearerToken: clean(s.xBearerToken) };
 }
 
 export async function setSettings(patch: Partial<Settings>): Promise<Settings> {
-  const key = typeof patch.heliusKey === 'string' ? patch.heliusKey.trim() : current.heliusKey;
-  current = { heliusKey: key && key.length > 0 ? key : null };
+  current = {
+    heliusKey: 'heliusKey' in patch ? clean(patch.heliusKey) : current.heliusKey,
+    xBearerToken: 'xBearerToken' in patch ? clean(patch.xBearerToken) : current.xBearerToken,
+  };
   await chrome.storage.local.set({ [KEY]: current });
   return current;
 }
@@ -36,6 +42,14 @@ export function getSettings(): Settings {
 
 export function hasHelius(): boolean {
   return Boolean(current.heliusKey);
+}
+
+export function xBearerToken(): string | null {
+  return current.xBearerToken;
+}
+
+export function hasX(): boolean {
+  return Boolean(current.xBearerToken);
 }
 
 /** Effective RPC URL — user's Helius key if set, else the config default. */

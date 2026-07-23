@@ -25,6 +25,7 @@ import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '..
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
 import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
+import { xMonitorQuery, xSearchUrl } from '../lib/twitterClient.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
 import type {
   AnalyzeResponse,
@@ -36,6 +37,7 @@ import type {
   Signal,
   TokenAnalysis,
   WatchlistResponse,
+  XBuzzResponse,
 } from '../lib/types.ts';
 
 const BASE58 = '[1-9A-HJ-NP-Za-km-z]{32,44}';
@@ -195,6 +197,10 @@ const STYLES = `
   .row { display: flex; justify-content: space-between; align-items: center; }
   .details-btn { color: #7aa2ff; font-size: 12px; }
   .back-btn { color: #7aa2ff; font-size: 12px; padding: 2px 0; }
+  .x-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .x-link { color: #7aa2ff; text-decoration: none; font-size: 12px; }
+  .x-link:hover { text-decoration: underline; }
+  .x-warn { color: #ffb076; font-size: 11px; }
   .rug-banner { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 8px; margin-bottom: 8px; font-size: 11.5px; }
   .rug-banner span { font-weight: 400; opacity: .92; }
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
@@ -1149,6 +1155,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
       <button class="details-btn">Details ▾</button>
       <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
     </div>
+    <div class="x-monitor"></div>
     <div class="panel" hidden></div>
     <div class="row" style="margin-top:10px">
       <button class="back-btn">← Scan another token</button>
@@ -1158,6 +1165,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   body.querySelector('.back-btn')?.addEventListener('click', backToHome);
   const copyBtn = body.querySelector<HTMLButtonElement>('.copy');
   copyBtn?.addEventListener('click', () => copyToClipboard(analysis.identity.address, copyBtn));
+  renderXMonitor(body.querySelector<HTMLDivElement>('.x-monitor'), analysis);
   const watchBtn = body.querySelector<HTMLButtonElement>('.watch-btn');
   watchBtn?.addEventListener('click', () => {
     watchBtn.disabled = true;
@@ -1190,6 +1198,50 @@ function backToHome(): void {
   currentAddress = null;
   view = 'home';
   renderHome();
+}
+
+/* ── 𝕏 monitor: live-search links (free) + automated buzz (BYO X token) ── */
+function renderXMonitor(box: HTMLDivElement | null, analysis: TokenAnalysis): void {
+  if (!box) return;
+  const sym = analysis.identity.symbol;
+  const addr = analysis.identity.address;
+  const query = xMonitorQuery(sym, addr);
+  const handle = analysis.socials?.twitter ?? null;
+  const handleUrl = handle
+    ? handle.startsWith('http')
+      ? handle
+      : `https://x.com/${handle.replace(/^@/, '')}`
+    : null;
+
+  box.innerHTML = `
+    <h4 style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#9aa1af;margin:10px 0 4px">𝕏 Monitor</h4>
+    <div class="x-row">
+      <a class="x-link" href="${esc(xSearchUrl(query, true))}" target="_blank" rel="noreferrer">🔍 Watch ${esc(query)} live on X ↗</a>
+      ${handleUrl ? `<a class="x-link" href="${esc(handleUrl)}" target="_blank" rel="noreferrer">Token's X ↗</a>` : '<span class="x-warn">no X account linked</span>'}
+    </div>
+    <div class="x-buzz muted" style="font-size:11px;margin-top:4px">checking recent X activity…</div>`;
+
+  const buzzEl = box.querySelector<HTMLDivElement>('.x-buzz');
+  chrome.runtime.sendMessage({ type: 'CHECK_X', symbol: sym, address: addr }, (res: XBuzzResponse | undefined) => {
+    if (!buzzEl) return;
+    if (!res || !res.ok) {
+      buzzEl.textContent = '';
+      return;
+    }
+    if (!res.hasToken) {
+      buzzEl.innerHTML = `<span class="muted">Automated buzz needs an X API token (Settings) — use the live search above meanwhile.</span>`;
+      return;
+    }
+    if (!res.buzz) {
+      buzzEl.innerHTML = `<span class="muted">X buzz unavailable (rate-limited or no recent posts).</span>`;
+      return;
+    }
+    const n = res.buzz.notableAuthors;
+    buzzEl.innerHTML =
+      `<b>${res.buzz.tweetCount}+</b> recent posts` +
+      (n.length ? ` · notable: ${esc(n.slice(0, 3).join(', '))}` : '') +
+      ` <span class="muted">(hype ≠ value — bots fake this)</span>`;
+  });
 }
 
 function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskResult, quality: QualityResult): void {

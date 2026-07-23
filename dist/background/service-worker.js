@@ -1499,15 +1499,18 @@ function assessRugPotential(a, risk) {
 
 // lib/settings.ts
 var KEY = "ck:settings";
-var current = { heliusKey: null };
+var current = { heliusKey: null, xBearerToken: null };
+var clean = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
 async function loadSettings() {
   const d = await chrome.storage.local.get(KEY);
   const s = d[KEY];
-  if (s) current = { heliusKey: typeof s.heliusKey === "string" && s.heliusKey.trim() ? s.heliusKey.trim() : null };
+  if (s) current = { heliusKey: clean(s.heliusKey), xBearerToken: clean(s.xBearerToken) };
 }
 async function setSettings(patch) {
-  const key = typeof patch.heliusKey === "string" ? patch.heliusKey.trim() : current.heliusKey;
-  current = { heliusKey: key && key.length > 0 ? key : null };
+  current = {
+    heliusKey: "heliusKey" in patch ? clean(patch.heliusKey) : current.heliusKey,
+    xBearerToken: "xBearerToken" in patch ? clean(patch.xBearerToken) : current.xBearerToken
+  };
   await chrome.storage.local.set({ [KEY]: current });
   return current;
 }
@@ -1516,6 +1519,12 @@ function getSettings() {
 }
 function hasHelius() {
   return Boolean(current.heliusKey);
+}
+function xBearerToken() {
+  return current.xBearerToken;
+}
+function hasX() {
+  return Boolean(current.xBearerToken);
 }
 function activeRpcUrl() {
   return current.heliusKey ? `https://mainnet.helius-rpc.com/?api-key=${current.heliusKey}` : SOLANA.rpcUrl;
@@ -1528,6 +1537,32 @@ function effectiveScanBudget() {
 }
 function effectiveConcurrency() {
   return hasHelius() ? LIVE_FEED.scanConcurrency * 2 : LIVE_FEED.scanConcurrency;
+}
+
+// lib/twitterClient.ts
+function xMonitorQuery(symbol, address) {
+  const sym = (symbol ?? "").replace(/[^A-Za-z0-9]/g, "");
+  return sym ? `$${sym}` : address;
+}
+async function fetchXBuzz(symbol, address, bearer) {
+  if (!bearer) return null;
+  const base = xMonitorQuery(symbol, address);
+  const query = `${base} -is:retweet`;
+  const url = `https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(query)}&max_results=50&expansions=author_id&user.fields=verified,public_metrics`;
+  try {
+    const res = await fetch(url, { headers: { authorization: `Bearer ${bearer}` } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const tweetCount = Array.isArray(json.data) ? json.data.length : 0;
+    const users = json.includes?.users ?? [];
+    const notableAuthors = users.filter((u) => {
+      const followers = asNumber(u.public_metrics?.followers_count) ?? 0;
+      return u.verified === true || followers >= 1e4;
+    }).map((u) => `@${String(u.username ?? "")}`).filter((h) => h.length > 1).slice(0, 5);
+    return { tweetCount, notableAuthors, query: base };
+  } catch {
+    return null;
+  }
 }
 
 // lib/watchAlerts.ts
@@ -1766,13 +1801,23 @@ async function handle(msg) {
       return unwatchToken(msg.address);
     case "GET_WATCHLIST":
       return { ok: true, watchlist: await loadWatchlist() };
-    case "GET_SETTINGS":
+    case "GET_SETTINGS": {
       await loadSettings();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+      const s = getSettings();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+    }
     case "SET_SETTINGS": {
-      await setSettings({ heliusKey: msg.heliusKey });
-      cache.clear();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+      const patch = {};
+      if ("heliusKey" in msg) patch.heliusKey = msg.heliusKey ?? null;
+      if ("xBearerToken" in msg) patch.xBearerToken = msg.xBearerToken ?? null;
+      await setSettings(patch);
+      if ("heliusKey" in msg) cache.clear();
+      const s = getSettings();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+    }
+    case "CHECK_X": {
+      const buzz = await fetchXBuzz(msg.symbol, msg.address, xBearerToken());
+      return { ok: true, buzz, hasToken: hasX() };
     }
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };

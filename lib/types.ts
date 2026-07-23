@@ -285,7 +285,8 @@ export type BgRequest =
   | { type: 'UNWATCH_TOKEN'; address: string }
   | { type: 'GET_WATCHLIST' }
   | { type: 'GET_SETTINGS' }
-  | { type: 'SET_SETTINGS'; heliusKey: string | null };
+  | { type: 'SET_SETTINGS'; heliusKey?: string | null; xBearerToken?: string | null }
+  | { type: 'CHECK_X'; symbol: string | null; address: string };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; quality: QualityResult; mock: boolean }
@@ -329,7 +330,13 @@ export type LiveFeedResponse =
 
 export type WatchlistResponse = { ok: true; watchlist: WatchedCoin[] } | { ok: false; error: string };
 
-export type SettingsResponse = { ok: true; hasHelius: boolean; heliusKeySet: boolean } | { ok: false; error: string };
+export type SettingsResponse =
+  | { ok: true; hasHelius: boolean; heliusKeySet: boolean; hasX: boolean; xTokenSet: boolean }
+  | { ok: false; error: string };
+
+export type XBuzzResponse =
+  | { ok: true; buzz: { tweetCount: number; notableAuthors: string[]; query: string } | null; hasToken: boolean }
+  | { ok: false; error: string };
 
 export type ResolvePairsResponse =
   | { ok: true; tokens: Record<string, { address: string; symbol: string | null }> }

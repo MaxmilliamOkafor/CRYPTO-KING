@@ -10,7 +10,8 @@
     "https://api.dexscreener.com/*",
     "https://api.mainnet-beta.solana.com/*",
     "https://*.helius-rpc.com/*",
-    "https://api.rugcheck.xyz/*"
+    "https://api.rugcheck.xyz/*",
+    "https://api.twitter.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

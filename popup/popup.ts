@@ -38,11 +38,18 @@ function initSettings(): void {
   const status = $('turbo-status');
   const msg = $('settings-msg');
 
+  const xInput = $('x-token') as HTMLInputElement;
+  const xStatus = $('x-status');
+  const xMsg = $('x-msg');
+
   const paint = (res: SettingsResponse | undefined) => {
-    const on = !!res && res.ok && res.hasHelius;
-    status.textContent = on ? 'ON' : 'off';
-    status.className = on ? 'turbo-on' : 'turbo-off';
-    if (on) input.placeholder = 'Helius key saved ✓ (paste a new one to change)';
+    if (!res || !res.ok) return;
+    status.textContent = res.hasHelius ? 'ON' : 'off';
+    status.className = res.hasHelius ? 'turbo-on' : 'turbo-off';
+    if (res.hasHelius) input.placeholder = 'Helius key saved ✓ (paste a new one to change)';
+    xStatus.textContent = res.hasX ? 'ON' : 'off';
+    xStatus.className = res.hasX ? 'turbo-on' : 'turbo-off';
+    if (res.hasX) xInput.placeholder = 'X token saved ✓ (paste a new one to change)';
   };
 
   chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }, paint);
@@ -63,6 +70,23 @@ function initSettings(): void {
         ? '⚡ Turbo ON — scanning 3× more coins, faster. Re-scan of everything started.'
         : 'Key cleared — back to the free public RPC.';
       msg.className = 'settings-msg ok';
+    });
+  });
+
+  $('save-x').addEventListener('click', () => {
+    const token = xInput.value.trim();
+    xMsg.textContent = 'Saving…';
+    xMsg.className = 'settings-msg';
+    chrome.runtime.sendMessage({ type: 'SET_SETTINGS', xBearerToken: token || null }, (res: SettingsResponse | undefined) => {
+      if (chrome.runtime.lastError || !res || !res.ok) {
+        xMsg.textContent = 'Could not save.';
+        xMsg.className = 'settings-msg err';
+        return;
+      }
+      xInput.value = '';
+      paint(res);
+      xMsg.textContent = res.hasX ? '𝕏 automated buzz ON.' : 'X token cleared — live search still works.';
+      xMsg.className = 'settings-msg ok';
     });
   });
 }

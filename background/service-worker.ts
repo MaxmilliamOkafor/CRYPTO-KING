@@ -30,9 +30,12 @@ import {
   effectiveScanBudget,
   getSettings,
   hasHelius,
+  hasX,
   loadSettings,
   setSettings,
+  xBearerToken,
 } from '../lib/settings.ts';
+import { fetchXBuzz } from '../lib/twitterClient.ts';
 import { computeWatchAlerts } from '../lib/watchAlerts.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
@@ -53,6 +56,7 @@ import type {
   WatchedCoin,
   WatchlistResponse,
   WatchSnapshot,
+  XBuzzResponse,
 } from '../lib/types.ts';
 
 const RECENT_KEY = 'ck:recent';
@@ -80,7 +84,13 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
 async function handle(
   msg: BgRequest,
 ): Promise<
-  AnalyzeResponse | RecentResponse | LiveFeedResponse | ResolvePairsResponse | WatchlistResponse | SettingsResponse
+  | AnalyzeResponse
+  | RecentResponse
+  | LiveFeedResponse
+  | ResolvePairsResponse
+  | WatchlistResponse
+  | SettingsResponse
+  | XBuzzResponse
 > {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
@@ -104,13 +114,23 @@ async function handle(
       return unwatchToken(msg.address);
     case 'GET_WATCHLIST':
       return { ok: true, watchlist: await loadWatchlist() };
-    case 'GET_SETTINGS':
+    case 'GET_SETTINGS': {
       await loadSettings();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+      const s = getSettings();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+    }
     case 'SET_SETTINGS': {
-      await setSettings({ heliusKey: msg.heliusKey });
-      cache.clear(); // re-scan everything through the new RPC
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(getSettings().heliusKey) };
+      const patch: { heliusKey?: string | null; xBearerToken?: string | null } = {};
+      if ('heliusKey' in msg) patch.heliusKey = msg.heliusKey ?? null;
+      if ('xBearerToken' in msg) patch.xBearerToken = msg.xBearerToken ?? null;
+      await setSettings(patch);
+      if ('heliusKey' in msg) cache.clear(); // RPC changed → re-scan everything
+      const s = getSettings();
+      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+    }
+    case 'CHECK_X': {
+      const buzz = await fetchXBuzz(msg.symbol, msg.address, xBearerToken());
+      return { ok: true, buzz, hasToken: hasX() };
     }
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };

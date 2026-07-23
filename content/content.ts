@@ -201,6 +201,9 @@ const STYLES = `
   .x-link { color: #7aa2ff; text-decoration: none; font-size: 12px; }
   .x-link:hover { text-decoration: underline; }
   .x-warn { color: #ffb076; font-size: 11px; }
+  .x-icon { flex: none; text-decoration: none; font-size: 13px; padding: 3px 5px; border-radius: 6px; color: #8a91a0; }
+  .x-icon.has { color: #7aa2ff; }
+  .x-icon:hover { background: #2a2f3e; color: #fff; }
   .rug-banner { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 8px; margin-bottom: 8px; font-size: 11.5px; }
   .rug-banner span { font-weight: 400; opacity: .92; }
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
@@ -629,6 +632,7 @@ function updateScanList(): void {
             <span class="si-sym">${esc(sym)}${rugTag}${isReplica ? '<span class="replica">COPYCAT?</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          ${xIconLink(null, r.symbol, r.address)}
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
         </div>`;
     })
@@ -787,6 +791,7 @@ function updateLiveList(): void {
               ${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ''}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          ${xIconLink(r.twitter, r.symbol, r.address)}
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
         </div>`;
     })
@@ -852,6 +857,16 @@ function fmtPrice(v: number): string {
   return zeros >= 4 ? `$0.0(${zeros})${m[2]}` : `$0.${m[1]}${m[2]}`;
 }
 
+/** A tiny 𝕏 link per row: the coin's own account if it has one, else a live
+ *  cashtag search — one click, no typing, no card needed. */
+function xIconLink(twitter: string | null, symbol: string | null, address: string): string {
+  if (twitter) {
+    const url = twitter.startsWith('http') ? twitter : `https://x.com/${twitter.replace(/^@/, '')}`;
+    return `<a class="x-icon has" href="${esc(url)}" target="_blank" rel="noreferrer" title="Open this coin's X account">𝕏</a>`;
+  }
+  return `<a class="x-icon" href="${esc(xSearchUrl(xMonitorQuery(symbol, address), true))}" target="_blank" rel="noreferrer" title="No linked X — click to search live chatter on X">𝕏?</a>`;
+}
+
 function eurShort(v: number): string {
   if (v >= 1_000_000) return `€${(v / 1_000_000).toFixed(1)}M`;
   if (v >= 1_000) return `€${(v / 1_000).toFixed(0)}k`;
@@ -871,6 +886,10 @@ function wireRowHandlers(list: HTMLElement): void {
       e.stopPropagation();
       copyToClipboard(btn.getAttribute('data-copy') ?? '', btn);
     });
+  });
+  // The 𝕏 link opens X in a new tab; don't also trigger the row's scan.
+  list.querySelectorAll<HTMLElement>('.x-icon').forEach((a) => {
+    a.addEventListener('click', (e) => e.stopPropagation());
   });
 }
 

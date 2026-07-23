@@ -257,6 +257,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       rugVerdict: rug.verdict,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
+      twitter: entry.analysis.socials?.twitter ?? null,
       insufficientData: entry.risk.insufficientData,
       unverified:
         entry.analysis.holders === null ||

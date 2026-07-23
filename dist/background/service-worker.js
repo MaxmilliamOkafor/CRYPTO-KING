@@ -1930,6 +1930,7 @@ async function doLiveFeedSweep() {
       rugVerdict: rug.verdict,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
+      twitter: entry.analysis.socials?.twitter ?? null,
       insufficientData: entry.risk.insufficientData,
       unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()

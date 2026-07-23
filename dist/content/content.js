@@ -703,6 +703,9 @@ var STYLES = `
   .x-link { color: #7aa2ff; text-decoration: none; font-size: 12px; }
   .x-link:hover { text-decoration: underline; }
   .x-warn { color: #ffb076; font-size: 11px; }
+  .x-icon { flex: none; text-decoration: none; font-size: 13px; padding: 3px 5px; border-radius: 6px; color: #8a91a0; }
+  .x-icon.has { color: #7aa2ff; }
+  .x-icon:hover { background: #2a2f3e; color: #fff; }
   .rug-banner { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px; border-radius: 8px; margin-bottom: 8px; font-size: 11.5px; }
   .rug-banner span { font-weight: 400; opacity: .92; }
   .watch-btn { color: #ffc83c; font-size: 12px; padding: 2px 6px; border: 1px solid #4d3f1e; border-radius: 6px; }
@@ -1080,6 +1083,7 @@ function updateScanList() {
             <span class="si-sym">${esc(sym)}${rugTag}${isReplica ? '<span class="replica">COPYCAT?</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          ${xIconLink(null, r.symbol, r.address)}
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
         </div>`;
   }).join("");
@@ -1195,6 +1199,7 @@ function updateLiveList() {
               ${r.unverified && !r.insufficientData ? '<span class="uv">PARTIAL</span>' : ""}</span>
             <span class="si-reason">${esc(reason)}</span>
           </span>
+          ${xIconLink(r.twitter, r.symbol, r.address)}
           <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
         </div>`;
   }).join("");
@@ -1249,6 +1254,13 @@ function fmtPrice(v) {
   const zeros = m[1].length;
   return zeros >= 4 ? `$0.0(${zeros})${m[2]}` : `$0.${m[1]}${m[2]}`;
 }
+function xIconLink(twitter, symbol, address) {
+  if (twitter) {
+    const url = twitter.startsWith("http") ? twitter : `https://x.com/${twitter.replace(/^@/, "")}`;
+    return `<a class="x-icon has" href="${esc(url)}" target="_blank" rel="noreferrer" title="Open this coin's X account">\u{1D54F}</a>`;
+  }
+  return `<a class="x-icon" href="${esc(xSearchUrl(xMonitorQuery(symbol, address), true))}" target="_blank" rel="noreferrer" title="No linked X \u2014 click to search live chatter on X">\u{1D54F}?</a>`;
+}
 function eurShort(v) {
   if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(1)}M`;
   if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
@@ -1266,6 +1278,9 @@ function wireRowHandlers(list) {
       e.stopPropagation();
       copyToClipboard(btn.getAttribute("data-copy") ?? "", btn);
     });
+  });
+  list.querySelectorAll(".x-icon").forEach((a) => {
+    a.addEventListener("click", (e) => e.stopPropagation());
   });
 }
 function copyToClipboard(text, btn) {

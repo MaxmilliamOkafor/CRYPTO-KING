@@ -318,6 +318,8 @@ export interface FeedRow {
   graduated: boolean | null;
   /** Informational narrative tags (never scored). */
   narratives: string[];
+  /** The coin's linked X/Twitter (handle or URL), auto-detected — null if none. */
+  twitter: string | null;
   insufficientData: boolean;
   /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
   unverified: boolean;

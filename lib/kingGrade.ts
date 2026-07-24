@@ -49,19 +49,27 @@ export function computeKingGrade(a: TokenAnalysis, risk: RiskResult, quality: Qu
   const coveragePct = (checks.filter(Boolean).length / checks.length) * 100;
 
   const safety = 100 - risk.riskScore;
-  const raw =
-    KING_GRADE.safetyWeight * safety +
-    KING_GRADE.qualityWeight * quality.qualityScore +
-    KING_GRADE.coverageWeight * coveragePct;
-  let grade = Math.round(Math.min(100, Math.max(0, raw)));
+  const raw = Math.min(
+    100,
+    Math.max(
+      0,
+      KING_GRADE.safetyWeight * safety +
+        KING_GRADE.qualityWeight * quality.qualityScore +
+        KING_GRADE.coverageWeight * coveragePct,
+    ),
+  );
 
-  /* Hard caps — strictness lives here. Worst applicable cap wins. */
+  /* Ceiling — strictness lives here. The LOWEST applicable cap is the binding
+   * ceiling. But rather than hard-clamping every capped coin to the exact cap
+   * (which pins a whole wave of fresh launches to the same number), coins that
+   * exceed the ceiling are ranked into a band JUST BELOW it: better coins sit
+   * near the ceiling, weaker ones lower — so they stay distinguishable while
+   * still never claiming more safety than the cap allows. */
   const caps: string[] = [];
-  const cap = (limit: number, why: string) => {
-    if (grade > limit) {
-      grade = limit;
-      caps.push(`Capped at ${limit}%: ${why}`);
-    }
+  let ceiling = 100;
+  const applyCap = (limit: number, why: string) => {
+    if (limit < ceiling) ceiling = limit;
+    if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
   };
 
   const confirmedTrap =
@@ -72,17 +80,28 @@ export function computeKingGrade(a: TokenAnalysis, risk: RiskResult, quality: Qu
     a.mint?.defaultAccountFrozen === true ||
     a.market?.sellSimulation?.ok === false ||
     a.market?.lpStatus === 'deployer_held';
-  if (confirmedTrap) cap(KING_GRADE.caps.confirmedTrap, 'confirmed trap/rug mechanic present.');
-  if (risk.riskScore >= 60) cap(KING_GRADE.caps.highRisk, 'risk score 60+.');
+  if (confirmedTrap) applyCap(KING_GRADE.caps.confirmedTrap, 'confirmed trap/rug mechanic present.');
+  if (risk.riskScore >= 60) applyCap(KING_GRADE.caps.highRisk, 'risk score 60+.');
   if (a.launch?.bondingCurveComplete === false) {
-    cap(KING_GRADE.caps.onBondingCurve, 'still on the bonding curve — dev can dump any second.');
+    applyCap(KING_GRADE.caps.onBondingCurve, 'still on the bonding curve — dev can dump any second.');
   }
   if (!known(a.holders?.largestNonLpWalletPct) || a.market === null || a.market.lpStatus === 'unknown') {
-    cap(KING_GRADE.caps.partialData, 'holders/LP not verified yet — run the full scan.');
+    applyCap(KING_GRADE.caps.partialData, 'holders/LP not verified yet — run the full scan.');
   }
   if (!gemBackgroundCheck(a, risk, quality).gem) {
-    cap(KING_GRADE.caps.noGemPass, '80%+ is reserved for coins that pass the full background check.');
+    applyCap(KING_GRADE.caps.noGemPass, '80%+ is reserved for coins that pass the full background check.');
   }
+
+  let gradeF: number;
+  if (raw <= ceiling) {
+    gradeF = raw; // ceiling doesn't bind — use the real score
+  } else {
+    // Compress the overflow (ceiling, 100] into (ceiling-band, ceiling],
+    // preserving order so the strongest capped coins rank highest.
+    const band = Math.min(22, ceiling);
+    gradeF = ceiling - band + band * ((raw - ceiling) / (100 - ceiling));
+  }
+  const grade = Math.round(Math.min(ceiling, Math.max(0, gradeF)));
 
   return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
 }

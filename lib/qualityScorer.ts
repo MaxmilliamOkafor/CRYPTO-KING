@@ -20,6 +20,15 @@ import type { QualityResult, RiskReason, TokenAnalysis } from './types.ts';
 type QWeights = typeof QUALITY_WEIGHTS;
 type QLimits = typeof QUALITY_LIMITS;
 
+/** pump.fun graduation happens near ~$69k mcap; in EUR at the config rate. */
+const GRAD_CAP_EUR = 63_000;
+
+function fmtK(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(0)}k`;
+  return n.toFixed(0);
+}
+
 export function scoreQuality(a: TokenAnalysis, w: QWeights = QUALITY_WEIGHTS, l: QLimits = QUALITY_LIMITS): QualityResult {
   const reasons: RiskReason[] = [];
   const hit = (points: number, text: string) => reasons.push({ points, text });
@@ -103,13 +112,15 @@ export function scoreQuality(a: TokenAnalysis, w: QWeights = QUALITY_WEIGHTS, l:
   /* Launchpad graduation, curve traction & community */
   if (a.launch?.bondingCurveComplete === true) {
     hit(w.graduated, 'Graduated its bonding curve — survived the launchpad.');
-  } else if (
-    a.launch?.bondingCurveComplete === false &&
-    a.market?.marketCapEur !== null &&
-    a.market?.marketCapEur !== undefined &&
-    a.market.marketCapEur >= l.curveTractionMinEur
-  ) {
-    hit(w.curveTraction, `Real buyer traction on the curve (€${Math.round(a.market.marketCapEur / 1000)}k cap).`);
+  } else if (a.launch?.bondingCurveComplete === false && a.market?.marketCapEur != null) {
+    // GRADED traction so fresh on-curve coins differ by real early momentum
+    // (a coin climbing toward graduation ranks above a dead-on-arrival $2k
+    // launch). Scales continuously with progress toward the graduation cap.
+    const progress = Math.min(1, a.market.marketCapEur / GRAD_CAP_EUR);
+    const pts = Math.round(w.curveTraction * progress);
+    if (pts > 0) {
+      hit(pts, `Curve traction: €${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
+    }
   }
   if (a.launch?.replyCount !== null && a.launch?.replyCount !== undefined && a.launch.replyCount >= l.minReplies) {
     hit(w.communityActivity, `Active launchpad community (${a.launch.replyCount} comments).`);

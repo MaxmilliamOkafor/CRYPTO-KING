@@ -335,11 +335,31 @@ test('King Grade: QUOKKA grades 98% GEM GRADE (only deployer history unchecked)'
   assert.equal(kg.caps.length, 0);
 });
 
-test('King Grade: RUGKING is hard-capped at 10% (confirmed trap mechanics)', () => {
+test('King Grade: RUGKING sits at/below the 10% trap ceiling (band-ranked, AVOID)', () => {
   const kg = computeKingGrade(FIXTURE_AVOID, scoreToken(FIXTURE_AVOID), scoreQuality(FIXTURE_AVOID));
-  assert.equal(kg.grade, 10);
+  assert.ok(kg.grade !== null && kg.grade <= 10, `expected ≤10, got ${kg.grade}`);
   assert.equal(kg.label, 'AVOID');
   assert.ok(kg.caps.some((c) => /confirmed trap/.test(c)));
+});
+
+test('King Grade: band-ranking spreads two same-ceiling fresh coins apart', () => {
+  // Both still on the bonding curve (ceiling 40) but different market-cap
+  // traction → they must NOT collapse to the same grade.
+  const mk = (mcapEur: number): TokenAnalysis => {
+    const t = structuredClone(FIXTURE_NEUTRAL);
+    t.identity = { ...t.identity, ageMinutes: 3 };
+    t.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false, replyCount: 0 };
+    t.market = { ...t.market!, marketCapEur: mcapEur, lpStatus: 'unknown' };
+    t.socials = null;
+    t.smartMoney = null;
+    return t;
+  };
+  const low = mk(2_000);
+  const high = mk(45_000);
+  const gLow = computeKingGrade(low, scoreToken(low), scoreQuality(low)).grade ?? 0;
+  const gHigh = computeKingGrade(high, scoreToken(high), scoreQuality(high)).grade ?? 0;
+  assert.ok(gHigh > gLow, `traction should rank higher: ${gHigh} vs ${gLow}`);
+  assert.ok(gHigh <= 40 && gLow <= 40, 'both stay under the bonding-curve ceiling');
 });
 
 test('King Grade: WIFCAT lands mid-field (56% MIXED) — real differentiation', () => {

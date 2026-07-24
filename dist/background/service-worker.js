@@ -913,27 +913,39 @@ function computeKingGrade(a, risk, quality) {
   ];
   const coveragePct = checks.filter(Boolean).length / checks.length * 100;
   const safety = 100 - risk.riskScore;
-  const raw = KING_GRADE.safetyWeight * safety + KING_GRADE.qualityWeight * quality.qualityScore + KING_GRADE.coverageWeight * coveragePct;
-  let grade = Math.round(Math.min(100, Math.max(0, raw)));
+  const raw = Math.min(
+    100,
+    Math.max(
+      0,
+      KING_GRADE.safetyWeight * safety + KING_GRADE.qualityWeight * quality.qualityScore + KING_GRADE.coverageWeight * coveragePct
+    )
+  );
   const caps = [];
-  const cap = (limit, why) => {
-    if (grade > limit) {
-      grade = limit;
-      caps.push(`Capped at ${limit}%: ${why}`);
-    }
+  let ceiling = 100;
+  const applyCap = (limit, why) => {
+    if (limit < ceiling) ceiling = limit;
+    if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
-  if (confirmedTrap) cap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
-  if (risk.riskScore >= 60) cap(KING_GRADE.caps.highRisk, "risk score 60+.");
+  if (confirmedTrap) applyCap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
+  if (risk.riskScore >= 60) applyCap(KING_GRADE.caps.highRisk, "risk score 60+.");
   if (a.launch?.bondingCurveComplete === false) {
-    cap(KING_GRADE.caps.onBondingCurve, "still on the bonding curve \u2014 dev can dump any second.");
+    applyCap(KING_GRADE.caps.onBondingCurve, "still on the bonding curve \u2014 dev can dump any second.");
   }
   if (!known(a.holders?.largestNonLpWalletPct) || a.market === null || a.market.lpStatus === "unknown") {
-    cap(KING_GRADE.caps.partialData, "holders/LP not verified yet \u2014 run the full scan.");
+    applyCap(KING_GRADE.caps.partialData, "holders/LP not verified yet \u2014 run the full scan.");
   }
   if (!gemBackgroundCheck(a, risk, quality).gem) {
-    cap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
+    applyCap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
   }
+  let gradeF;
+  if (raw <= ceiling) {
+    gradeF = raw;
+  } else {
+    const band = Math.min(22, ceiling);
+    gradeF = ceiling - band + band * ((raw - ceiling) / (100 - ceiling));
+  }
+  const grade = Math.round(Math.min(ceiling, Math.max(0, gradeF)));
   return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
 }
 function gradeLabel(grade) {
@@ -1144,6 +1156,12 @@ var EMPTY2 = {
 };
 
 // lib/qualityScorer.ts
+var GRAD_CAP_EUR = 63e3;
+function fmtK(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
+  return n.toFixed(0);
+}
 function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
   const reasons = [];
   const hit = (points, text) => reasons.push({ points, text });
@@ -1203,8 +1221,12 @@ function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
   }
   if (a.launch?.bondingCurveComplete === true) {
     hit(w.graduated, "Graduated its bonding curve \u2014 survived the launchpad.");
-  } else if (a.launch?.bondingCurveComplete === false && a.market?.marketCapEur !== null && a.market?.marketCapEur !== void 0 && a.market.marketCapEur >= l.curveTractionMinEur) {
-    hit(w.curveTraction, `Real buyer traction on the curve (\u20AC${Math.round(a.market.marketCapEur / 1e3)}k cap).`);
+  } else if (a.launch?.bondingCurveComplete === false && a.market?.marketCapEur != null) {
+    const progress = Math.min(1, a.market.marketCapEur / GRAD_CAP_EUR);
+    const pts = Math.round(w.curveTraction * progress);
+    if (pts > 0) {
+      hit(pts, `Curve traction: \u20AC${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
+    }
   }
   if (a.launch?.replyCount !== null && a.launch?.replyCount !== void 0 && a.launch.replyCount >= l.minReplies) {
     hit(w.communityActivity, `Active launchpad community (${a.launch.replyCount} comments).`);
@@ -1311,11 +1333,11 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
       if (market.liquidityEur < l.thinLiquidityEur && market.marketCapEur > l.thinLiqMcapEur) {
         hit(
           w.thinLiquidityVsMcap,
-          `Thin liquidity (\u20AC${fmtK(market.liquidityEur)}) vs. cap (\u20AC${fmtK(market.marketCapEur)}) \u2014 easy to manipulate.`
+          `Thin liquidity (\u20AC${fmtK2(market.liquidityEur)}) vs. cap (\u20AC${fmtK2(market.marketCapEur)}) \u2014 easy to manipulate.`
         );
       }
       if (market.marketCapEur < l.microMcapEur && lpSecured === false) {
-        hit(w.microMcapUnlockedLp, `Micro cap (\u20AC${fmtK(market.marketCapEur)}) with unsecured LP \u2014 high rug exposure.`);
+        hit(w.microMcapUnlockedLp, `Micro cap (\u20AC${fmtK2(market.marketCapEur)}) with unsecured LP \u2014 high rug exposure.`);
       }
     } else {
       gap("Liquidity/market-cap figures incomplete.");
@@ -1457,7 +1479,7 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
 function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, n));
 }
-function fmtK(n) {
+function fmtK2(n) {
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
   return n.toFixed(0);

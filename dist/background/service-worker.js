@@ -1,5 +1,6 @@
 // config.ts
 var MOCK_MODE = false;
+var DEBUG = false;
 var EUR_PER_USD = 1;
 var GMGN = {
   baseUrl: "https://gmgn.ai",
@@ -691,9 +692,11 @@ async function fetchPumpfunData(address) {
     symbol: asString(pick(json, ["symbol"])),
     name: asString(pick(json, ["name"])),
     ageMinutes: createdMs !== null ? Math.max(0, (Date.now() - createdMs) / 6e4) : null,
-    marketCapEur: usdToEur(asNumber(pick(json, ["usd_market_cap", "market_cap"]))),
+    // USD ONLY: pump.fun's `market_cap` is denominated in SOL — using it as USD
+    // was showing ~$30–70 for real coins. `usd_market_cap` is the dollar value.
+    marketCapEur: usdToEur(asNumber(pick(json, ["usd_market_cap", "market_cap_usd"]))),
     priceEur: derivePriceEur(
-      asNumber(pick(json, ["usd_market_cap", "market_cap"])),
+      asNumber(pick(json, ["usd_market_cap", "market_cap_usd"])),
       asNumber(pick(json, ["total_supply"]))
     ),
     bondingCurveComplete: asBoolLoose(pick(json, ["complete"])),
@@ -837,6 +840,32 @@ async function fetchPairBaseTokens(pairAddresses) {
     }
   }
   return out;
+}
+async function fetchDexscreenerToken(mint) {
+  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE2.test(mint)) return null;
+  const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  const pairs = json?.pairs;
+  if (!Array.isArray(pairs) || pairs.length === 0) return null;
+  let best = null;
+  let bestLiq = -1;
+  for (const p of pairs) {
+    if (asString(pick(p, ["chainId"])) !== "solana") continue;
+    const liq = asNumber(pick(p, ["liquidity.usd"])) ?? 0;
+    if (liq > bestLiq) {
+      bestLiq = liq;
+      best = p;
+    }
+  }
+  if (!best) return null;
+  return {
+    priceUsd: asNumber(pick(best, ["priceUsd"])),
+    marketCapUsd: asNumber(pick(best, ["marketCap", "fdv"])),
+    liquidityUsd: asNumber(pick(best, ["liquidity.usd"])),
+    volume24hUsd: asNumber(pick(best, ["volume.h24"])),
+    symbol: asString(pick(best, ["baseToken.symbol"])),
+    name: asString(pick(best, ["baseToken.name"])),
+    pairCreatedMs: asNumber(pick(best, ["pairCreatedAt"]))
+  };
 }
 async function fetchDexscreenerNewSolana(limit) {
   if (MOCK_MODE || !DEXSCREENER.enabled) return [];
@@ -2005,20 +2034,30 @@ async function doAnalyze(address, rawGmgn, lite = false) {
   try {
     const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : lite && !MOCK_MODE ? Promise.resolve(emptyGmgnData()) : fetchGmgnData(address);
     const pumpfun = await fetchPumpfunData(address);
-    const [gmgn, solana, audit] = await Promise.all([
+    const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
       fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator),
-      rugcheckAdapter.fetchAudit(address)
+      rugcheckAdapter.fetchAudit(address),
+      lite ? Promise.resolve(null) : fetchDexscreenerToken(address)
     ]);
     let deployerHist = lite ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator) : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
     deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
-    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, {
+    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, {
       gmgn: gmgn.status,
       solana: solana.status,
       pumpfun: pumpfun.status,
       rugcheck: audit.status,
       deployer: deployerHist.status
     });
+    if (DEBUG) {
+      console.log("[CRYPTO-KING] merged analysis", address, {
+        market: analysis.market,
+        pumpfunMcap: pumpfun.marketCapEur,
+        dexMarket,
+        mint: analysis.mint,
+        holders: analysis.holders
+      });
+    }
     const risk = scoreToken(analysis);
     const quality = scoreQuality(analysis);
     cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
@@ -2029,7 +2068,7 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     return { ok: false, error: "Analysis failed \u2014 data unavailable." };
   }
 }
-function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, sources) {
+function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, dexMarket, sources) {
   let mint = solana.mint;
   if (!mint && (gmgn.mintRenounced !== null || gmgn.freezeRenounced !== null || gmgn.taxBps !== null)) {
     mint = {
@@ -2064,12 +2103,12 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, s
   } : null;
   const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== "unknown" ? gmgn.lpStatus : auditLpStatus ?? gmgn.lpStatus ?? "unknown";
   const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
-  const hasMarket = gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== "unknown";
+  const hasMarket = dexMarket !== null || gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== "unknown";
   const market = hasMarket ? {
-    priceEur: gmgn.priceEur ?? pumpfun.priceEur,
-    marketCapEur: gmgn.marketCapEur ?? pumpfun.marketCapEur,
-    liquidityEur: gmgn.liquidityEur,
-    volume24hEur: gmgn.volume24hEur,
+    priceEur: dexMarket?.priceUsd ?? gmgn.priceEur ?? pumpfun.priceEur,
+    marketCapEur: dexMarket?.marketCapUsd ?? gmgn.marketCapEur ?? pumpfun.marketCapEur,
+    liquidityEur: dexMarket?.liquidityUsd ?? gmgn.liquidityEur,
+    volume24hEur: dexMarket?.volume24hUsd ?? gmgn.volume24hEur,
     lpStatus,
     sellSimulation
   } : null;

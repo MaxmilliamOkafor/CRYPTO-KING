@@ -8,7 +8,7 @@
  */
 
 import { DEXSCREENER, MOCK_MODE } from '../config.ts';
-import { asString, fetchJson, pick } from './http.ts';
+import { asNumber, asString, fetchJson, pick } from './http.ts';
 
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
@@ -37,6 +37,54 @@ export async function fetchPairBaseTokens(
     }
   }
   return out;
+}
+
+/** Authoritative market data for a token from DexScreener (USD, matches the site). */
+export interface DexTokenMarket {
+  priceUsd: number | null;
+  marketCapUsd: number | null;
+  liquidityUsd: number | null;
+  volume24hUsd: number | null;
+  symbol: string | null;
+  name: string | null;
+  pairCreatedMs: number | null;
+}
+
+/**
+ * Reliable price/market-cap/liquidity for a token, straight from DexScreener's
+ * token endpoint (returns `priceUsd`, `marketCap`, `liquidity.usd` directly —
+ * no derivation, matches what the sites show). Picks the deepest-liquidity
+ * Solana pair. null when the token isn't listed on any DEX yet (fresh pump
+ * coins on the bonding curve) or on failure.
+ */
+export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarket | null> {
+  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE.test(mint)) return null;
+  const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  const pairs = (json as { pairs?: unknown[] } | null)?.pairs;
+  if (!Array.isArray(pairs) || pairs.length === 0) return null;
+
+  // Deepest Solana pair = the canonical market for the token.
+  let best: unknown = null;
+  let bestLiq = -1;
+  for (const p of pairs) {
+    if (asString(pick(p, ['chainId'])) !== 'solana') continue;
+    const liq = asNumber(pick(p, ['liquidity.usd'])) ?? 0;
+    if (liq > bestLiq) {
+      bestLiq = liq;
+      best = p;
+    }
+  }
+  if (!best) return null;
+
+  return {
+    priceUsd: asNumber(pick(best, ['priceUsd'])),
+    marketCapUsd: asNumber(pick(best, ['marketCap', 'fdv'])),
+    liquidityUsd: asNumber(pick(best, ['liquidity.usd'])),
+    volume24hUsd: asNumber(pick(best, ['volume.h24'])),
+    symbol: asString(pick(best, ['baseToken.symbol'])),
+    name: asString(pick(best, ['baseToken.name'])),
+    pairCreatedMs: asNumber(pick(best, ['pairCreatedAt'])),
+  };
 }
 
 /** Fresh Solana token mint addresses from DexScreener's latest profiles. [] on failure. */

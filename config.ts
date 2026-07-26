@@ -22,6 +22,14 @@ import type { Signal } from './lib/types.ts';
  */
 export const MOCK_MODE = false;
 
+/**
+ * true = log every source's raw response + the merged analysis to the SERVICE
+ * WORKER console (chrome://extensions → CRYPTO-KING → "service worker"). Turn
+ * this on to see exactly what each API returned and pin any value that doesn't
+ * match the site — then correct the field mapping in the matching lib/*Client.
+ */
+export const DEBUG = false;
+
 /** Display currency. Meme markets (pump.fun/GMGN/DexScreener) quote in USD, so
  *  we display native USD to MATCH the sites exactly — no conversion drift. */
 export const DISPLAY_CURRENCY = 'USD' as const;

@@ -14,9 +14,14 @@
  * Read-only by design: no keys, no wallets, no signing, no trading.
  */
 
-import { CACHE_TTL_MS, EUR_PER_USD, LIVE_FEED, MOCK_MODE, RECENT_MAX, WATCHLIST } from '../config.ts';
+import { CACHE_TTL_MS, DEBUG, EUR_PER_USD, LIVE_FEED, MOCK_MODE, RECENT_MAX, WATCHLIST } from '../config.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
-import { fetchDexscreenerNewSolana, fetchPairBaseTokens } from '../lib/dexscreenerClient.ts';
+import {
+  fetchDexscreenerNewSolana,
+  fetchDexscreenerToken,
+  fetchPairBaseTokens,
+  type DexTokenMarket,
+} from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade } from '../lib/kingGrade.ts';
 import { matchNarratives } from '../lib/narratives.ts';
@@ -348,10 +353,14 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     // (excluded from concentration math so the curve doesn't read as a whale).
     const pumpfun = await fetchPumpfunData(address);
     // Remaining adapters degrade to honest "unavailable" internally; Promise.all is safe.
-    const [gmgn, solana, audit] = await Promise.all([
+    // DexScreener gives authoritative USD price/mcap/liquidity for LISTED coins —
+    // fetched only on full scans (fresh on-curve coins aren't listed yet, and it
+    // keeps the lite feed sweep fast).
+    const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
       fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator),
       rugcheckAdapter.fetchAudit(address),
+      lite ? Promise.resolve(null) : fetchDexscreenerToken(address),
     ]);
     // Full scans check the creator's launch history (serial-deployer signal);
     // lite feed sweeps skip it to stay within the per-poll budget. Either way,
@@ -361,7 +370,7 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
       : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
     deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
 
-    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, {
+    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, {
       gmgn: gmgn.status,
       solana: solana.status,
       pumpfun: pumpfun.status,
@@ -369,6 +378,15 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
       deployer: deployerHist.status,
     });
 
+    if (DEBUG) {
+      console.log('[CRYPTO-KING] merged analysis', address, {
+        market: analysis.market,
+        pumpfunMcap: pumpfun.marketCapEur,
+        dexMarket,
+        mint: analysis.mint,
+        holders: analysis.holders,
+      });
+    }
     const risk = scoreToken(analysis);
     const quality = scoreQuality(analysis);
     cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
@@ -391,6 +409,7 @@ function mergeSources(
   pumpfun: PumpfunData,
   auditLpStatus: MarketInfo['lpStatus'] | null,
   deployer: TokenAnalysis['deployer'],
+  dexMarket: DexTokenMarket | null,
   sources: TokenAnalysis['sources'],
 ): TokenAnalysis {
   // In mock mode the fixture IS the truth — the mock adapters all slice the
@@ -447,14 +466,21 @@ function mergeSources(
         : gmgn.isHoneypot === false
           ? { ok: true, slippagePct: null }
           : null;
+  // Market data precedence for price/mcap/liquidity: DexScreener first — it
+  // returns authoritative USD values that MATCH the sites (no derivation) — then
+  // GMGN (same-origin), then pump.fun (derived). Values are USD (EUR_PER_USD=1).
   const hasMarket =
-    gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== 'unknown';
+    dexMarket !== null ||
+    gmgn.marketCapEur !== null ||
+    gmgn.liquidityEur !== null ||
+    pumpfun.marketCapEur !== null ||
+    lpStatus !== 'unknown';
   const market: MarketInfo | null = hasMarket
     ? {
-        priceEur: gmgn.priceEur ?? pumpfun.priceEur,
-        marketCapEur: gmgn.marketCapEur ?? pumpfun.marketCapEur,
-        liquidityEur: gmgn.liquidityEur,
-        volume24hEur: gmgn.volume24hEur,
+        priceEur: dexMarket?.priceUsd ?? gmgn.priceEur ?? pumpfun.priceEur,
+        marketCapEur: dexMarket?.marketCapUsd ?? gmgn.marketCapEur ?? pumpfun.marketCapEur,
+        liquidityEur: dexMarket?.liquidityUsd ?? gmgn.liquidityEur,
+        volume24hEur: dexMarket?.volume24hUsd ?? gmgn.volume24hEur,
         lpStatus,
         sellSimulation,
       }

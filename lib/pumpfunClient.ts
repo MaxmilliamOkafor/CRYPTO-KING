@@ -77,9 +77,11 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
     symbol: asString(pick(json, ['symbol'])),
     name: asString(pick(json, ['name'])),
     ageMinutes: createdMs !== null ? Math.max(0, (Date.now() - createdMs) / 60_000) : null,
-    marketCapEur: usdToEur(asNumber(pick(json, ['usd_market_cap', 'market_cap']))),
+    // USD ONLY: pump.fun's `market_cap` is denominated in SOL — using it as USD
+    // was showing ~$30–70 for real coins. `usd_market_cap` is the dollar value.
+    marketCapEur: usdToEur(asNumber(pick(json, ['usd_market_cap', 'market_cap_usd']))),
     priceEur: derivePriceEur(
-      asNumber(pick(json, ['usd_market_cap', 'market_cap'])),
+      asNumber(pick(json, ['usd_market_cap', 'market_cap_usd'])),
       asNumber(pick(json, ['total_supply'])),
     ),
     bondingCurveComplete: asBoolLoose(pick(json, ['complete'])),

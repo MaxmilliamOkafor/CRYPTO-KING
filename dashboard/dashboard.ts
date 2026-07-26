@@ -215,13 +215,13 @@ function short(addr: string): string {
 
 function eur(v: number | null): string {
   if (v === null) return '—';
-  if (v >= 1_000_000) return `€${(v / 1_000_000).toFixed(2)}M`;
-  if (v >= 1_000) return `€${(v / 1_000).toFixed(0)}k`;
-  return `€${v.toFixed(2)}`;
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}k`;
+  return `$${v.toFixed(2)}`;
 }
 
 function fmtPrice(v: number): string {
-  return `€${v < 0.01 ? v.toFixed(8) : v.toFixed(4)}`;
+  return `$${v < 0.01 ? v.toFixed(8) : v.toFixed(4)}`;
 }
 
 function age(minutes: number | null): string {

@@ -1274,9 +1274,9 @@ function xIconLink(twitter, symbol, address) {
   return `<a class="x-icon" href="${esc(xSearchUrl(xMonitorQuery(symbol, address), true))}" target="_blank" rel="noreferrer" title="No linked X \u2014 click to search live chatter on X">\u{1D54F}?</a>`;
 }
 function eurShort(v) {
-  if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(1)}M`;
-  if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
-  return `\u20AC${v.toFixed(0)}`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}k`;
+  return `$${v.toFixed(0)}`;
 }
 function wireRowHandlers(list) {
   list.querySelectorAll(".scan-item").forEach((el) => {

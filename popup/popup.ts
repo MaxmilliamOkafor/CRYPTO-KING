@@ -299,9 +299,9 @@ function reasonLi(points: string, text: string, cls: 'bad' | 'good'): HTMLLIElem
 
 function eur(v: number | null | undefined): string {
   if (v == null) return 'unknown';
-  if (v >= 1_000_000) return `€${(v / 1_000_000).toFixed(2)}M`;
-  if (v >= 1_000) return `€${(v / 1_000).toFixed(0)}k`;
-  return `€${v.toFixed(v < 1 ? 6 : 2)}`;
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}k`;
+  return `$${v.toFixed(v < 1 ? 6 : 2)}`;
 }
 
 function pct(v: number | null | undefined): string {

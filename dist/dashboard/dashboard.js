@@ -194,12 +194,12 @@ function short(addr) {
 }
 function eur(v) {
   if (v === null) return "\u2014";
-  if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(2)}M`;
-  if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
-  return `\u20AC${v.toFixed(2)}`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}k`;
+  return `$${v.toFixed(2)}`;
 }
 function fmtPrice(v) {
-  return `\u20AC${v < 0.01 ? v.toFixed(8) : v.toFixed(4)}`;
+  return `$${v < 0.01 ? v.toFixed(8) : v.toFixed(4)}`;
 }
 function age(minutes) {
   if (minutes === null) return "\u2014";

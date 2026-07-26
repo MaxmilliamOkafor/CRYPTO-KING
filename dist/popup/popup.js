@@ -422,9 +422,9 @@ function reasonLi(points, text, cls) {
 }
 function eur(v) {
   if (v == null) return "unknown";
-  if (v >= 1e6) return `\u20AC${(v / 1e6).toFixed(2)}M`;
-  if (v >= 1e3) return `\u20AC${(v / 1e3).toFixed(0)}k`;
-  return `\u20AC${v.toFixed(v < 1 ? 6 : 2)}`;
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}k`;
+  return `$${v.toFixed(v < 1 ? 6 : 2)}`;
 }
 function pct(v) {
   return v == null ? "unknown" : `${v.toFixed(0)}%`;

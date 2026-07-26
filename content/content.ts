@@ -868,9 +868,9 @@ function xIconLink(twitter: string | null, symbol: string | null, address: strin
 }
 
 function eurShort(v: number): string {
-  if (v >= 1_000_000) return `€${(v / 1_000_000).toFixed(1)}M`;
-  if (v >= 1_000) return `€${(v / 1_000).toFixed(0)}k`;
-  return `€${v.toFixed(0)}`;
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}k`;
+  return `$${v.toFixed(0)}`;
 }
 
 /** Row click = full scan; ⧉ = one-click copy of the mint address. */

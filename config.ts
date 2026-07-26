@@ -22,14 +22,17 @@ import type { Signal } from './lib/types.ts';
  */
 export const MOCK_MODE = false;
 
-/** Display currency. All fixture values and converted live values are EUR. */
-export const DISPLAY_CURRENCY = 'EUR' as const;
+/** Display currency. Meme markets (pump.fun/GMGN/DexScreener) quote in USD, so
+ *  we display native USD to MATCH the sites exactly — no conversion drift. */
+export const DISPLAY_CURRENCY = 'USD' as const;
 
 /**
- * Static USD→EUR conversion for live data (GMGN/pump.fun report USD).
- * Precision here only affects displayed € figures, never risk scores.
+ * Currency multiplier applied to source (USD) values. Kept at 1.0 so displayed
+ * numbers equal what you see on the sites. (Field names use an `Eur` suffix for
+ * historical reasons but the values are USD.) Change only if you deliberately
+ * want a different display currency — it never affects risk scores.
  */
-export const EUR_PER_USD = 0.92;
+export const EUR_PER_USD = 1;
 
 /* ────────────────────────────── Data sources ────────────────────────────── */
 

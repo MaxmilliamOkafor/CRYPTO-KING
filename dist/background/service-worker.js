@@ -1,6 +1,6 @@
 // config.ts
 var MOCK_MODE = false;
-var EUR_PER_USD = 0.92;
+var EUR_PER_USD = 1;
 var GMGN = {
   baseUrl: "https://gmgn.ai",
   endpoints: {

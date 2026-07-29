@@ -272,6 +272,7 @@ const STYLES = `
   .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 0 0 rgba(255,77,77,.6); animation: pulse 1.6s infinite; }
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,77,77,.6); } 70% { box-shadow: 0 0 0 6px rgba(255,77,77,0); } 100% { box-shadow: 0 0 0 0 rgba(255,77,77,0); } }
   .live-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
+  .grade-legend { color: #8fb3ff; background: #171d2b; border: 1px solid #2a3550; border-radius: 6px; padding: 5px 8px; font-size: 10.5px; margin: 4px 0; line-height: 1.4; }
   .livelist { max-height: 62vh; overflow-y: auto; margin: 0 -4px; }
   .safe-toggle { display: flex; align-items: center; gap: 4px; font-size: 10.5px; color: #8a91a0; cursor: pointer; }
   .safe-toggle input { accent-color: #2f6df6; }
@@ -368,6 +369,7 @@ function renderHome(): void {
         <span class="live-dot"></span>
         <span class="t">Live Solana launches — auto-scanning</span>
       </div>
+      <div class="grade-legend">All scores are <b>King Grade %</b> — <b>higher = safer/better</b> (100% = passed every audit). 80%+ = gem grade · &lt;40% = avoid. Never a buy signal.</div>
       <div class="live-controls">
         <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
         <label class="safe-toggle"><input type="checkbox" class="low-cap" /> low caps only</label>
@@ -485,8 +487,8 @@ interface ScanRow {
   address: string;
   symbol: string | null;
   name: string | null;
-  score: number;
-  signal: Signal;
+  /** King Grade 0–100% — higher = better, consistent with every other list. */
+  grade: number | null;
   topReason: string | null;
   rugVerdict: 'HIGH' | 'POSSIBLE' | 'LOW' | 'UNVERIFIED';
   insufficient: boolean;
@@ -550,13 +552,12 @@ async function scanPage(): Promise<void> {
               address: mint,
               symbol: res.analysis.identity.symbol ?? hint,
               name: res.analysis.identity.name,
-              score: res.risk.riskScore,
-              signal: res.risk.signal,
+              grade: computeKingGrade(res.analysis, res.risk, res.quality).grade,
               topReason: res.risk.reasons[0]?.text ?? null,
               rugVerdict: assessRugPotential(res.analysis, res.risk).verdict,
               insufficient: res.risk.insufficientData,
             }
-          : { address: mint, symbol: hint, name: null, score: 0, signal: 'NEUTRAL', topReason: null, rugVerdict: 'UNVERIFIED', insufficient: true },
+          : { address: mint, symbol: hint, name: null, grade: null, topReason: null, rugVerdict: 'UNVERIFIED', insufficient: true },
       );
       updateScanList();
     }
@@ -588,13 +589,17 @@ function updateScanList(): void {
 
   const replicas = replicaSymbols();
   const rows = [...pageScan.values()].sort((a, b) => {
-    // Worst first: insufficient-data last, otherwise highest risk score first.
+    // BEST first (highest King Grade), matching the live feed's direction;
+    // no-data rows last.
     if (a.insufficient !== b.insufficient) return a.insufficient ? 1 : -1;
-    return b.score - a.score;
+    return (b.grade ?? -1) - (a.grade ?? -1);
   });
 
   const replicaCount = rows.filter((r) => r.symbol && replicas.has(r.symbol.trim().toUpperCase())).length;
-  const avoid = rows.filter((r) => !r.insufficient && (r.signal === 'AVOID' || r.signal === 'HIGH_RISK')).length;
+  // Low grade OR a live rug vector = the ones to steer clear of.
+  const avoid = rows.filter(
+    (r) => !r.insufficient && ((r.grade !== null && r.grade < 40) || r.rugVerdict === 'HIGH'),
+  ).length;
   if (!scanning) {
     const parts: string[] = [];
     parts.push(rows.length ? `${rows.length} scanned` : '');
@@ -610,17 +615,20 @@ function updateScanList(): void {
 
   list.innerHTML = rows
     .map((r) => {
-      const meta = SIGNAL_META[r.signal];
+      // King Grade, same as every other list: HIGHER = BETTER. (This list used
+      // to show the raw risk score with risk labels — the opposite direction,
+      // which made 55 mean "risky" here and "decent" in the feed.)
       const isReplica = r.symbol && replicas.has(r.symbol.trim().toUpperCase());
-      const label = r.insufficient ? 'NO DATA' : `${r.score} ${meta.label}`;
-      const bg = r.insufficient ? '#3a3f4c' : meta.color;
-      const fg = r.insufficient ? '#e6e8ee' : meta.textColor;
+      const gc = gradeColors(r.grade);
+      const label = r.insufficient || r.grade === null ? 'NO DATA' : `${r.grade}% ${gradeLabel(r.grade)}`;
+      const bg = r.insufficient ? '#3a3f4c' : gc.color;
+      const fg = r.insufficient ? '#e6e8ee' : gc.textColor;
       const sym = r.symbol ?? short(r.address);
       const reason = r.insufficient
         ? 'Not enough data to assess'
         : isReplica
           ? 'Shares a symbol with another coin here — possible copycat/rug'
-          : (r.topReason ?? 'Lower observed risk — not a buy signal');
+          : (r.topReason ?? 'No red flags found — still speculative, not a buy signal');
       const rugTag =
         r.rugVerdict === 'HIGH'
           ? '<span class="rug-tag high">🚩 RUG RISK</span>'

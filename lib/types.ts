@@ -95,7 +95,17 @@ export interface MarketInfo {
   volume24hEur: number | null;
   lpStatus: LpStatus;
   sellSimulation: SellSimulation | null;
+  /* Live momentum — how an ALREADY-rugged / actively-dumping coin is detected.
+     null = unknown (never treated as healthy). */
+  priceChange1h: number | null;
+  priceChange6h: number | null;
+  priceChange24h: number | null;
+  buys1h: number | null;
+  sells1h: number | null;
 }
+
+/** Live state of a coin's market RIGHT NOW — separate from structural risk. */
+export type LiveState = 'HEALTHY' | 'DUMPING' | 'DEAD' | 'UNKNOWN';
 
 /** Behavioral pattern flags (from trade-history heuristics / GMGN tags). */
 export interface BehaviorInfo {
@@ -314,6 +324,8 @@ export interface FeedRow {
   gem: boolean;
   /** Pre-buy rug verdict (lib/rugPotential.ts), computed in the background for EVERY coin. */
   rugVerdict: 'HIGH' | 'POSSIBLE' | 'LOW' | 'UNVERIFIED';
+  /** Live market state — DEAD = already rugged, DUMPING = exiting now. */
+  liveState: LiveState;
   /** true = graduated off its bonding curve; null = unknown/not a launchpad coin. */
   graduated: boolean | null;
   /** Informational narrative tags (never scored). */

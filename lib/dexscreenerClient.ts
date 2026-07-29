@@ -45,6 +45,14 @@ export interface DexTokenMarket {
   marketCapUsd: number | null;
   liquidityUsd: number | null;
   volume24hUsd: number | null;
+  /** Price change %, per window — how "already rugged/dumping" is detected. */
+  priceChange5m: number | null;
+  priceChange1h: number | null;
+  priceChange6h: number | null;
+  priceChange24h: number | null;
+  /** Buy/sell counts in the last hour — sell-dominance = exit in progress. */
+  buys1h: number | null;
+  sells1h: number | null;
   symbol: string | null;
   name: string | null;
   pairCreatedMs: number | null;
@@ -81,6 +89,12 @@ export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarke
     marketCapUsd: asNumber(pick(best, ['marketCap', 'fdv'])),
     liquidityUsd: asNumber(pick(best, ['liquidity.usd'])),
     volume24hUsd: asNumber(pick(best, ['volume.h24'])),
+    priceChange5m: asNumber(pick(best, ['priceChange.m5'])),
+    priceChange1h: asNumber(pick(best, ['priceChange.h1'])),
+    priceChange6h: asNumber(pick(best, ['priceChange.h6'])),
+    priceChange24h: asNumber(pick(best, ['priceChange.h24'])),
+    buys1h: asNumber(pick(best, ['txns.h1.buys'])),
+    sells1h: asNumber(pick(best, ['txns.h1.sells'])),
     symbol: asString(pick(best, ['baseToken.symbol'])),
     name: asString(pick(best, ['baseToken.name'])),
     pairCreatedMs: asNumber(pick(best, ['pairCreatedAt'])),

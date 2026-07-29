@@ -168,6 +168,11 @@ var WEIGHTS = {
   // LP neither burned nor locked
   sellSimulationFailed: 30,
   // sell fails / honeypot flag / slippage > LIMITS.sellSlippageMaxPct
+  // Live state — the rug already happened / is happening (lib/liveState.ts)
+  alreadyDead: 60,
+  // liquidity pulled or price collapsed: do not enter
+  activelyDumping: 30,
+  // falling hard / sells dominating right now
   // Token-2022 trap extensions — the current generation of rug tricks
   permanentDelegate: 30,
   // delegate can SEIZE tokens from any holder wallet
@@ -325,6 +330,18 @@ var QUALITY_LIMITS = {
   minLaunchesForProven: 2
   // …across at least this many prior launches
 };
+var LIVE_STATE = {
+  /** Liquidity below this (USD) on a listed coin = effectively pulled. */
+  deadLiquidityUsd: 1500,
+  /** Price change ≤ this % (6h or 24h) = the collapse already happened. */
+  deadDropPct: -70,
+  /** Price change ≤ this % (1h or 6h) = actively dumping. */
+  dumpingDropPct: -30,
+  /** Sells > buys × this (1h) = holders exiting. */
+  sellDominanceRatio: 1.8,
+  /** Minimum 1h transactions before buy/sell flow is meaningful. */
+  minTxnsForFlow: 15
+};
 var KING_GRADE = {
   safetyWeight: 0.5,
   // (100 - riskScore) share
@@ -412,7 +429,12 @@ var FIXTURE_AVOID = {
     volume24hEur: 41e4,
     lpStatus: "deployer_held",
     // +20
-    sellSimulation: { ok: true, slippagePct: 12 }
+    sellSimulation: { ok: true, slippagePct: 12 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -471,7 +493,12 @@ var FIXTURE_WATCH = {
     liquidityEur: 38e3,
     volume24hEur: 95e4,
     lpStatus: "burned",
-    sellSimulation: { ok: true, slippagePct: 6 }
+    sellSimulation: { ok: true, slippagePct: 6 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -527,7 +554,12 @@ var FIXTURE_NEUTRAL = {
     liquidityEur: 26e4,
     volume24hEur: 78e4,
     lpStatus: "burned",
-    sellSimulation: { ok: true, slippagePct: 2 }
+    sellSimulation: { ok: true, slippagePct: 2 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -862,6 +894,12 @@ async function fetchDexscreenerToken(mint) {
     marketCapUsd: asNumber(pick(best, ["marketCap", "fdv"])),
     liquidityUsd: asNumber(pick(best, ["liquidity.usd"])),
     volume24hUsd: asNumber(pick(best, ["volume.h24"])),
+    priceChange5m: asNumber(pick(best, ["priceChange.m5"])),
+    priceChange1h: asNumber(pick(best, ["priceChange.h1"])),
+    priceChange6h: asNumber(pick(best, ["priceChange.h6"])),
+    priceChange24h: asNumber(pick(best, ["priceChange.h24"])),
+    buys1h: asNumber(pick(best, ["txns.h1.buys"])),
+    sells1h: asNumber(pick(best, ["txns.h1.sells"])),
     symbol: asString(pick(best, ["baseToken.symbol"])),
     name: asString(pick(best, ["baseToken.name"])),
     pairCreatedMs: asNumber(pick(best, ["pairCreatedAt"]))
@@ -883,6 +921,41 @@ async function fetchDexscreenerNewSolana(limit) {
     if (out.length >= limit) break;
   }
   return out;
+}
+
+// lib/liveState.ts
+function assessLiveState(market, t = LIVE_STATE) {
+  if (!market) return { state: "UNKNOWN", reasons: ["No market data."] };
+  const reasons = [];
+  const { priceChange1h: h1, priceChange6h: h6, priceChange24h: h24, liquidityEur: liq, marketCapEur: mcap } = market;
+  const haveMomentum = h1 !== null || h6 !== null || h24 !== null;
+  let dead = false;
+  if (liq !== null && liq < t.deadLiquidityUsd && (mcap === null || mcap > t.deadLiquidityUsd)) {
+    dead = true;
+    reasons.push(`Liquidity is only $${Math.round(liq)} \u2014 effectively pulled; you could not exit.`);
+  }
+  if (h24 !== null && h24 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h24))}% in 24h \u2014 this already collapsed.`);
+  }
+  if (h6 !== null && h6 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 collapse in progress/complete.`);
+  }
+  if (dead) return { state: "DEAD", reasons };
+  if (h1 !== null && h1 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h1))}% in the last hour \u2014 actively dumping.`);
+  }
+  if (h6 !== null && h6 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 sustained bleed.`);
+  }
+  const { buys1h: buys, sells1h: sells } = market;
+  if (buys !== null && sells !== null && buys + sells >= t.minTxnsForFlow && sells > buys * t.sellDominanceRatio) {
+    reasons.push(`Sells dominating (${sells} sells vs ${buys} buys in 1h) \u2014 holders exiting.`);
+  }
+  if (reasons.length > 0) return { state: "DUMPING", reasons };
+  if (!haveMomentum) return { state: "UNKNOWN", reasons: ["No price-momentum data yet (unlisted/too fresh)."] };
+  return { state: "HEALTHY", reasons: [] };
 }
 
 // lib/gemCriteria.ts
@@ -912,8 +985,16 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
   const dev = a.holders?.devHoldsPct ?? null;
-  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+  if (a.launch?.platform === "pumpfun" && dev === null) {
+    blockers.push("Dev wallet holdings not verified yet \u2014 cannot clear it as gem grade.");
+  } else if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") {
+    blockers.push(`Already rugged/dead: ${live.reasons[0] ?? "market collapsed."}`);
+  } else if (live.state === "DUMPING") {
+    blockers.push(`Dumping right now: ${live.reasons[0] ?? "price falling hard."}`);
   }
   if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
     blockers.push("Creator's launch history not checked yet.");
@@ -956,6 +1037,9 @@ function computeKingGrade(a, risk, quality) {
     if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") applyCap(KING_GRADE.caps.confirmedTrap, "already rugged/dead \u2014 market collapsed.");
+  else if (live.state === "DUMPING") applyCap(KING_GRADE.caps.highRisk, "dumping right now.");
   if (confirmedTrap) applyCap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
   if (risk.riskScore >= 60) applyCap(KING_GRADE.caps.highRisk, "risk score 60+.");
   if (a.launch?.bondingCurveComplete === false) {
@@ -1371,6 +1455,14 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
     } else {
       gap("Liquidity/market-cap figures incomplete.");
     }
+  }
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") {
+    hit(w.alreadyDead, `ALREADY RUGGED/DEAD \u2014 ${live.reasons[0] ?? "market collapsed."}`);
+  } else if (live.state === "DUMPING") {
+    hit(w.activelyDumping, `DUMPING NOW \u2014 ${live.reasons[0] ?? "price falling hard."}`);
+  } else if (live.state === "UNKNOWN" && a.market !== null) {
+    gap("Live price momentum unavailable \u2014 cannot tell if it is already dumping.");
   }
   const h = a.holders;
   if (!h) {
@@ -1979,6 +2071,7 @@ async function doLiveFeedSweep() {
       grade: kingGrade.grade,
       gem: verdict.gem,
       rugVerdict: rug.verdict,
+      liveState: assessLiveState(entry.analysis.market).state,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
       twitter: entry.analysis.socials?.twitter ?? null,
@@ -2110,7 +2203,12 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
     liquidityEur: dexMarket?.liquidityUsd ?? gmgn.liquidityEur,
     volume24hEur: dexMarket?.volume24hUsd ?? gmgn.volume24hEur,
     lpStatus,
-    sellSimulation
+    sellSimulation,
+    priceChange1h: dexMarket?.priceChange1h ?? null,
+    priceChange6h: dexMarket?.priceChange6h ?? null,
+    priceChange24h: dexMarket?.priceChange24h ?? null,
+    buys1h: dexMarket?.buys1h ?? null,
+    sells1h: dexMarket?.sells1h ?? null
   } : null;
   const behavior = gmgn.behavior ?? (pumpfun.isBanned === true ? {
     volumeSpikeFlatPrice: null,

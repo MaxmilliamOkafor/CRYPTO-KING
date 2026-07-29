@@ -67,6 +67,11 @@ export const FIXTURE_AVOID: TokenAnalysis = {
     volume24hEur: 410_000,
     lpStatus: 'deployer_held', // +20
     sellSimulation: { ok: true, slippagePct: 12 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null,
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -135,6 +140,11 @@ export const FIXTURE_WATCH: TokenAnalysis = {
     volume24hEur: 950_000,
     lpStatus: 'burned',
     sellSimulation: { ok: true, slippagePct: 6 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null,
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -202,6 +212,11 @@ export const FIXTURE_NEUTRAL: TokenAnalysis = {
     volume24hEur: 780_000,
     lpStatus: 'burned',
     sellSimulation: { ok: true, slippagePct: 2 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null,
   },
   behavior: {
     volumeSpikeFlatPrice: false,

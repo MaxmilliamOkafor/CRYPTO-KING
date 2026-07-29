@@ -24,6 +24,7 @@
 import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
+import { assessLiveState, LIVE_STATE_META } from '../lib/liveState.ts';
 import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
 import { xMonitorQuery, xSearchUrl } from '../lib/twitterClient.ts';
 import { fetchGmgnRaw, type GmgnRaw } from '../lib/gmgnClient.ts';
@@ -736,7 +737,13 @@ function updateLiveList(): void {
   let rows = [...liveRows];
   if (liveSafeOnly) {
     rows = rows.filter(
-      (r) => !r.insufficientData && r.signal !== 'AVOID' && r.signal !== 'HIGH_RISK' && r.rugVerdict !== 'HIGH',
+      (r) =>
+        !r.insufficientData &&
+        r.signal !== 'AVOID' &&
+        r.signal !== 'HIGH_RISK' &&
+        r.rugVerdict !== 'HIGH' &&
+        r.liveState !== 'DEAD' &&
+        r.liveState !== 'DUMPING',
     );
   }
   // "Low caps only" keeps 💎 gem-grade coins visible even above the cap —
@@ -750,6 +757,9 @@ function updateLiveList(): void {
     // 🏆 highest King Grade first. A ranking aid for research — NOT a profit prediction.
     rows.sort((a, b) => (b.grade ?? -1) - (a.grade ?? -1));
   }
+  // Applied LAST so it's the primary key (sort is stable): corpses and active
+  // dumps sink below live coins regardless of how good their structure looks.
+  rows.sort((a, b) => stateRank(a.liveState) - stateRank(b.liveState));
 
   if (rows.length === 0) {
     list.innerHTML = `<div class="scan-empty">${
@@ -772,12 +782,21 @@ function updateLiveList(): void {
             ? 'Early checks clean — holders/LP not verified yet (click for full scan)'
             : 'No risk factors triggered — still not a buy signal'));
       const gem = isGem(r);
+      // Already-rugged / dumping is the loudest thing on the row — it's the
+      // difference between "worth a look" and "this already took someone's money".
+      const stateTag =
+        r.liveState === 'DEAD'
+          ? '<span class="rug-tag high">💀 ALREADY RUGGED</span>'
+          : r.liveState === 'DUMPING'
+            ? '<span class="rug-tag poss">📉 DUMPING</span>'
+            : '';
       const rugTag =
-        r.rugVerdict === 'HIGH'
+        stateTag ||
+        (r.rugVerdict === 'HIGH'
           ? '<span class="rug-tag high">🚩 RUG RISK</span>'
           : r.rugVerdict === 'POSSIBLE'
             ? '<span class="rug-tag poss">🚩 possible</span>'
-            : '';
+            : '');
       return `
         <div class="scan-item${gem ? ' gem' : ''}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
@@ -865,6 +884,11 @@ function xIconLink(twitter: string | null, symbol: string | null, address: strin
     return `<a class="x-icon has" href="${esc(url)}" target="_blank" rel="noreferrer" title="Open this coin's X account">𝕏</a>`;
   }
   return `<a class="x-icon" href="${esc(xSearchUrl(xMonitorQuery(symbol, address), true))}" target="_blank" rel="noreferrer" title="No linked X — click to search live chatter on X">𝕏?</a>`;
+}
+
+/** Live coins first, then unknown, then dumping, then already-dead. */
+function stateRank(s: FeedRow['liveState']): number {
+  return s === 'DEAD' ? 3 : s === 'DUMPING' ? 2 : s === 'UNKNOWN' ? 1 : 0;
 }
 
 function eurShort(v: number): string {
@@ -1149,11 +1173,20 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
     rug.verdict === 'LOW'
       ? ''
       : esc(rug.vectors[0] ?? (rug.unverified.length ? `Unverified: ${rug.unverified.join(', ')}.` : ''));
-  const rugBanner = `
-    <div class="rug-banner" style="background:${rm.color};color:${rm.textColor}">
-      <b>${esc(rm.label)}</b>${rugDetail ? `<span>${rugDetail}</span>` : ''}
-      ${rug.vectors.length > 1 ? `<span>+${rug.vectors.length - 1} more vector${rug.vectors.length > 2 ? 's' : ''} — see Details</span>` : ''}
-    </div>`;
+  // If the rug ALREADY happened (or is happening), that outranks everything.
+  const live = assessLiveState(analysis.market);
+  const lm = LIVE_STATE_META[live.state];
+  const rugBanner =
+    live.state === 'DEAD' || live.state === 'DUMPING'
+      ? `<div class="rug-banner" style="background:${lm.color};color:${lm.textColor}">
+           <b>${esc(lm.label)}</b>
+           ${live.reasons.slice(0, 2).map((x) => `<span>${esc(x)}</span>`).join('')}
+           <span>Do not enter — this is not an early opportunity.</span>
+         </div>`
+      : `<div class="rug-banner" style="background:${rm.color};color:${rm.textColor}">
+           <b>${esc(rm.label)}</b>${rugDetail ? `<span>${rugDetail}</span>` : ''}
+           ${rug.vectors.length > 1 ? `<span>+${rug.vectors.length - 1} more vector${rug.vectors.length > 2 ? 's' : ''} — see Details</span>` : ''}
+         </div>`;
   // Everything here reads the SAME direction as the grade: higher = better.
   const subLine = quality.insufficientData
     ? ''

@@ -13,6 +13,7 @@
 
 import { KING_GRADE, GRADE_META } from '../config.ts';
 import { gemBackgroundCheck } from './gemCriteria.ts';
+import { assessLiveState } from './liveState.ts';
 import type { QualityResult, RiskResult, TokenAnalysis } from './types.ts';
 
 export interface KingGrade {
@@ -80,6 +81,12 @@ export function computeKingGrade(a: TokenAnalysis, risk: RiskResult, quality: Qu
     a.mint?.defaultAccountFrozen === true ||
     a.market?.sellSimulation?.ok === false ||
     a.market?.lpStatus === 'deployer_held';
+  // The rug already happened / is happening — hardest ceiling of all. A corpse
+  // must never present as a decent grade no matter how clean its structure.
+  const live = assessLiveState(a.market);
+  if (live.state === 'DEAD') applyCap(KING_GRADE.caps.confirmedTrap, 'already rugged/dead — market collapsed.');
+  else if (live.state === 'DUMPING') applyCap(KING_GRADE.caps.highRisk, 'dumping right now.');
+
   if (confirmedTrap) applyCap(KING_GRADE.caps.confirmedTrap, 'confirmed trap/rug mechanic present.');
   if (risk.riskScore >= 60) applyCap(KING_GRADE.caps.highRisk, 'risk score 60+.');
   if (a.launch?.bondingCurveComplete === false) {

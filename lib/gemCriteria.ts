@@ -15,6 +15,7 @@
  */
 
 import { GEM_CRITERIA, LIVE_FEED } from '../config.ts';
+import { assessLiveState } from './liveState.ts';
 import type { QualityResult, RiskResult, TokenAnalysis } from './types.ts';
 
 export interface GemVerdict {
@@ -57,10 +58,24 @@ export function gemBackgroundCheck(a: TokenAnalysis, risk: RiskResult, quality: 
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
 
-  // Dev gate: the creator's own wallet is the most motivated seller.
+  // Dev gate: the creator's own wallet is the most motivated seller. UNKNOWN is
+  // a blocker, not a pass — an unchecked dev bag is exactly how a "gem" turns
+  // out to have already been dumped on.
   const dev = a.holders?.devHoldsPct ?? null;
-  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+  if (a.launch?.platform === 'pumpfun' && dev === null) {
+    blockers.push('Dev wallet holdings not verified yet — cannot clear it as gem grade.');
+  } else if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+
+  // LIVE STATE gate: never call a corpse or an actively-dumping coin a gem,
+  // however clean its structure looks. This is the check whose absence let
+  // already-rugged coins reach the top of the feed.
+  const live = assessLiveState(a.market);
+  if (live.state === 'DEAD') {
+    blockers.push(`Already rugged/dead: ${live.reasons[0] ?? 'market collapsed.'}`);
+  } else if (live.state === 'DUMPING') {
+    blockers.push(`Dumping right now: ${live.reasons[0] ?? 'price falling hard.'}`);
   }
 
   // Creator history must have been checked (serial-launcher screen).

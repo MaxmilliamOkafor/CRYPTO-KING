@@ -39,6 +39,18 @@ var LIVE_FEED = {
   gemMinQuality: 30
 };
 var CACHE_TTL_MS = 5 * 6e4;
+var LIVE_STATE = {
+  /** Liquidity below this (USD) on a listed coin = effectively pulled. */
+  deadLiquidityUsd: 1500,
+  /** Price change ≤ this % (6h or 24h) = the collapse already happened. */
+  deadDropPct: -70,
+  /** Price change ≤ this % (1h or 6h) = actively dumping. */
+  dumpingDropPct: -30,
+  /** Sells > buys × this (1h) = holders exiting. */
+  sellDominanceRatio: 1.8,
+  /** Minimum 1h transactions before buy/sell flow is meaningful. */
+  minTxnsForFlow: 15
+};
 var KING_GRADE = {
   safetyWeight: 0.5,
   // (100 - riskScore) share
@@ -77,6 +89,41 @@ var GEM_CRITERIA = {
 };
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
 
+// lib/liveState.ts
+function assessLiveState(market, t = LIVE_STATE) {
+  if (!market) return { state: "UNKNOWN", reasons: ["No market data."] };
+  const reasons = [];
+  const { priceChange1h: h1, priceChange6h: h6, priceChange24h: h24, liquidityEur: liq, marketCapEur: mcap } = market;
+  const haveMomentum = h1 !== null || h6 !== null || h24 !== null;
+  let dead = false;
+  if (liq !== null && liq < t.deadLiquidityUsd && (mcap === null || mcap > t.deadLiquidityUsd)) {
+    dead = true;
+    reasons.push(`Liquidity is only $${Math.round(liq)} \u2014 effectively pulled; you could not exit.`);
+  }
+  if (h24 !== null && h24 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h24))}% in 24h \u2014 this already collapsed.`);
+  }
+  if (h6 !== null && h6 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 collapse in progress/complete.`);
+  }
+  if (dead) return { state: "DEAD", reasons };
+  if (h1 !== null && h1 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h1))}% in the last hour \u2014 actively dumping.`);
+  }
+  if (h6 !== null && h6 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 sustained bleed.`);
+  }
+  const { buys1h: buys, sells1h: sells } = market;
+  if (buys !== null && sells !== null && buys + sells >= t.minTxnsForFlow && sells > buys * t.sellDominanceRatio) {
+    reasons.push(`Sells dominating (${sells} sells vs ${buys} buys in 1h) \u2014 holders exiting.`);
+  }
+  if (reasons.length > 0) return { state: "DUMPING", reasons };
+  if (!haveMomentum) return { state: "UNKNOWN", reasons: ["No price-momentum data yet (unlisted/too fresh)."] };
+  return { state: "HEALTHY", reasons: [] };
+}
+
 // lib/gemCriteria.ts
 function gemBackgroundCheck(a, risk, quality) {
   const blockers = [];
@@ -104,8 +151,16 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
   const dev = a.holders?.devHoldsPct ?? null;
-  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+  if (a.launch?.platform === "pumpfun" && dev === null) {
+    blockers.push("Dev wallet holdings not verified yet \u2014 cannot clear it as gem grade.");
+  } else if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") {
+    blockers.push(`Already rugged/dead: ${live.reasons[0] ?? "market collapsed."}`);
+  } else if (live.state === "DUMPING") {
+    blockers.push(`Dumping right now: ${live.reasons[0] ?? "price falling hard."}`);
   }
   if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
     blockers.push("Creator's launch history not checked yet.");
@@ -148,6 +203,9 @@ function computeKingGrade(a, risk, quality) {
     if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") applyCap(KING_GRADE.caps.confirmedTrap, "already rugged/dead \u2014 market collapsed.");
+  else if (live.state === "DUMPING") applyCap(KING_GRADE.caps.highRisk, "dumping right now.");
   if (confirmedTrap) applyCap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
   if (risk.riskScore >= 60) applyCap(KING_GRADE.caps.highRisk, "risk score 60+.");
   if (a.launch?.bondingCurveComplete === false) {

@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade } from '../lib/kingGrade.ts';
+import { assessLiveState } from '../lib/liveState.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { assessRugPotential } from '../lib/rugPotential.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
@@ -477,6 +478,57 @@ test('rug potential: missing checks → UNVERIFIED, never LOW', () => {
   const r = assessRugPotential(partial, scoreToken(partial));
   assert.equal(r.verdict, 'UNVERIFIED');
   assert.ok(r.unverified.includes('LP burn/lock status'));
+});
+
+/* ── 💀 Already-rugged / dumping detection (the losses this prevents) ──── */
+
+const withMarket = (patch: Partial<NonNullable<TokenAnalysis['market']>>): TokenAnalysis => {
+  const t = structuredClone(FIXTURE_NEUTRAL);
+  t.market = { ...t.market!, ...patch };
+  return t;
+};
+
+test('live state: price collapsed 24h → DEAD (already rugged)', () => {
+  const r = assessLiveState(withMarket({ priceChange24h: -88 }).market);
+  assert.equal(r.state, 'DEAD');
+  assert.ok(r.reasons.some((x) => /already collapsed/.test(x)));
+});
+
+test('live state: liquidity pulled → DEAD even with clean structure', () => {
+  const dead = withMarket({ liquidityEur: 300, marketCapEur: 250_000 });
+  assert.equal(assessLiveState(dead.market).state, 'DEAD');
+  // …and it must be scored/graded as such despite QUOKKA's perfect structure:
+  const kg = computeKingGrade(dead, scoreToken(dead), scoreQuality(dead));
+  assert.ok(kg.grade !== null && kg.grade <= 10, `corpse must not grade well, got ${kg.grade}`);
+  assert.equal(gemBackgroundCheck(dead, scoreToken(dead), scoreQuality(dead)).gem, false);
+});
+
+test('live state: -45% in 1h → DUMPING; sells dominating → DUMPING', () => {
+  assert.equal(assessLiveState(withMarket({ priceChange1h: -45 }).market).state, 'DUMPING');
+  assert.equal(assessLiveState(withMarket({ buys1h: 5, sells1h: 40 }).market).state, 'DUMPING');
+});
+
+test('live state: healthy momentum → HEALTHY; missing momentum → UNKNOWN (never healthy)', () => {
+  assert.equal(assessLiveState(withMarket({ priceChange1h: 12, priceChange24h: 40 }).market).state, 'HEALTHY');
+  assert.equal(assessLiveState(withMarket({}).market).state, 'UNKNOWN'); // fixtures have null momentum
+  assert.equal(assessLiveState(null).state, 'UNKNOWN');
+});
+
+test('gem check: unverified DEV HOLDINGS on a launchpad coin blocks gem grade', () => {
+  const t = structuredClone(FIXTURE_NEUTRAL);
+  t.launch = { platform: 'pumpfun', bondingCurveComplete: true, bannedOnPlatform: false, replyCount: 30 };
+  t.deployer = { ...t.deployer!, priorLaunches: 2, priorDeadLaunches: 0, graduatedLaunches: 2 };
+  t.holders = { ...t.holders!, devHoldsPct: null }; // NOT checked
+  const v = gemBackgroundCheck(t, scoreToken(t), scoreQuality(t));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.some((b) => /Dev wallet holdings not verified/.test(b)));
+});
+
+test('a dumping coin can never be a gem, however clean its structure', () => {
+  const t = withMarket({ priceChange1h: -55 });
+  const v = gemBackgroundCheck(t, scoreToken(t), scoreQuality(t));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.some((b) => /Dumping right now/.test(b)));
 });
 
 console.log(`\n${passed} tests passed.`);

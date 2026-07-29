@@ -270,6 +270,10 @@ export const WEIGHTS = {
   lpNotSecured: 20, // LP neither burned nor locked
   sellSimulationFailed: 30, // sell fails / honeypot flag / slippage > LIMITS.sellSlippageMaxPct
 
+  // Live state — the rug already happened / is happening (lib/liveState.ts)
+  alreadyDead: 60, // liquidity pulled or price collapsed: do not enter
+  activelyDumping: 30, // falling hard / sells dominating right now
+
   // Token-2022 trap extensions — the current generation of rug tricks
   permanentDelegate: 30, // delegate can SEIZE tokens from any holder wallet
   nonTransferable: 30, // soulbound — you cannot sell at all
@@ -403,6 +407,23 @@ export const QUALITY_LIMITS = {
  * passes every gate below. Rationale: the gem must never point at a coin
  * whose dev can still nuke it in one transaction.
  */
+/* ──────────────── Live state: already-rugged / dumping detection ──────────
+ * Thresholds for lib/liveState.ts. These answer "what is happening NOW",
+ * separate from the structural audit. Tuned to catch corpses and active exits.
+ */
+export const LIVE_STATE = {
+  /** Liquidity below this (USD) on a listed coin = effectively pulled. */
+  deadLiquidityUsd: 1_500,
+  /** Price change ≤ this % (6h or 24h) = the collapse already happened. */
+  deadDropPct: -70,
+  /** Price change ≤ this % (1h or 6h) = actively dumping. */
+  dumpingDropPct: -30,
+  /** Sells > buys × this (1h) = holders exiting. */
+  sellDominanceRatio: 1.8,
+  /** Minimum 1h transactions before buy/sell flow is meaningful. */
+  minTxnsForFlow: 15,
+} as const;
+
 /* ───────────────────────── King Grade (0–100%) ────────────────────────────
  * One strict percentage per coin: 100% = passed every audit we can run,
  * 0% = confirmed danger. Composite of safety (inverted risk), quality and

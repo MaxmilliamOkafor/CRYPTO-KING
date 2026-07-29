@@ -24,6 +24,7 @@ import {
 } from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade } from '../lib/kingGrade.ts';
+import { assessLiveState } from '../lib/liveState.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
 import { fetchPumpfunData, fetchPumpfunNewCoins, type PumpfunData } from '../lib/pumpfunClient.ts';
@@ -260,6 +261,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       grade: kingGrade.grade,
       gem: verdict.gem,
       rugVerdict: rug.verdict,
+      liveState: assessLiveState(entry.analysis.market).state,
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
       twitter: entry.analysis.socials?.twitter ?? null,
@@ -483,6 +485,11 @@ function mergeSources(
         volume24hEur: dexMarket?.volume24hUsd ?? gmgn.volume24hEur,
         lpStatus,
         sellSimulation,
+        priceChange1h: dexMarket?.priceChange1h ?? null,
+        priceChange6h: dexMarket?.priceChange6h ?? null,
+        priceChange24h: dexMarket?.priceChange24h ?? null,
+        buys1h: dexMarket?.buys1h ?? null,
+        sells1h: dexMarket?.sells1h ?? null,
       }
     : null;
 

@@ -15,6 +15,7 @@
  */
 
 import { LIMITS, MITIGATION_CAP, SIGNAL_THRESHOLDS, WEIGHTS } from '../config.ts';
+import { assessLiveState } from './liveState.ts';
 import type { RiskReason, RiskResult, Signal, TokenAnalysis } from './types.ts';
 
 type Weights = typeof WEIGHTS;
@@ -134,6 +135,16 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
     } else {
       gap('Liquidity/market-cap figures incomplete.');
     }
+  }
+
+  /* ── Live state: has the rug ALREADY happened? (highest-weight reality) ── */
+  const live = assessLiveState(a.market);
+  if (live.state === 'DEAD') {
+    hit(w.alreadyDead, `ALREADY RUGGED/DEAD — ${live.reasons[0] ?? 'market collapsed.'}`);
+  } else if (live.state === 'DUMPING') {
+    hit(w.activelyDumping, `DUMPING NOW — ${live.reasons[0] ?? 'price falling hard.'}`);
+  } else if (live.state === 'UNKNOWN' && a.market !== null) {
+    gap('Live price momentum unavailable — cannot tell if it is already dumping.');
   }
 
   /* ── Holder concentration ──────────────────────────────────────────── */

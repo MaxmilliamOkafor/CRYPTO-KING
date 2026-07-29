@@ -115,6 +115,18 @@ var LIMITS = {
   devHoldsPct: 5
   // creator holdings at/above this % → devHoldingsHigh risk
 };
+var LIVE_STATE = {
+  /** Liquidity below this (USD) on a listed coin = effectively pulled. */
+  deadLiquidityUsd: 1500,
+  /** Price change ≤ this % (6h or 24h) = the collapse already happened. */
+  deadDropPct: -70,
+  /** Price change ≤ this % (1h or 6h) = actively dumping. */
+  dumpingDropPct: -30,
+  /** Sells > buys × this (1h) = holders exiting. */
+  sellDominanceRatio: 1.8,
+  /** Minimum 1h transactions before buy/sell flow is meaningful. */
+  minTxnsForFlow: 15
+};
 var KING_GRADE = {
   safetyWeight: 0.5,
   // (100 - riskScore) share
@@ -160,6 +172,47 @@ var SIGNAL_META = {
 };
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
 
+// lib/liveState.ts
+function assessLiveState(market, t = LIVE_STATE) {
+  if (!market) return { state: "UNKNOWN", reasons: ["No market data."] };
+  const reasons = [];
+  const { priceChange1h: h1, priceChange6h: h6, priceChange24h: h24, liquidityEur: liq, marketCapEur: mcap } = market;
+  const haveMomentum = h1 !== null || h6 !== null || h24 !== null;
+  let dead = false;
+  if (liq !== null && liq < t.deadLiquidityUsd && (mcap === null || mcap > t.deadLiquidityUsd)) {
+    dead = true;
+    reasons.push(`Liquidity is only $${Math.round(liq)} \u2014 effectively pulled; you could not exit.`);
+  }
+  if (h24 !== null && h24 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h24))}% in 24h \u2014 this already collapsed.`);
+  }
+  if (h6 !== null && h6 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 collapse in progress/complete.`);
+  }
+  if (dead) return { state: "DEAD", reasons };
+  if (h1 !== null && h1 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h1))}% in the last hour \u2014 actively dumping.`);
+  }
+  if (h6 !== null && h6 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 sustained bleed.`);
+  }
+  const { buys1h: buys, sells1h: sells } = market;
+  if (buys !== null && sells !== null && buys + sells >= t.minTxnsForFlow && sells > buys * t.sellDominanceRatio) {
+    reasons.push(`Sells dominating (${sells} sells vs ${buys} buys in 1h) \u2014 holders exiting.`);
+  }
+  if (reasons.length > 0) return { state: "DUMPING", reasons };
+  if (!haveMomentum) return { state: "UNKNOWN", reasons: ["No price-momentum data yet (unlisted/too fresh)."] };
+  return { state: "HEALTHY", reasons: [] };
+}
+var LIVE_STATE_META = {
+  DEAD: { label: "\u{1F480} ALREADY RUGGED/DEAD", color: "#7a1d1d", textColor: "#ffd9d9" },
+  DUMPING: { label: "\u{1F4C9} DUMPING NOW", color: "#8a3a10", textColor: "#ffe0c9" },
+  HEALTHY: { label: "no collapse detected", color: "#2e5a3c", textColor: "#c9f0d4" },
+  UNKNOWN: { label: "momentum unknown", color: "#3a3f4c", textColor: "#e6e8ee" }
+};
+
 // lib/gemCriteria.ts
 function gemBackgroundCheck(a, risk, quality) {
   const blockers = [];
@@ -187,8 +240,16 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push(`A single wallet holds ${largest.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
   }
   const dev = a.holders?.devHoldsPct ?? null;
-  if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
+  if (a.launch?.platform === "pumpfun" && dev === null) {
+    blockers.push("Dev wallet holdings not verified yet \u2014 cannot clear it as gem grade.");
+  } else if (dev !== null && dev > GEM_CRITERIA.maxLargestWalletPct) {
     blockers.push(`Dev wallet holds ${dev.toFixed(1)}% (max ${GEM_CRITERIA.maxLargestWalletPct}% for gem grade).`);
+  }
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") {
+    blockers.push(`Already rugged/dead: ${live.reasons[0] ?? "market collapsed."}`);
+  } else if (live.state === "DUMPING") {
+    blockers.push(`Dumping right now: ${live.reasons[0] ?? "price falling hard."}`);
   }
   if (a.deployer === null || a.deployer.priorLaunches === null && a.launch?.platform === "pumpfun") {
     blockers.push("Creator's launch history not checked yet.");
@@ -231,6 +292,9 @@ function computeKingGrade(a, risk, quality) {
     if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") applyCap(KING_GRADE.caps.confirmedTrap, "already rugged/dead \u2014 market collapsed.");
+  else if (live.state === "DUMPING") applyCap(KING_GRADE.caps.highRisk, "dumping right now.");
   if (confirmedTrap) applyCap(KING_GRADE.caps.confirmedTrap, "confirmed trap/rug mechanic present.");
   if (risk.riskScore >= 60) applyCap(KING_GRADE.caps.highRisk, "risk score 60+.");
   if (a.launch?.bondingCurveComplete === false) {
@@ -411,7 +475,12 @@ var FIXTURE_AVOID = {
     volume24hEur: 41e4,
     lpStatus: "deployer_held",
     // +20
-    sellSimulation: { ok: true, slippagePct: 12 }
+    sellSimulation: { ok: true, slippagePct: 12 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -470,7 +539,12 @@ var FIXTURE_WATCH = {
     liquidityEur: 38e3,
     volume24hEur: 95e4,
     lpStatus: "burned",
-    sellSimulation: { ok: true, slippagePct: 6 }
+    sellSimulation: { ok: true, slippagePct: 6 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -526,7 +600,12 @@ var FIXTURE_NEUTRAL = {
     liquidityEur: 26e4,
     volume24hEur: 78e4,
     lpStatus: "burned",
-    sellSimulation: { ok: true, slippagePct: 2 }
+    sellSimulation: { ok: true, slippagePct: 2 },
+    priceChange1h: null,
+    priceChange6h: null,
+    priceChange24h: null,
+    buys1h: null,
+    sells1h: null
   },
   behavior: {
     volumeSpikeFlatPrice: false,
@@ -1174,7 +1253,7 @@ function updateLiveList() {
   let rows = [...liveRows];
   if (liveSafeOnly) {
     rows = rows.filter(
-      (r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK" && r.rugVerdict !== "HIGH"
+      (r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK" && r.rugVerdict !== "HIGH" && r.liveState !== "DEAD" && r.liveState !== "DUMPING"
     );
   }
   if (liveLowCapOnly) {
@@ -1185,6 +1264,7 @@ function updateLiveList() {
   if (liveSortBest) {
     rows.sort((a, b) => (b.grade ?? -1) - (a.grade ?? -1));
   }
+  rows.sort((a, b) => stateRank(a.liveState) - stateRank(b.liveState));
   if (rows.length === 0) {
     list.innerHTML = `<div class="scan-empty">${liveSafeOnly || liveLowCapOnly ? "No fresh launches match the filters right now." : "Waiting for the first live results\u2026"}</div>`;
     return;
@@ -1197,7 +1277,8 @@ function updateLiveList() {
     const sym = r.symbol ?? short(r.address);
     const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? (r.unverified ? "Early checks clean \u2014 holders/LP not verified yet (click for full scan)" : "No risk factors triggered \u2014 still not a buy signal");
     const gem = isGem(r);
-    const rugTag = r.rugVerdict === "HIGH" ? '<span class="rug-tag high">\u{1F6A9} RUG RISK</span>' : r.rugVerdict === "POSSIBLE" ? '<span class="rug-tag poss">\u{1F6A9} possible</span>' : "";
+    const stateTag = r.liveState === "DEAD" ? '<span class="rug-tag high">\u{1F480} ALREADY RUGGED</span>' : r.liveState === "DUMPING" ? '<span class="rug-tag poss">\u{1F4C9} DUMPING</span>' : "";
+    const rugTag = stateTag || (r.rugVerdict === "HIGH" ? '<span class="rug-tag high">\u{1F6A9} RUG RISK</span>' : r.rugVerdict === "POSSIBLE" ? '<span class="rug-tag poss">\u{1F6A9} possible</span>' : "");
     return `
         <div class="scan-item${gem ? " gem" : ""}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
@@ -1272,6 +1353,9 @@ function xIconLink(twitter, symbol, address) {
     return `<a class="x-icon has" href="${esc(url)}" target="_blank" rel="noreferrer" title="Open this coin's X account">\u{1D54F}</a>`;
   }
   return `<a class="x-icon" href="${esc(xSearchUrl(xMonitorQuery(symbol, address), true))}" target="_blank" rel="noreferrer" title="No linked X \u2014 click to search live chatter on X">\u{1D54F}?</a>`;
+}
+function stateRank(s) {
+  return s === "DEAD" ? 3 : s === "DUMPING" ? 2 : s === "UNKNOWN" ? 1 : 0;
 }
 function eurShort(v) {
   if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
@@ -1493,11 +1577,16 @@ function render(analysis, risk, quality, mock) {
   const rug = assessRugPotential(analysis, risk);
   const rm = RUG_VERDICT_META[rug.verdict];
   const rugDetail = rug.verdict === "LOW" ? "" : esc(rug.vectors[0] ?? (rug.unverified.length ? `Unverified: ${rug.unverified.join(", ")}.` : ""));
-  const rugBanner = `
-    <div class="rug-banner" style="background:${rm.color};color:${rm.textColor}">
-      <b>${esc(rm.label)}</b>${rugDetail ? `<span>${rugDetail}</span>` : ""}
-      ${rug.vectors.length > 1 ? `<span>+${rug.vectors.length - 1} more vector${rug.vectors.length > 2 ? "s" : ""} \u2014 see Details</span>` : ""}
-    </div>`;
+  const live = assessLiveState(analysis.market);
+  const lm = LIVE_STATE_META[live.state];
+  const rugBanner = live.state === "DEAD" || live.state === "DUMPING" ? `<div class="rug-banner" style="background:${lm.color};color:${lm.textColor}">
+           <b>${esc(lm.label)}</b>
+           ${live.reasons.slice(0, 2).map((x) => `<span>${esc(x)}</span>`).join("")}
+           <span>Do not enter \u2014 this is not an early opportunity.</span>
+         </div>` : `<div class="rug-banner" style="background:${rm.color};color:${rm.textColor}">
+           <b>${esc(rm.label)}</b>${rugDetail ? `<span>${rugDetail}</span>` : ""}
+           ${rug.vectors.length > 1 ? `<span>+${rug.vectors.length - 1} more vector${rug.vectors.length > 2 ? "s" : ""} \u2014 see Details</span>` : ""}
+         </div>`;
   const subLine = quality.insufficientData ? "" : `<div class="quality-line">Safety <b>${Math.round(kg.parts.safety)}/100</b> \xB7 Quality <b>${quality.qualityScore}/100</b> \xB7 Audit coverage <b>${Math.round(kg.parts.coveragePct)}%</b></div>`;
   body.innerHTML = `
     <div class="head">

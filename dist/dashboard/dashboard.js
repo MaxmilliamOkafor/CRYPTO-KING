@@ -43,7 +43,36 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("journal-form").addEventListener("submit", onJournalSubmit);
   void loadAll();
+  loadAccuracy();
 });
+function loadAccuracy() {
+  chrome.runtime.sendMessage({ type: "GET_ACCURACY" }, (res) => {
+    const body = $("accuracy-body");
+    const note = $("accuracy-note");
+    if (!res || !res.ok) {
+      note.textContent = "Report card unavailable.";
+      return;
+    }
+    body.innerHTML = "";
+    for (const b of res.accuracy.bands) {
+      const tr = document.createElement("tr");
+      const rate = document.createElement("td");
+      rate.className = b.total === 0 ? "" : b.survivalPct >= 50 ? "pnl-pos" : "pnl-neg";
+      rate.textContent = b.total === 0 ? "\u2014" : `${b.survivalPct}%`;
+      tr.append(
+        td(b.band),
+        td(String(b.total)),
+        td(String(b.rugged)),
+        td(String(b.faded)),
+        td(String(b.survived)),
+        td(String(b.winners)),
+        rate
+      );
+      body.appendChild(tr);
+    }
+    note.textContent = res.accuracy.totalChecked === 0 ? `No predictions scored yet \u2014 ${res.accuracy.pending} waiting on their 24h re-check. Come back tomorrow.` : `${res.accuracy.totalChecked} predictions scored \xB7 ${res.accuracy.pending} still pending.`;
+  });
+}
 async function loadAll() {
   chrome.runtime.sendMessage({ type: "GET_RECENT" }, (res) => {
     recent = res?.ok ? res.recent : [];

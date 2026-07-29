@@ -296,7 +296,8 @@ export type BgRequest =
   | { type: 'GET_WATCHLIST' }
   | { type: 'GET_SETTINGS' }
   | { type: 'SET_SETTINGS'; heliusKey?: string | null; xBearerToken?: string | null }
-  | { type: 'CHECK_X'; symbol: string | null; address: string };
+  | { type: 'CHECK_X'; symbol: string | null; address: string }
+  | { type: 'GET_ACCURACY' };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; quality: QualityResult; mock: boolean }
@@ -346,6 +347,25 @@ export type WatchlistResponse = { ok: true; watchlist: WatchedCoin[] } | { ok: f
 
 export type SettingsResponse =
   | { ok: true; hasHelius: boolean; heliusKeySet: boolean; hasX: boolean; xTokenSet: boolean }
+  | { ok: false; error: string };
+
+export type AccuracyResponse =
+  | {
+      ok: true;
+      accuracy: {
+        bands: Array<{
+          band: string;
+          total: number;
+          rugged: number;
+          faded: number;
+          survived: number;
+          winners: number;
+          survivalPct: number;
+        }>;
+        totalChecked: number;
+        pending: number;
+      };
+    }
   | { ok: false; error: string };
 
 export type XBuzzResponse =

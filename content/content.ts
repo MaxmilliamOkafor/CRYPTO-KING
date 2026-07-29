@@ -24,6 +24,7 @@
 import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
+import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState, LIVE_STATE_META } from '../lib/liveState.ts';
 import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
 import { xMonitorQuery, xSearchUrl } from '../lib/twitterClient.ts';
@@ -1313,6 +1314,11 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
   const rugItems =
     rug.vectors.map((v) => `<li><span class="pts bad">🚩</span><span>${esc(v)}</span></li>`).join('') +
     rug.unverified.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`).join('');
+  const xr = assessExitReality(analysis.market, analysis.mint);
+  const exitSection = `<h4>Can you actually get out?</h4><ul>
+      <li><span class="pts ${xr.maxGentleUsd !== null && xr.maxGentleUsd < 50 ? 'bad' : 'good'}">↩</span><span>${esc(xr.note)}</span></li>
+      ${xr.transferFeePct ? `<li><span class="pts bad">+${xr.transferFeePct.toFixed(1)}%</span><span>Token-2022 transfer fee charged on the way out too.</span></li>` : ''}
+    </ul>`;
   const rugSection = rugItems
     ? `<h4>Rug-pull vectors</h4><ul>${rugItems}</ul>`
     : `<h4>Rug-pull vectors</h4><ul><li><span class="pts good">✓</span><span>None found on verified data — market risk still applies.</span></li></ul>`;
@@ -1333,6 +1339,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
 
   panel.innerHTML = `
     ${rugSection}
+    ${exitSection}
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
     ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ''}

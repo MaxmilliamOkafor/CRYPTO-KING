@@ -11,7 +11,7 @@
 
 import { DISCLAIMER, MOCK_MODE } from '../config.ts';
 import { gradeColors as gradeColorsDash, gradeLabel as gradeLabelDash } from '../lib/kingGrade.ts';
-import type { JournalEntry, RecentResponse, RecentToken } from '../lib/types.ts';
+import type { AccuracyResponse, JournalEntry, RecentResponse, RecentToken } from '../lib/types.ts';
 
 const JOURNAL_KEY = 'ck:journal';
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -37,7 +37,41 @@ document.addEventListener('DOMContentLoaded', () => {
   $('journal-form').addEventListener('submit', onJournalSubmit);
 
   void loadAll();
+  loadAccuracy();
 });
+
+/** The scanner grading itself: were its predictions right? */
+function loadAccuracy(): void {
+  chrome.runtime.sendMessage({ type: 'GET_ACCURACY' }, (res: AccuracyResponse | undefined) => {
+    const body = $('accuracy-body');
+    const note = $('accuracy-note');
+    if (!res || !res.ok) {
+      note.textContent = 'Report card unavailable.';
+      return;
+    }
+    body.innerHTML = '';
+    for (const b of res.accuracy.bands) {
+      const tr = document.createElement('tr');
+      const rate = document.createElement('td');
+      rate.className = b.total === 0 ? '' : b.survivalPct >= 50 ? 'pnl-pos' : 'pnl-neg';
+      rate.textContent = b.total === 0 ? '—' : `${b.survivalPct}%`;
+      tr.append(
+        td(b.band),
+        td(String(b.total)),
+        td(String(b.rugged)),
+        td(String(b.faded)),
+        td(String(b.survived)),
+        td(String(b.winners)),
+        rate,
+      );
+      body.appendChild(tr);
+    }
+    note.textContent =
+      res.accuracy.totalChecked === 0
+        ? `No predictions scored yet — ${res.accuracy.pending} waiting on their 24h re-check. Come back tomorrow.`
+        : `${res.accuracy.totalChecked} predictions scored · ${res.accuracy.pending} still pending.`;
+  });
+}
 
 async function loadAll(): Promise<void> {
   chrome.runtime.sendMessage({ type: 'GET_RECENT' }, (res: RecentResponse | undefined) => {

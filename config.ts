@@ -407,6 +407,40 @@ export const QUALITY_LIMITS = {
  * passes every gate below. Rationale: the gem must never point at a coin
  * whose dev can still nuke it in one transaction.
  */
+/* ────────────── Outcome ledger (does the scanner actually work?) ──────────
+ * Every grade is a prediction. The ledger re-checks graded coins later and
+ * reports the real hit rate per grade band, so accuracy is measured, not argued.
+ */
+export const OUTCOME_LEDGER = {
+  enabled: true,
+  /** Re-check a graded coin after this many hours. */
+  recheckAfterHours: 24,
+  /** Max predictions kept (rolling). */
+  maxEntries: 400,
+  /** mcap ratio ≤ this vs baseline = rugged. */
+  ruggedRatio: 0.25,
+  /** ≤ this = faded. */
+  fadedRatio: 0.7,
+  /** ≥ this = winner. */
+  winnerRatio: 2,
+} as const;
+
+/* ─────────────────── Exit reality (position sizing) ───────────────────────
+ * "Can I actually get out?" — your own sell moves the price in a thin pool.
+ * Set referencePositionUsd to the size you typically buy; the card will tell
+ * you what exiting that size actually costs.
+ */
+export const EXIT_REALITY = {
+  /** Your typical position size (USD) — the card reports its real exit cost. */
+  referencePositionUsd: 100,
+  /** "Gentle" exit: price impact you'd barely notice. */
+  gentleImpactPct: 2,
+  /** Most you'd tolerate losing to slippage on the way out. */
+  toleratedImpactPct: 5,
+  /** If even a gentle exit is under this, the pool is unusably thin. */
+  dangerouslyThinUsd: 50,
+} as const;
+
 /* ──────────────── Live state: already-rugged / dumping detection ──────────
  * Thresholds for lib/liveState.ts. These answer "what is happening NOW",
  * separate from the structural audit. Tuned to catch corpses and active exits.

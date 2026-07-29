@@ -115,6 +115,16 @@ var LIMITS = {
   devHoldsPct: 5
   // creator holdings at/above this % → devHoldingsHigh risk
 };
+var EXIT_REALITY = {
+  /** Your typical position size (USD) — the card reports its real exit cost. */
+  referencePositionUsd: 100,
+  /** "Gentle" exit: price impact you'd barely notice. */
+  gentleImpactPct: 2,
+  /** Most you'd tolerate losing to slippage on the way out. */
+  toleratedImpactPct: 5,
+  /** If even a gentle exit is under this, the pool is unusably thin. */
+  dangerouslyThinUsd: 50
+};
 var LIVE_STATE = {
   /** Liquidity below this (USD) on a listed coin = effectively pulled. */
   deadLiquidityUsd: 1500,
@@ -325,6 +335,37 @@ function gradeColors(grade) {
   if (grade === null) return { color: "#3a3f4c", textColor: "#e6e8ee" };
   for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };
   return { color: "#e5484d", textColor: "#ffffff" };
+}
+
+// lib/exitReality.ts
+function assessExitReality(market, mint, t = EXIT_REALITY) {
+  const liquidity = market?.liquidityEur ?? null;
+  const feePct = mint?.transferFeeBps != null ? mint.transferFeeBps / 100 : mint?.isToken2022 === false ? 0 : null;
+  if (liquidity === null || liquidity <= 0) {
+    return {
+      maxGentleUsd: null,
+      maxToleratedUsd: null,
+      refPositionImpactPct: null,
+      transferFeePct: feePct,
+      note: "Liquidity unknown \u2014 exit cost cannot be estimated. Assume you may not get out cleanly."
+    };
+  }
+  const reserve = liquidity / 2;
+  const maxFor = (impact) => reserve * impact / (1 - impact);
+  const maxGentleUsd = maxFor(t.gentleImpactPct / 100);
+  const maxToleratedUsd = maxFor(t.toleratedImpactPct / 100);
+  const ref = t.referencePositionUsd;
+  const rawImpact = ref / (ref + reserve) * 100;
+  const refPositionImpactPct = rawImpact + (feePct ?? 0);
+  let note;
+  if (maxGentleUsd < t.dangerouslyThinUsd) {
+    note = `Dangerously thin: even a $${Math.round(maxGentleUsd)} exit moves the price. You likely cannot sell a real position without collapsing it.`;
+  } else if (refPositionImpactPct > t.toleratedImpactPct) {
+    note = `A $${ref} position would cost ~${refPositionImpactPct.toFixed(1)}% to exit. Size down to ~$${Math.round(maxToleratedUsd)} or less.`;
+  } else {
+    note = `A $${ref} position exits at ~${refPositionImpactPct.toFixed(1)}% cost. Rough ceiling before it hurts: ~$${Math.round(maxToleratedUsd)}.`;
+  }
+  return { maxGentleUsd, maxToleratedUsd, refPositionImpactPct, transferFeePct: feePct, note };
 }
 
 // lib/rugPotential.ts
@@ -1684,6 +1725,11 @@ function fillPanel(panel, analysis, risk, quality) {
   const qualityItems = quality.reasons.slice(0, 6).map((q) => `<li><span class="pts good">+${q.points}</span><span>${esc(q.text)}</span></li>`).join("");
   const rug = assessRugPotential(analysis, risk);
   const rugItems = rug.vectors.map((v) => `<li><span class="pts bad">\u{1F6A9}</span><span>${esc(v)}</span></li>`).join("") + rug.unverified.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`).join("");
+  const xr = assessExitReality(analysis.market, analysis.mint);
+  const exitSection = `<h4>Can you actually get out?</h4><ul>
+      <li><span class="pts ${xr.maxGentleUsd !== null && xr.maxGentleUsd < 50 ? "bad" : "good"}">\u21A9</span><span>${esc(xr.note)}</span></li>
+      ${xr.transferFeePct ? `<li><span class="pts bad">+${xr.transferFeePct.toFixed(1)}%</span><span>Token-2022 transfer fee charged on the way out too.</span></li>` : ""}
+    </ul>`;
   const rugSection = rugItems ? `<h4>Rug-pull vectors</h4><ul>${rugItems}</ul>` : `<h4>Rug-pull vectors</h4><ul><li><span class="pts good">\u2713</span><span>None found on verified data \u2014 market risk still applies.</span></li></ul>`;
   const verdict = gemBackgroundCheck(analysis, risk, quality);
   const kg = computeKingGrade(analysis, risk, quality);
@@ -1692,6 +1738,7 @@ function fillPanel(panel, analysis, risk, quality) {
   const gaps = risk.dataGaps.slice(0, 5).map((g) => `<li class="gap">${esc(g)}</li>`).join("");
   panel.innerHTML = `
     ${rugSection}
+    ${exitSection}
     ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
     ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ""}

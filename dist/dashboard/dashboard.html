@@ -50,6 +50,20 @@
 
       <section>
         <div class="section-head">
+          <h2>📊 Scanner report card — did its grades hold up?</h2>
+        </div>
+        <p class="legend">Every full grade is logged as a prediction and re-checked ~24h later. This is the honest hit rate — if high grades aren't surviving more than low ones, <b>don't trust the grades</b>, and tell me so the weights can be fixed on evidence.</p>
+        <table id="accuracy-table">
+          <thead>
+            <tr><th>Grade band</th><th>Checked</th><th>Rugged</th><th>Faded</th><th>Survived</th><th>2x+</th><th>Survival rate</th></tr>
+          </thead>
+          <tbody id="accuracy-body"></tbody>
+        </table>
+        <p id="accuracy-note" class="legend"></p>
+      </section>
+
+      <section>
+        <div class="section-head">
           <h2>P&amp;L journal (manual entries only — no wallet access)</h2>
         </div>
         <form id="journal-form">

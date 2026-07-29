@@ -330,6 +330,19 @@ var QUALITY_LIMITS = {
   minLaunchesForProven: 2
   // …across at least this many prior launches
 };
+var OUTCOME_LEDGER = {
+  enabled: true,
+  /** Re-check a graded coin after this many hours. */
+  recheckAfterHours: 24,
+  /** Max predictions kept (rolling). */
+  maxEntries: 400,
+  /** mcap ratio ≤ this vs baseline = rugged. */
+  ruggedRatio: 0.25,
+  /** ≤ this = faded. */
+  fadedRatio: 0.7,
+  /** ≥ this = winner. */
+  winnerRatio: 2
+};
 var LIVE_STATE = {
   /** Liquidity below this (USD) on a listed coin = effectively pulled. */
   deadLiquidityUsd: 1500,
@@ -386,6 +399,55 @@ var SIGNAL_THRESHOLDS = [
   { min: 20, signal: "CONSIDER" },
   { min: 0, signal: "NEUTRAL" }
 ];
+
+// lib/outcomeLedger.ts
+function classifyOutcome(baselineMcap, nowMcap, isDead, t = OUTCOME_LEDGER) {
+  if (isDead) return "RUGGED";
+  if (baselineMcap === null || nowMcap === null || baselineMcap <= 0) return "PENDING";
+  const ratio = nowMcap / baselineMcap;
+  if (ratio <= t.ruggedRatio) return "RUGGED";
+  if (ratio <= t.fadedRatio) return "FADED";
+  if (ratio >= t.winnerRatio) return "WINNER";
+  return "SURVIVED";
+}
+function computeAccuracy(entries) {
+  const defs = [
+    { band: "80\u2013100% (gem grade)", min: 80, max: 101 },
+    { band: "60\u201379% (strong)", min: 60, max: 80 },
+    { band: "40\u201359% (mixed)", min: 40, max: 60 },
+    { band: "0\u201339% (weak/avoid)", min: 0, max: 40 }
+  ];
+  let pending = 0;
+  let totalChecked = 0;
+  const bands = defs.map((d) => ({
+    band: d.band,
+    total: 0,
+    rugged: 0,
+    faded: 0,
+    survived: 0,
+    winners: 0,
+    survivalPct: 0
+  }));
+  for (const e of entries) {
+    if (!e.outcome || e.outcome === "PENDING" || e.grade === null) {
+      pending++;
+      continue;
+    }
+    const i = defs.findIndex((d) => e.grade >= d.min && e.grade < d.max);
+    if (i < 0) continue;
+    const b = bands[i];
+    b.total++;
+    totalChecked++;
+    if (e.outcome === "RUGGED") b.rugged++;
+    else if (e.outcome === "FADED") b.faded++;
+    else if (e.outcome === "SURVIVED") b.survived++;
+    else if (e.outcome === "WINNER") b.winners++;
+  }
+  for (const b of bands) {
+    b.survivalPct = b.total > 0 ? Math.round((b.total - b.rugged) / b.total * 100) : 0;
+  }
+  return { bands, totalChecked, pending };
+}
 
 // mock/fixtures.ts
 var now = () => Date.now();
@@ -1975,6 +2037,8 @@ async function handle(msg) {
       const buzz = await fetchXBuzz(msg.symbol, msg.address, xBearerToken());
       return { ok: true, buzz, hasToken: hasX() };
     }
+    case "GET_ACCURACY":
+      return { ok: true, accuracy: computeAccuracy(await loadLedger()) };
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
@@ -2154,7 +2218,10 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     const risk = scoreToken(analysis);
     const quality = scoreQuality(analysis);
     cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
-    if (!lite) await saveRecent(analysis, risk, quality);
+    if (!lite) {
+      await saveRecent(analysis, risk, quality);
+      await recordPrediction(analysis, computeKingGrade(analysis, risk, quality).grade, assessRugPotential(analysis, risk).verdict);
+    }
     return { ok: true, analysis, risk, quality, mock: MOCK_MODE };
   } catch (err) {
     console.error("[CRYPTO-KING] analysis failed:", err);
@@ -2364,7 +2431,10 @@ function ensureWatchAlarm() {
   chrome.alarms.create("ck-watch", { periodInMinutes: WATCHLIST.pollMinutes });
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "ck-watch") void sweepWatchlist();
+  if (alarm.name === "ck-watch") {
+    void sweepWatchlist();
+    void recheckLedger();
+  }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
@@ -2375,6 +2445,53 @@ chrome.notifications?.onClicked.addListener((id) => {
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
 });
+var LEDGER_KEY = "ck:ledger";
+async function loadLedger() {
+  const d = await chrome.storage.local.get(LEDGER_KEY);
+  return Array.isArray(d[LEDGER_KEY]) ? d[LEDGER_KEY] : [];
+}
+async function recordPrediction(analysis, grade, rugVerdict) {
+  if (!OUTCOME_LEDGER.enabled || MOCK_MODE || grade === null) return;
+  const ledger = await loadLedger();
+  if (ledger.some((e) => e.address === analysis.identity.address)) return;
+  ledger.unshift({
+    address: analysis.identity.address,
+    symbol: analysis.identity.symbol,
+    gradedAt: Date.now(),
+    grade,
+    rugVerdict,
+    baselineMcap: analysis.market?.marketCapEur ?? null
+  });
+  await chrome.storage.local.set({ [LEDGER_KEY]: ledger.slice(0, OUTCOME_LEDGER.maxEntries) });
+}
+async function recheckLedger() {
+  if (!OUTCOME_LEDGER.enabled || MOCK_MODE) return;
+  const ledger = await loadLedger();
+  const dueAt = Date.now() - OUTCOME_LEDGER.recheckAfterHours * 36e5;
+  const due = ledger.filter((e) => !e.outcome && e.gradedAt <= dueAt).slice(0, 5);
+  if (due.length === 0) return;
+  for (const entry of due) {
+    const dex = await fetchDexscreenerToken(entry.address);
+    const nowMcap = dex?.marketCapUsd ?? null;
+    const isDead = dex === null ? true : assessLiveState({
+      priceEur: dex.priceUsd,
+      marketCapEur: dex.marketCapUsd,
+      liquidityEur: dex.liquidityUsd,
+      volume24hEur: dex.volume24hUsd,
+      lpStatus: "unknown",
+      sellSimulation: null,
+      priceChange1h: dex.priceChange1h,
+      priceChange6h: dex.priceChange6h,
+      priceChange24h: dex.priceChange24h,
+      buys1h: dex.buys1h,
+      sells1h: dex.sells1h
+    }).state === "DEAD";
+    entry.checkedAt = Date.now();
+    entry.finalMcap = nowMcap;
+    entry.outcome = classifyOutcome(entry.baselineMcap, nowMcap, isDead);
+  }
+  await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+}
 async function loadRecent() {
   const data = await chrome.storage.local.get(RECENT_KEY);
   const list = data[RECENT_KEY];

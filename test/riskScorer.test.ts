@@ -10,7 +10,9 @@
 import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade } from '../lib/kingGrade.ts';
+import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
+import { classifyOutcome, computeAccuracy } from '../lib/outcomeLedger.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { assessRugPotential } from '../lib/rugPotential.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
@@ -529,6 +531,61 @@ test('a dumping coin can never be a gem, however clean its structure', () => {
   const v = gemBackgroundCheck(t, scoreToken(t), scoreQuality(t));
   assert.equal(v.gem, false);
   assert.ok(v.blockers.some((b) => /Dumping right now/.test(b)));
+});
+
+/* ── ↩ Exit reality (position sizing) ──────────────────────────────────── */
+
+test('exit reality: thin pool caps position size; deep pool allows more', () => {
+  const thin = assessExitReality({ ...FIXTURE_NEUTRAL.market!, liquidityEur: 8_000 }, FIXTURE_NEUTRAL.mint);
+  const deep = assessExitReality({ ...FIXTURE_NEUTRAL.market!, liquidityEur: 500_000 }, FIXTURE_NEUTRAL.mint);
+  assert.ok(thin.maxToleratedUsd !== null && deep.maxToleratedUsd !== null);
+  assert.ok(deep.maxToleratedUsd! > thin.maxToleratedUsd! * 10, 'deeper pool must allow much larger exits');
+  // $8k pool: ~2% of a $4k reserve ≈ low hundreds max at 5% impact
+  assert.ok(thin.maxToleratedUsd! < 500, `thin pool ceiling too high: ${thin.maxToleratedUsd}`);
+});
+
+test('exit reality: unusably thin pool is called out; unknown liquidity never guesses', () => {
+  const dust = assessExitReality({ ...FIXTURE_NEUTRAL.market!, liquidityEur: 400 }, FIXTURE_NEUTRAL.mint);
+  assert.match(dust.note, /Dangerously thin/);
+  const unknown = assessExitReality({ ...FIXTURE_NEUTRAL.market!, liquidityEur: null }, FIXTURE_NEUTRAL.mint);
+  assert.equal(unknown.maxToleratedUsd, null);
+  assert.match(unknown.note, /cannot be estimated/);
+});
+
+test('exit reality: Token-2022 transfer fee is added to the exit cost', () => {
+  const taxed = assessExitReality(
+    { ...FIXTURE_NEUTRAL.market!, liquidityEur: 500_000 },
+    { ...FIXTURE_NEUTRAL.mint!, isToken2022: true, transferFeeBps: 500 },
+  );
+  assert.equal(taxed.transferFeePct, 5);
+  assert.ok(taxed.refPositionImpactPct !== null && taxed.refPositionImpactPct >= 5, 'fee must be included');
+});
+
+/* ── 📊 Outcome ledger (does the scanner work?) ────────────────────────── */
+
+test('outcome ledger: classifies rugged / faded / survived / winner', () => {
+  assert.equal(classifyOutcome(100_000, 5_000, false), 'RUGGED'); // -95%
+  assert.equal(classifyOutcome(100_000, 50_000, false), 'FADED'); // -50%
+  assert.equal(classifyOutcome(100_000, 95_000, false), 'SURVIVED');
+  assert.equal(classifyOutcome(100_000, 300_000, false), 'WINNER'); // 3x
+  assert.equal(classifyOutcome(100_000, 999_999, true), 'RUGGED'); // dead overrides
+  assert.equal(classifyOutcome(null, 100, false), 'PENDING'); // no baseline → no claim
+});
+
+test('outcome ledger: accuracy report groups by grade band and computes survival', () => {
+  const acc = computeAccuracy([
+    { address: 'a', symbol: 'A', gradedAt: 1, grade: 85, rugVerdict: 'LOW', baselineMcap: 1, outcome: 'WINNER' },
+    { address: 'b', symbol: 'B', gradedAt: 1, grade: 82, rugVerdict: 'LOW', baselineMcap: 1, outcome: 'RUGGED' },
+    { address: 'c', symbol: 'C', gradedAt: 1, grade: 20, rugVerdict: 'HIGH', baselineMcap: 1, outcome: 'RUGGED' },
+    { address: 'd', symbol: 'D', gradedAt: 1, grade: 50, rugVerdict: 'POSSIBLE', baselineMcap: 1 }, // pending
+  ]);
+  const gem = acc.bands.find((b) => b.band.startsWith('80'))!;
+  assert.equal(gem.total, 2);
+  assert.equal(gem.survivalPct, 50); // 1 of 2 rugged
+  const weak = acc.bands.find((b) => b.band.startsWith('0'))!;
+  assert.equal(weak.survivalPct, 0);
+  assert.equal(acc.pending, 1);
+  assert.equal(acc.totalChecked, 3);
 });
 
 console.log(`\n${passed} tests passed.`);

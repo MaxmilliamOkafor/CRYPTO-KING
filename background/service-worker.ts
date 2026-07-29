@@ -14,7 +14,17 @@
  * Read-only by design: no keys, no wallets, no signing, no trading.
  */
 
-import { CACHE_TTL_MS, DEBUG, EUR_PER_USD, LIVE_FEED, MOCK_MODE, RECENT_MAX, WATCHLIST } from '../config.ts';
+import {
+  CACHE_TTL_MS,
+  DEBUG,
+  EUR_PER_USD,
+  LIVE_FEED,
+  MOCK_MODE,
+  OUTCOME_LEDGER,
+  RECENT_MAX,
+  WATCHLIST,
+} from '../config.ts';
+import { classifyOutcome, computeAccuracy, type LedgerEntry } from '../lib/outcomeLedger.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import {
   fetchDexscreenerNewSolana,
@@ -46,6 +56,7 @@ import { computeWatchAlerts } from '../lib/watchAlerts.ts';
 import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
 import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
 import type {
+  AccuracyResponse,
   AnalyzeResponse,
   BgRequest,
   FeedRow,
@@ -97,6 +108,7 @@ async function handle(
   | WatchlistResponse
   | SettingsResponse
   | XBuzzResponse
+  | AccuracyResponse
 > {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
@@ -138,6 +150,8 @@ async function handle(
       const buzz = await fetchXBuzz(msg.symbol, msg.address, xBearerToken());
       return { ok: true, buzz, hasToken: hasX() };
     }
+    case 'GET_ACCURACY':
+      return { ok: true, accuracy: computeAccuracy(await loadLedger()) };
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };
   }
@@ -394,7 +408,11 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     cache.set(address, { analysis, risk, quality, at: Date.now(), lite });
     // Lite feed sweeps would flush the user's own browsing history out of the
     // dashboard's capped recent list — only full scans are recorded there.
-    if (!lite) await saveRecent(analysis, risk, quality);
+    if (!lite) {
+      await saveRecent(analysis, risk, quality);
+      // Every full grade is a prediction — log it so it can be scored later.
+      await recordPrediction(analysis, computeKingGrade(analysis, risk, quality).grade, assessRugPotential(analysis, risk).verdict);
+    }
     return { ok: true, analysis, risk, quality, mock: MOCK_MODE };
   } catch (err) {
     console.error('[CRYPTO-KING] analysis failed:', err);
@@ -696,7 +714,10 @@ function ensureWatchAlarm(): void {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'ck-watch') void sweepWatchlist();
+  if (alarm.name === 'ck-watch') {
+    void sweepWatchlist();
+    void recheckLedger(); // score past predictions on the same tick
+  }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
@@ -709,6 +730,68 @@ chrome.notifications?.onClicked.addListener((id) => {
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
 });
+
+/* ── Outcome ledger: grade every prediction, then check if it was right ──
+ * Recorded on full scans; re-checked on the watch alarm after
+ * OUTCOME_LEDGER.recheckAfterHours. computeAccuracy() turns it into a report
+ * card so "is this accurate?" becomes a measured number.
+ */
+
+const LEDGER_KEY = 'ck:ledger';
+
+async function loadLedger(): Promise<LedgerEntry[]> {
+  const d = await chrome.storage.local.get(LEDGER_KEY);
+  return Array.isArray(d[LEDGER_KEY]) ? (d[LEDGER_KEY] as LedgerEntry[]) : [];
+}
+
+async function recordPrediction(analysis: TokenAnalysis, grade: number | null, rugVerdict: string): Promise<void> {
+  if (!OUTCOME_LEDGER.enabled || MOCK_MODE || grade === null) return;
+  const ledger = await loadLedger();
+  if (ledger.some((e) => e.address === analysis.identity.address)) return; // first grade only
+  ledger.unshift({
+    address: analysis.identity.address,
+    symbol: analysis.identity.symbol,
+    gradedAt: Date.now(),
+    grade,
+    rugVerdict,
+    baselineMcap: analysis.market?.marketCapEur ?? null,
+  });
+  await chrome.storage.local.set({ [LEDGER_KEY]: ledger.slice(0, OUTCOME_LEDGER.maxEntries) });
+}
+
+/** Re-check due predictions and score them. Bounded per sweep to stay cheap. */
+async function recheckLedger(): Promise<void> {
+  if (!OUTCOME_LEDGER.enabled || MOCK_MODE) return;
+  const ledger = await loadLedger();
+  const dueAt = Date.now() - OUTCOME_LEDGER.recheckAfterHours * 3_600_000;
+  const due = ledger.filter((e) => !e.outcome && e.gradedAt <= dueAt).slice(0, 5);
+  if (due.length === 0) return;
+
+  for (const entry of due) {
+    const dex = await fetchDexscreenerToken(entry.address);
+    const nowMcap = dex?.marketCapUsd ?? null;
+    const isDead =
+      dex === null // delisted entirely = dead
+        ? true
+        : assessLiveState({
+            priceEur: dex.priceUsd,
+            marketCapEur: dex.marketCapUsd,
+            liquidityEur: dex.liquidityUsd,
+            volume24hEur: dex.volume24hUsd,
+            lpStatus: 'unknown',
+            sellSimulation: null,
+            priceChange1h: dex.priceChange1h,
+            priceChange6h: dex.priceChange6h,
+            priceChange24h: dex.priceChange24h,
+            buys1h: dex.buys1h,
+            sells1h: dex.sells1h,
+          }).state === 'DEAD';
+    entry.checkedAt = Date.now();
+    entry.finalMcap = nowMcap;
+    entry.outcome = classifyOutcome(entry.baselineMcap, nowMcap, isDead);
+  }
+  await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+}
 
 /* ── Recent-tokens persistence (dashboard) ────────────────────────────── */
 

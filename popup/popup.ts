@@ -5,7 +5,10 @@
  */
 
 import { DISCLAIMER } from '../config.ts';
-import { computeKingGrade, gradeColors as gradeColorsPopup, gradeLabel } from '../lib/kingGrade.ts';
+import { assessExitReality } from '../lib/exitReality.ts';
+import { computeKingGrade, gradeBlurb, gradeColors as gradeColorsPopup, gradeLabel } from '../lib/kingGrade.ts';
+import { assessLiveState, LIVE_STATE_META } from '../lib/liveState.ts';
+import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
 import type {
   AnalyzeResponse,
   QualityResult,
@@ -156,7 +159,10 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   const fill = $('score-fill');
   fill.style.width = `${kg.grade ?? 0}%`;
   fill.style.background = gc.color;
-  $('score-num').textContent = kg.grade === null ? '— / 100' : `${kg.grade}% King Grade`;
+  $('score-num').textContent = kg.grade === null ? '— no grade' : `${kg.grade}% King Grade`;
+  $('grade-blurb').textContent = gradeBlurb(kg.grade);
+
+  renderStatusBanner(analysis, risk);
 
   const reasons = $('reasons');
   reasons.innerHTML = '';
@@ -178,14 +184,59 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   for (const g of risk.dataGaps) gaps.appendChild(li('gap-item', g));
   $('gaps-details').hidden = risk.dataGaps.length === 0;
 
-  renderMetrics(analysis, risk, quality);
+  renderMetrics(analysis, quality);
 
   ($('link-solscan') as HTMLAnchorElement).href = `https://solscan.io/token/${addr}`;
   ($('link-rugcheck') as HTMLAnchorElement).href = `https://rugcheck.xyz/tokens/${addr}`;
   ($('link-gmgn') as HTMLAnchorElement).href = `https://gmgn.ai/sol/token/${addr}`;
 }
 
-function renderMetrics(a: TokenAnalysis, risk: RiskResult, quality: QualityResult): void {
+/**
+ * The two questions that actually cost money, answered above the fold:
+ *  1. Has the rug ALREADY happened? (live state — outranks everything)
+ *  2. Can it still rug me? (open rug vectors)
+ * The content panel has had this since the "you recommended a coin that already
+ * rugged" report; the popup was still showing only a grade.
+ */
+function renderStatusBanner(a: TokenAnalysis, risk: RiskResult): void {
+  const el = $('status-banner');
+  el.innerHTML = '';
+  el.hidden = false;
+
+  const live = assessLiveState(a.market);
+  if (live.state === 'DEAD' || live.state === 'DUMPING') {
+    const lm = LIVE_STATE_META[live.state];
+    el.style.background = lm.color;
+    el.style.color = lm.textColor;
+    el.append(strong(lm.label));
+    for (const r of live.reasons.slice(0, 2)) el.append(span(r));
+    el.append(span('Do not enter — this is not an early opportunity.'));
+    return;
+  }
+
+  const rug = assessRugPotential(a, risk);
+  const rm = RUG_VERDICT_META[rug.verdict];
+  el.style.background = rm.color;
+  el.style.color = rm.textColor;
+  el.append(strong(rm.label));
+  if (rug.vectors.length > 0) el.append(span(rug.vectors[0]));
+  else if (rug.unverified.length > 0) el.append(span(`Unverified: ${rug.unverified.join(', ')}.`));
+  if (rug.vectors.length > 1) el.append(span(`+${rug.vectors.length - 1} more open vector${rug.vectors.length > 2 ? 's' : ''}.`));
+}
+
+function strong(text: string): HTMLElement {
+  const el = document.createElement('b');
+  el.textContent = text;
+  return el;
+}
+
+function span(text: string): HTMLElement {
+  const el = document.createElement('span');
+  el.textContent = text;
+  return el;
+}
+
+function renderMetrics(a: TokenAnalysis, quality: QualityResult): void {
   const m = a.market;
   const h = a.holders;
   const mint = a.mint;
@@ -217,12 +268,14 @@ function renderMetrics(a: TokenAnalysis, risk: RiskResult, quality: QualityResul
       v: quality.insufficientData ? 'unknown' : `${quality.qualityScore}/100`,
       cls: !quality.insufficientData && quality.qualityScore >= 50 ? 'good' : undefined,
     },
+    // The grade is already the headline — this slot answers the question the
+    // grade can't: how much money can you actually get back OUT of this pool?
     (() => {
-      const kg = computeKingGrade(a, risk, quality);
+      const exit = assessExitReality(a.market, a.mint);
       return {
-        k: 'King Grade',
-        v: kg.grade === null ? 'unknown' : `${kg.grade}% ${gradeLabel(kg.grade)}`,
-        cls: kg.grade !== null && kg.grade >= 60 ? 'good' : kg.grade !== null && kg.grade < 20 ? 'bad' : undefined,
+        k: 'Max exit (low slip)',
+        v: exit.maxGentleUsd === null ? 'unknown' : eur(exit.maxGentleUsd),
+        cls: exit.maxGentleUsd !== null && exit.maxGentleUsd < 100 ? 'bad' : undefined,
       };
     })(),
   ];

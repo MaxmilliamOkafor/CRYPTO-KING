@@ -144,6 +144,12 @@ export const LIVE_FEED = {
    * research — emphatically not a buy signal.
    */
   gemMinQuality: 30,
+  /**
+   * "Hide risky coins" cut-off, expressed in King Grade (higher = better) so the
+   * toggle, the ⚠ counter and the % on each row all read the same direction.
+   * 40 = the bottom of the MIXED band; WEAK/AVOID are hidden.
+   */
+  safeMinGrade: 40,
 };
 
 /**
@@ -479,12 +485,49 @@ export const KING_GRADE = {
 } as const;
 
 /** Grade buckets for display. */
-export const GRADE_META: Array<{ min: number; label: string; color: string; textColor: string }> = [
-  { min: 80, label: 'GEM GRADE', color: '#d4a017', textColor: '#1b1b18' },
-  { min: 60, label: 'STRONG', color: '#46a758', textColor: '#ffffff' },
-  { min: 40, label: 'MIXED', color: '#ffb224', textColor: '#1b1b18' },
-  { min: 20, label: 'WEAK', color: '#f76b15', textColor: '#ffffff' },
-  { min: 0, label: 'AVOID', color: '#e5484d', textColor: '#ffffff' },
+export const GRADE_META: Array<{
+  min: number;
+  label: string;
+  color: string;
+  textColor: string;
+  /** One line, written in the SAME direction as the grade: higher = better. */
+  blurb: string;
+}> = [
+  {
+    min: 80,
+    label: 'GEM GRADE',
+    color: '#d4a017',
+    textColor: '#1b1b18',
+    blurb: 'Passed every check we can run — still speculative, never "safe".',
+  },
+  {
+    min: 60,
+    label: 'STRONG',
+    color: '#46a758',
+    textColor: '#ffffff',
+    blurb: 'Most checks passed — read the remaining flags before anything.',
+  },
+  {
+    min: 40,
+    label: 'MIXED',
+    color: '#ffb224',
+    textColor: '#1b1b18',
+    blurb: 'Real flags or unverified checks — not an opportunity signal.',
+  },
+  {
+    min: 20,
+    label: 'WEAK',
+    color: '#f76b15',
+    textColor: '#ffffff',
+    blurb: 'Serious problems found — the odds are against you here.',
+  },
+  {
+    min: 0,
+    label: 'AVOID',
+    color: '#e5484d',
+    textColor: '#ffffff',
+    blurb: 'Severe red flags — this looks like a scam/rug setup.',
+  },
 ];
 
 export const GEM_CRITERIA = {
@@ -510,17 +553,13 @@ export const SIGNAL_THRESHOLDS: Array<{ min: number; signal: Signal }> = [
 ];
 
 /**
- * UI metadata per signal — labels are plain English about DANGER LEVEL only.
- * (Internal Signal ids are unchanged; only display text differs.)
- * IMPORTANT: lower observed risk ≠ safe — keep that framing everywhere.
+ * NOTE: there is deliberately no SIGNAL_META here any more.
+ * `Signal` is an INTERNAL coarse bucket of the raw risk score (higher = worse).
+ * It must never reach the UI: every user-facing number and label is the King
+ * Grade (lib/kingGrade.ts — 0–100%, higher = better). Mixing the two directions
+ * in one panel is what made the old UI unreadable. If you need display text for
+ * a coin, use gradeLabel() / gradeColors() / gradeBlurb().
  */
-export const SIGNAL_META: Record<Signal, { color: string; textColor: string; label: string; blurb: string }> = {
-  AVOID: { color: '#e5484d', textColor: '#ffffff', label: 'AVOID', blurb: 'Severe red flags — likely scam/rug setup.' },
-  HIGH_RISK: { color: '#f76b15', textColor: '#ffffff', label: 'HIGH RISK', blurb: 'Multiple serious red flags.' },
-  WATCH: { color: '#ffb224', textColor: '#1b1b18', label: 'RISKY', blurb: 'Notable red flags — read them first.' },
-  CONSIDER: { color: '#46a758', textColor: '#ffffff', label: 'MILD RISK', blurb: 'Some red flags found — not danger-free, not a buy call.' },
-  NEUTRAL: { color: '#64748b', textColor: '#ffffff', label: 'LOW RISK', blurb: 'Few red flags found — still speculative, not safe.' },
-};
 
 /** Mandatory disclaimer — rendered in overlay details, popup footer, dashboard, README. */
 export const DISCLAIMER =

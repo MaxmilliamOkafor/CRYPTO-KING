@@ -36,9 +36,53 @@ var LIVE_FEED = {
    * AND quality ≥ gemMinQuality. An attention aid for candidates worth YOUR
    * research — emphatically not a buy signal.
    */
-  gemMinQuality: 30
+  gemMinQuality: 30,
+  /**
+   * "Hide risky coins" cut-off, expressed in King Grade (higher = better) so the
+   * toggle, the ⚠ counter and the % on each row all read the same direction.
+   * 40 = the bottom of the MIXED band; WEAK/AVOID are hidden.
+   */
+  safeMinGrade: 40
 };
 var CACHE_TTL_MS = 5 * 6e4;
+var LIMITS = {
+  transferFeeHighBps: 1e3,
+  // 10%
+  transferFeeVeryHighBps: 2e3,
+  // 20%
+  sellSlippageMaxPct: 40,
+  top10Pct: 60,
+  singleWalletPct: 30,
+  top5Pct: 80,
+  top5MinHolders: 500,
+  // "looks distributed but is effectively concentrated"
+  bundledPct: 20,
+  thinLiquidityEur: 5e4,
+  thinLiqMcapEur: 5e5,
+  microMcapEur: 5e4,
+  youngAgeMinutes: 30,
+  smartMoneyStrongWallets: 3,
+  serialMinLaunches: 3,
+  // serial-deployer factor needs at least this many prior coins…
+  serialDeadRatio: 0.7,
+  // …with at least this share dead/abandoned
+  earlyWhalePct: 5,
+  // % of TOTAL supply in one non-curve wallet while still on the curve
+  earlyTop10Pct: 15,
+  // % of TOTAL supply in top-10 non-curve wallets while on the curve
+  devHoldsPct: 5
+  // creator holdings at/above this % → devHoldingsHigh risk
+};
+var EXIT_REALITY = {
+  /** Your typical position size (USD) — the card reports its real exit cost. */
+  referencePositionUsd: 100,
+  /** "Gentle" exit: price impact you'd barely notice. */
+  gentleImpactPct: 2,
+  /** Most you'd tolerate losing to slippage on the way out. */
+  toleratedImpactPct: 5,
+  /** If even a gentle exit is under this, the pool is unusably thin. */
+  dangerouslyThinUsd: 50
+};
 var LIVE_STATE = {
   /** Liquidity below this (USD) on a listed coin = effectively pulled. */
   deadLiquidityUsd: 1500,
@@ -72,11 +116,41 @@ var KING_GRADE = {
   }
 };
 var GRADE_META = [
-  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
-  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
-  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
-  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
-  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+  {
+    min: 80,
+    label: "GEM GRADE",
+    color: "#d4a017",
+    textColor: "#1b1b18",
+    blurb: 'Passed every check we can run \u2014 still speculative, never "safe".'
+  },
+  {
+    min: 60,
+    label: "STRONG",
+    color: "#46a758",
+    textColor: "#ffffff",
+    blurb: "Most checks passed \u2014 read the remaining flags before anything."
+  },
+  {
+    min: 40,
+    label: "MIXED",
+    color: "#ffb224",
+    textColor: "#1b1b18",
+    blurb: "Real flags or unverified checks \u2014 not an opportunity signal."
+  },
+  {
+    min: 20,
+    label: "WEAK",
+    color: "#f76b15",
+    textColor: "#ffffff",
+    blurb: "Serious problems found \u2014 the odds are against you here."
+  },
+  {
+    min: 0,
+    label: "AVOID",
+    color: "#e5484d",
+    textColor: "#ffffff",
+    blurb: "Severe red flags \u2014 this looks like a scam/rug setup."
+  }
 ];
 var GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
@@ -88,6 +162,37 @@ var GEM_CRITERIA = {
   /** Risk score must be at or below LIVE_FEED.notifyMaxScore, quality at or above LIVE_FEED.gemMinQuality. */
 };
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
+
+// lib/exitReality.ts
+function assessExitReality(market, mint, t = EXIT_REALITY) {
+  const liquidity = market?.liquidityEur ?? null;
+  const feePct = mint?.transferFeeBps != null ? mint.transferFeeBps / 100 : mint?.isToken2022 === false ? 0 : null;
+  if (liquidity === null || liquidity <= 0) {
+    return {
+      maxGentleUsd: null,
+      maxToleratedUsd: null,
+      refPositionImpactPct: null,
+      transferFeePct: feePct,
+      note: "Liquidity unknown \u2014 exit cost cannot be estimated. Assume you may not get out cleanly."
+    };
+  }
+  const reserve = liquidity / 2;
+  const maxFor = (impact) => reserve * impact / (1 - impact);
+  const maxGentleUsd = maxFor(t.gentleImpactPct / 100);
+  const maxToleratedUsd = maxFor(t.toleratedImpactPct / 100);
+  const ref = t.referencePositionUsd;
+  const rawImpact = ref / (ref + reserve) * 100;
+  const refPositionImpactPct = rawImpact + (feePct ?? 0);
+  let note;
+  if (maxGentleUsd < t.dangerouslyThinUsd) {
+    note = `Dangerously thin: even a $${Math.round(maxGentleUsd)} exit moves the price. You likely cannot sell a real position without collapsing it.`;
+  } else if (refPositionImpactPct > t.toleratedImpactPct) {
+    note = `A $${ref} position would cost ~${refPositionImpactPct.toFixed(1)}% to exit. Size down to ~$${Math.round(maxToleratedUsd)} or less.`;
+  } else {
+    note = `A $${ref} position exits at ~${refPositionImpactPct.toFixed(1)}% cost. Rough ceiling before it hurts: ~$${Math.round(maxToleratedUsd)}.`;
+  }
+  return { maxGentleUsd, maxToleratedUsd, refPositionImpactPct, transferFeePct: feePct, note };
+}
 
 // lib/liveState.ts
 function assessLiveState(market, t = LIVE_STATE) {
@@ -123,6 +228,12 @@ function assessLiveState(market, t = LIVE_STATE) {
   if (!haveMomentum) return { state: "UNKNOWN", reasons: ["No price-momentum data yet (unlisted/too fresh)."] };
   return { state: "HEALTHY", reasons: [] };
 }
+var LIVE_STATE_META = {
+  DEAD: { label: "\u{1F480} ALREADY RUGGED/DEAD", color: "#7a1d1d", textColor: "#ffd9d9" },
+  DUMPING: { label: "\u{1F4C9} DUMPING NOW", color: "#8a3a10", textColor: "#ffe0c9" },
+  HEALTHY: { label: "no collapse detected", color: "#2e5a3c", textColor: "#c9f0d4" },
+  UNKNOWN: { label: "momentum unknown", color: "#3a3f4c", textColor: "#e6e8ee" }
+};
 
 // lib/gemCriteria.ts
 function gemBackgroundCheck(a, risk, quality) {
@@ -132,10 +243,10 @@ function gemBackgroundCheck(a, risk, quality) {
     return { gem: false, blockers };
   }
   if (risk.riskScore > LIVE_FEED.notifyMaxScore) {
-    blockers.push(`Risk score ${risk.riskScore} above the ${LIVE_FEED.notifyMaxScore} gate.`);
+    blockers.push(`Too many weighted red flags to clear the gem gate (${risk.reasons.length} flag${risk.reasons.length === 1 ? "" : "s"}).`);
   }
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
-    blockers.push(`Quality ${quality.qualityScore} below the ${LIVE_FEED.gemMinQuality} gate.`);
+    blockers.push("Not enough positive signals yet (liquidity depth, holder spread, socials, age).");
   }
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
     blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
@@ -232,11 +343,68 @@ function gradeLabel(grade) {
   for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.label;
   return "AVOID";
 }
+function gradeBlurb(grade) {
+  if (grade === null) return "Not enough verified data to grade this coin.";
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.blurb;
+  return "Severe red flags \u2014 this looks like a scam/rug setup.";
+}
 function gradeColors(grade) {
   if (grade === null) return { color: "#3a3f4c", textColor: "#e6e8ee" };
   for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };
   return { color: "#e5484d", textColor: "#ffffff" };
 }
+
+// lib/rugPotential.ts
+function assessRugPotential(a, risk) {
+  const hard = [];
+  const soft = [];
+  const unverified = [];
+  const mint = a.mint;
+  if (!mint) {
+    unverified.push("mint/freeze authority");
+  } else {
+    if (mint.mintAuthorityActive === true) hard.push("Supply can be inflated (mint authority active).");
+    if (mint.freezeAuthorityActive === true) hard.push("Your wallet can be frozen (freeze authority active).");
+    if (mint.permanentDelegateActive === true) hard.push("Dev can seize tokens (permanent delegate).");
+    if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
+    if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
+    if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.mintAuthorityActive === null) unverified.push("mint authority");
+    if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
+  }
+  const sim = a.market?.sellSimulation;
+  if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (lp === "deployer_held") hard.push("Deployer holds the LP \u2014 liquidity can be pulled in one transaction.");
+  else if (lp === "unlocked") soft.push("LP not burned/locked \u2014 liquidity can be pulled.");
+  else if (lp === "unknown") unverified.push("LP burn/lock status");
+  if (a.launch?.bondingCurveComplete === false) {
+    soft.push("Still on the bonding curve \u2014 insiders can dump at any moment.");
+  }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev >= LIMITS.devHoldsPct) soft.push(`Dev wallet holds ${dev.toFixed(1)}% \u2014 positioned to dump.`);
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > GEM_CRITERIA.maxLargestWalletPct) {
+    soft.push(`A single wallet holds ${whale.toFixed(1)}% \u2014 one seller from a crash.`);
+  }
+  if (whale === null) unverified.push("holder concentration");
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) {
+    hard.push("Creator is a serial launcher with mostly dead coins.");
+  }
+  let verdict;
+  if (hard.length > 0) verdict = "HIGH";
+  else if (soft.length >= 2) verdict = "HIGH";
+  else if (soft.length === 1) verdict = "POSSIBLE";
+  else if (unverified.length > 0) verdict = "UNVERIFIED";
+  else verdict = "LOW";
+  return { verdict, vectors: [...hard, ...soft], unverified };
+}
+var RUG_VERDICT_META = {
+  HIGH: { color: "#e5484d", textColor: "#ffffff", label: "\u{1F6A9} RUG POTENTIAL: HIGH" },
+  POSSIBLE: { color: "#f76b15", textColor: "#ffffff", label: "\u{1F6A9} RUG POTENTIAL: POSSIBLE" },
+  LOW: { color: "#2e5a3c", textColor: "#c9f0d4", label: "RUG VECTORS: none found (\u2260 safe)" },
+  UNVERIFIED: { color: "#3a3f4c", textColor: "#e6e8ee", label: "RUG CHECK: not fully verified yet" }
+};
 
 // popup/popup.ts
 var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
@@ -355,7 +523,9 @@ function render(analysis, risk, quality, mock) {
   const fill = $("score-fill");
   fill.style.width = `${kg.grade ?? 0}%`;
   fill.style.background = gc.color;
-  $("score-num").textContent = kg.grade === null ? "\u2014 / 100" : `${kg.grade}% King Grade`;
+  $("score-num").textContent = kg.grade === null ? "\u2014 no grade" : `${kg.grade}% King Grade`;
+  $("grade-blurb").textContent = gradeBlurb(kg.grade);
+  renderStatusBanner(analysis, risk);
   const reasons = $("reasons");
   reasons.innerHTML = "";
   if (risk.reasons.length === 0) {
@@ -373,12 +543,45 @@ function render(analysis, risk, quality, mock) {
   gaps.innerHTML = "";
   for (const g of risk.dataGaps) gaps.appendChild(li("gap-item", g));
   $("gaps-details").hidden = risk.dataGaps.length === 0;
-  renderMetrics(analysis, risk, quality);
+  renderMetrics(analysis, quality);
   $("link-solscan").href = `https://solscan.io/token/${addr}`;
   $("link-rugcheck").href = `https://rugcheck.xyz/tokens/${addr}`;
   $("link-gmgn").href = `https://gmgn.ai/sol/token/${addr}`;
 }
-function renderMetrics(a, risk, quality) {
+function renderStatusBanner(a, risk) {
+  const el = $("status-banner");
+  el.innerHTML = "";
+  el.hidden = false;
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD" || live.state === "DUMPING") {
+    const lm = LIVE_STATE_META[live.state];
+    el.style.background = lm.color;
+    el.style.color = lm.textColor;
+    el.append(strong(lm.label));
+    for (const r of live.reasons.slice(0, 2)) el.append(span(r));
+    el.append(span("Do not enter \u2014 this is not an early opportunity."));
+    return;
+  }
+  const rug = assessRugPotential(a, risk);
+  const rm = RUG_VERDICT_META[rug.verdict];
+  el.style.background = rm.color;
+  el.style.color = rm.textColor;
+  el.append(strong(rm.label));
+  if (rug.vectors.length > 0) el.append(span(rug.vectors[0]));
+  else if (rug.unverified.length > 0) el.append(span(`Unverified: ${rug.unverified.join(", ")}.`));
+  if (rug.vectors.length > 1) el.append(span(`+${rug.vectors.length - 1} more open vector${rug.vectors.length > 2 ? "s" : ""}.`));
+}
+function strong(text) {
+  const el = document.createElement("b");
+  el.textContent = text;
+  return el;
+}
+function span(text) {
+  const el = document.createElement("span");
+  el.textContent = text;
+  return el;
+}
+function renderMetrics(a, quality) {
   const m = a.market;
   const h = a.holders;
   const mint = a.mint;
@@ -408,12 +611,14 @@ function renderMetrics(a, risk, quality) {
       v: quality.insufficientData ? "unknown" : `${quality.qualityScore}/100`,
       cls: !quality.insufficientData && quality.qualityScore >= 50 ? "good" : void 0
     },
+    // The grade is already the headline — this slot answers the question the
+    // grade can't: how much money can you actually get back OUT of this pool?
     (() => {
-      const kg = computeKingGrade(a, risk, quality);
+      const exit = assessExitReality(a.market, a.mint);
       return {
-        k: "King Grade",
-        v: kg.grade === null ? "unknown" : `${kg.grade}% ${gradeLabel(kg.grade)}`,
-        cls: kg.grade !== null && kg.grade >= 60 ? "good" : kg.grade !== null && kg.grade < 20 ? "bad" : void 0
+        k: "Max exit (low slip)",
+        v: exit.maxGentleUsd === null ? "unknown" : eur(exit.maxGentleUsd),
+        cls: exit.maxGentleUsd !== null && exit.maxGentleUsd < 100 ? "bad" : void 0
       };
     })()
   ];

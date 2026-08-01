@@ -119,6 +119,13 @@ export function gradeLabel(grade: number | null): string {
   return 'AVOID';
 }
 
+/** Plain-language line for a grade — same direction as the number (higher = better). */
+export function gradeBlurb(grade: number | null): string {
+  if (grade === null) return 'Not enough verified data to grade this coin.';
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.blurb;
+  return 'Severe red flags — this looks like a scam/rug setup.';
+}
+
 export function gradeColors(grade: number | null): { color: string; textColor: string } {
   if (grade === null) return { color: '#3a3f4c', textColor: '#e6e8ee' };
   for (const bucket of GRADE_META) if (grade >= bucket.min) return { color: bucket.color, textColor: bucket.textColor };

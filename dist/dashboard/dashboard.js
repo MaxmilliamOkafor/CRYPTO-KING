@@ -2,11 +2,41 @@
 var MOCK_MODE = false;
 var CACHE_TTL_MS = 5 * 6e4;
 var GRADE_META = [
-  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
-  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
-  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
-  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
-  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+  {
+    min: 80,
+    label: "GEM GRADE",
+    color: "#d4a017",
+    textColor: "#1b1b18",
+    blurb: 'Passed every check we can run \u2014 still speculative, never "safe".'
+  },
+  {
+    min: 60,
+    label: "STRONG",
+    color: "#46a758",
+    textColor: "#ffffff",
+    blurb: "Most checks passed \u2014 read the remaining flags before anything."
+  },
+  {
+    min: 40,
+    label: "MIXED",
+    color: "#ffb224",
+    textColor: "#1b1b18",
+    blurb: "Real flags or unverified checks \u2014 not an opportunity signal."
+  },
+  {
+    min: 20,
+    label: "WEAK",
+    color: "#f76b15",
+    textColor: "#ffffff",
+    blurb: "Serious problems found \u2014 the odds are against you here."
+  },
+  {
+    min: 0,
+    label: "AVOID",
+    color: "#e5484d",
+    textColor: "#ffffff",
+    blurb: "Severe red flags \u2014 this looks like a scam/rug setup."
+  }
 ];
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
 

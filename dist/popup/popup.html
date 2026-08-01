@@ -28,12 +28,15 @@
           <div class="score-bar"><div id="score-fill" class="score-fill"></div></div>
           <div class="score-legend">
             <span id="score-num" class="score-num"></span>
-            <span class="legend-note">0 = lower observed risk (≠ safe) · 100 = severe risk</span>
+            <span id="grade-blurb" class="legend-note"></span>
+            <span class="legend-note">King Grade — higher = better. 100% = passed every check we can run; it is never "safe" and never a buy signal.</span>
           </div>
         </div>
 
+        <div id="status-banner" class="status-banner" hidden></div>
+
         <details id="reasons-details" open>
-          <summary>Why this score?</summary>
+          <summary>Why this grade?</summary>
           <ul id="reasons"></ul>
           <ul id="mitigations"></ul>
         </details>

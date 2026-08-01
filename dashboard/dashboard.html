@@ -30,7 +30,7 @@
               </select>
             </label>
             <label>Min grade % <input id="f-min-score" type="number" min="0" max="100" placeholder="0" /></label>
-            <label>Max mcap € <input id="f-max-mcap" type="number" min="0" placeholder="∞" /></label>
+            <label>Max mcap $ <input id="f-max-mcap" type="number" min="0" placeholder="∞" /></label>
             <label>Max age (min) <input id="f-max-age" type="number" min="0" placeholder="∞" /></label>
             <button id="clear-recent" class="ghost">Clear history</button>
           </div>
@@ -69,17 +69,17 @@
         <form id="journal-form">
           <input id="j-symbol" placeholder="Symbol" required maxlength="16" />
           <input id="j-address" placeholder="Mint address (optional)" maxlength="44" />
-          <input id="j-entry" type="number" step="any" min="0" placeholder="Entry price €" required />
+          <input id="j-entry" type="number" step="any" min="0" placeholder="Entry price $" required />
           <input id="j-amount" type="number" step="any" min="0" placeholder="Amount (tokens)" required />
-          <input id="j-exit" type="number" step="any" min="0" placeholder="Exit price € (optional)" />
+          <input id="j-exit" type="number" step="any" min="0" placeholder="Exit price $ (optional)" />
           <input id="j-note" placeholder="Note" maxlength="120" />
           <button type="submit">Log entry</button>
         </form>
         <table id="journal-table">
           <thead>
             <tr>
-              <th>Token</th><th>Entry €</th><th>Amount</th><th>Exit €</th>
-              <th>P&amp;L €</th><th>Note</th><th>Logged</th><th></th>
+              <th>Token</th><th>Entry $</th><th>Amount</th><th>Exit $</th>
+              <th>P&amp;L $</th><th>Note</th><th>Logged</th><th></th>
             </tr>
           </thead>
           <tbody id="journal-body"></tbody>

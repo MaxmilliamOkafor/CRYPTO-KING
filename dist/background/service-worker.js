@@ -84,7 +84,13 @@ var LIVE_FEED = {
    * AND quality ≥ gemMinQuality. An attention aid for candidates worth YOUR
    * research — emphatically not a buy signal.
    */
-  gemMinQuality: 30
+  gemMinQuality: 30,
+  /**
+   * "Hide risky coins" cut-off, expressed in King Grade (higher = better) so the
+   * toggle, the ⚠ counter and the % on each row all read the same direction.
+   * 40 = the bottom of the MIXED band; WEAK/AVOID are hidden.
+   */
+  safeMinGrade: 40
 };
 var DEXSCREENER = {
   enabled: true,
@@ -376,11 +382,41 @@ var KING_GRADE = {
   }
 };
 var GRADE_META = [
-  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
-  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
-  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
-  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
-  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+  {
+    min: 80,
+    label: "GEM GRADE",
+    color: "#d4a017",
+    textColor: "#1b1b18",
+    blurb: 'Passed every check we can run \u2014 still speculative, never "safe".'
+  },
+  {
+    min: 60,
+    label: "STRONG",
+    color: "#46a758",
+    textColor: "#ffffff",
+    blurb: "Most checks passed \u2014 read the remaining flags before anything."
+  },
+  {
+    min: 40,
+    label: "MIXED",
+    color: "#ffb224",
+    textColor: "#1b1b18",
+    blurb: "Real flags or unverified checks \u2014 not an opportunity signal."
+  },
+  {
+    min: 20,
+    label: "WEAK",
+    color: "#f76b15",
+    textColor: "#ffffff",
+    blurb: "Serious problems found \u2014 the odds are against you here."
+  },
+  {
+    min: 0,
+    label: "AVOID",
+    color: "#e5484d",
+    textColor: "#ffffff",
+    blurb: "Severe red flags \u2014 this looks like a scam/rug setup."
+  }
 ];
 var GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
@@ -1028,10 +1064,10 @@ function gemBackgroundCheck(a, risk, quality) {
     return { gem: false, blockers };
   }
   if (risk.riskScore > LIVE_FEED.notifyMaxScore) {
-    blockers.push(`Risk score ${risk.riskScore} above the ${LIVE_FEED.notifyMaxScore} gate.`);
+    blockers.push(`Too many weighted red flags to clear the gem gate (${risk.reasons.length} flag${risk.reasons.length === 1 ? "" : "s"}).`);
   }
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
-    blockers.push(`Quality ${quality.qualityScore} below the ${LIVE_FEED.gemMinQuality} gate.`);
+    blockers.push("Not enough positive signals yet (liquidity depth, holder spread, socials, age).");
   }
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
     blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");

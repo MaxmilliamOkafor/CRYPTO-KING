@@ -32,11 +32,13 @@ export function gemBackgroundCheck(a: TokenAnalysis, risk: RiskResult, quality: 
     return { gem: false, blockers };
   }
 
+  // Worded so the user never sees a second, inverted "score" competing with the
+  // King Grade — these are pass/fail gates, not numbers to compare grades against.
   if (risk.riskScore > LIVE_FEED.notifyMaxScore) {
-    blockers.push(`Risk score ${risk.riskScore} above the ${LIVE_FEED.notifyMaxScore} gate.`);
+    blockers.push(`Too many weighted red flags to clear the gem gate (${risk.reasons.length} flag${risk.reasons.length === 1 ? '' : 's'}).`);
   }
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
-    blockers.push(`Quality ${quality.qualityScore} below the ${LIVE_FEED.gemMinQuality} gate.`);
+    blockers.push('Not enough positive signals yet (liquidity depth, holder spread, socials, age).');
   }
 
   // Dev-dump window: on the bonding curve, insiders can sell any second.

@@ -72,7 +72,13 @@ var LIVE_FEED = {
    * AND quality ≥ gemMinQuality. An attention aid for candidates worth YOUR
    * research — emphatically not a buy signal.
    */
-  gemMinQuality: 30
+  gemMinQuality: 30,
+  /**
+   * "Hide risky coins" cut-off, expressed in King Grade (higher = better) so the
+   * toggle, the ⚠ counter and the % on each row all read the same direction.
+   * 40 = the bottom of the MIXED band; WEAK/AVOID are hidden.
+   */
+  safeMinGrade: 40
 };
 var INLINE_BADGES = {
   enabled: true,
@@ -158,11 +164,41 @@ var KING_GRADE = {
   }
 };
 var GRADE_META = [
-  { min: 80, label: "GEM GRADE", color: "#d4a017", textColor: "#1b1b18" },
-  { min: 60, label: "STRONG", color: "#46a758", textColor: "#ffffff" },
-  { min: 40, label: "MIXED", color: "#ffb224", textColor: "#1b1b18" },
-  { min: 20, label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
-  { min: 0, label: "AVOID", color: "#e5484d", textColor: "#ffffff" }
+  {
+    min: 80,
+    label: "GEM GRADE",
+    color: "#d4a017",
+    textColor: "#1b1b18",
+    blurb: 'Passed every check we can run \u2014 still speculative, never "safe".'
+  },
+  {
+    min: 60,
+    label: "STRONG",
+    color: "#46a758",
+    textColor: "#ffffff",
+    blurb: "Most checks passed \u2014 read the remaining flags before anything."
+  },
+  {
+    min: 40,
+    label: "MIXED",
+    color: "#ffb224",
+    textColor: "#1b1b18",
+    blurb: "Real flags or unverified checks \u2014 not an opportunity signal."
+  },
+  {
+    min: 20,
+    label: "WEAK",
+    color: "#f76b15",
+    textColor: "#ffffff",
+    blurb: "Serious problems found \u2014 the odds are against you here."
+  },
+  {
+    min: 0,
+    label: "AVOID",
+    color: "#e5484d",
+    textColor: "#ffffff",
+    blurb: "Severe red flags \u2014 this looks like a scam/rug setup."
+  }
 ];
 var GEM_CRITERIA = {
   /** Must be OFF the bonding curve (graduated) — on-curve devs can dump any second. */
@@ -172,13 +208,6 @@ var GEM_CRITERIA = {
   /** No single non-LP wallet may hold more than this % of supply. */
   maxLargestWalletPct: 10
   /** Risk score must be at or below LIVE_FEED.notifyMaxScore, quality at or above LIVE_FEED.gemMinQuality. */
-};
-var SIGNAL_META = {
-  AVOID: { color: "#e5484d", textColor: "#ffffff", label: "AVOID", blurb: "Severe red flags \u2014 likely scam/rug setup." },
-  HIGH_RISK: { color: "#f76b15", textColor: "#ffffff", label: "HIGH RISK", blurb: "Multiple serious red flags." },
-  WATCH: { color: "#ffb224", textColor: "#1b1b18", label: "RISKY", blurb: "Notable red flags \u2014 read them first." },
-  CONSIDER: { color: "#46a758", textColor: "#ffffff", label: "MILD RISK", blurb: "Some red flags found \u2014 not danger-free, not a buy call." },
-  NEUTRAL: { color: "#64748b", textColor: "#ffffff", label: "LOW RISK", blurb: "Few red flags found \u2014 still speculative, not safe." }
 };
 var DISCLAIMER = "Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.";
 
@@ -231,10 +260,10 @@ function gemBackgroundCheck(a, risk, quality) {
     return { gem: false, blockers };
   }
   if (risk.riskScore > LIVE_FEED.notifyMaxScore) {
-    blockers.push(`Risk score ${risk.riskScore} above the ${LIVE_FEED.notifyMaxScore} gate.`);
+    blockers.push(`Too many weighted red flags to clear the gem gate (${risk.reasons.length} flag${risk.reasons.length === 1 ? "" : "s"}).`);
   }
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
-    blockers.push(`Quality ${quality.qualityScore} below the ${LIVE_FEED.gemMinQuality} gate.`);
+    blockers.push("Not enough positive signals yet (liquidity depth, holder spread, socials, age).");
   }
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
     blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
@@ -330,6 +359,11 @@ function gradeLabel(grade) {
   if (grade === null) return "NO DATA";
   for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.label;
   return "AVOID";
+}
+function gradeBlurb(grade) {
+  if (grade === null) return "Not enough verified data to grade this coin.";
+  for (const bucket of GRADE_META) if (grade >= bucket.min) return bucket.blurb;
+  return "Severe red flags \u2014 this looks like a scam/rug setup.";
 }
 function gradeColors(grade) {
   if (grade === null) return { color: "#3a3f4c", textColor: "#e6e8ee" };
@@ -1258,7 +1292,7 @@ async function pollLiveFeed() {
     liveRows = res.feed;
     if (!collapsed) {
       updateLiveList();
-      const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === "AVOID" || r.signal === "HIGH_RISK")).length;
+      const worst = liveRows.filter((r) => !r.insufficientData && !passesSafeFilter(r)).length;
       const gems = liveRows.filter(isGem).length;
       setLiveStatus(
         `\u{1F534} live \xB7 ${liveRows.length} fresh coins \xB7 \u26A0 ${worst} high-risk \xB7 \u{1F48E} ${gems} candidates` + (res.source === "mock" ? " \xB7 MOCK" : "")
@@ -1291,15 +1325,14 @@ function setLiveStatus(text) {
   const el = shadow?.querySelector(".live-status");
   if (el) el.textContent = text;
 }
+function passesSafeFilter(r) {
+  return r.grade !== null && r.grade >= LIVE_FEED.safeMinGrade && r.rugVerdict !== "HIGH" && r.liveState !== "DEAD" && r.liveState !== "DUMPING";
+}
 function updateLiveList() {
   const list = shadow?.querySelector(".livelist");
   if (!list) return;
   let rows = [...liveRows];
-  if (liveSafeOnly) {
-    rows = rows.filter(
-      (r) => !r.insufficientData && r.signal !== "AVOID" && r.signal !== "HIGH_RISK" && r.rugVerdict !== "HIGH" && r.liveState !== "DEAD" && r.liveState !== "DUMPING"
-    );
-  }
+  if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && passesSafeFilter(r));
   if (liveLowCapOnly) {
     rows = rows.filter((r) => r.marketCapEur !== null && r.marketCapEur <= LIVE_FEED.lowCapMaxEur || isGem(r));
   }
@@ -1613,7 +1646,6 @@ function render(analysis, risk, quality, mock) {
     return;
   }
   const body = cardBody();
-  const meta = SIGNAL_META[risk.signal];
   const kg = computeKingGrade(analysis, risk, quality);
   const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? "No individual risk factors triggered \u2014 low observed risk \u2260 safe.";
@@ -1645,7 +1677,7 @@ function render(analysis, risk, quality, mock) {
     ${subLine}
     <div class="row">
       <button class="details-btn">Details \u25BE</button>
-      <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
+      <span class="muted" style="font-size:11px">${esc(gradeBlurb(kg.grade))}</span>
     </div>
     <div class="x-monitor"></div>
     <div class="panel" hidden></div>

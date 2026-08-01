@@ -9,7 +9,8 @@
 
 import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
-import { computeKingGrade } from '../lib/kingGrade.ts';
+import { GRADE_META, LIVE_FEED } from '../config.ts';
+import { computeKingGrade, gradeBlurb, gradeLabel } from '../lib/kingGrade.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
 import { classifyOutcome, computeAccuracy } from '../lib/outcomeLedger.ts';
@@ -586,6 +587,36 @@ test('outcome ledger: accuracy report groups by grade band and computes survival
   assert.equal(weak.survivalPct, 0);
   assert.equal(acc.pending, 1);
   assert.equal(acc.totalChecked, 3);
+});
+
+/* ── 🧭 One scale, one direction (the "55 is risky but 80 is good?" bug) ── */
+
+test('grade bands are ordered high→low and every band carries a blurb', () => {
+  for (let i = 1; i < GRADE_META.length; i++) {
+    assert.ok(GRADE_META[i].min < GRADE_META[i - 1].min, 'GRADE_META must descend');
+  }
+  for (const b of GRADE_META) {
+    assert.ok(b.blurb.length > 10, `band ${b.label} needs a blurb`);
+    // No band may describe itself with the OLD inverted vocabulary.
+    assert.ok(!/^low risk|^mild risk/i.test(b.blurb), `band ${b.label} uses inverted wording`);
+  }
+});
+
+test('gradeBlurb / gradeLabel read the same direction as the number', () => {
+  assert.equal(gradeLabel(95), 'GEM GRADE');
+  assert.equal(gradeLabel(5), 'AVOID');
+  assert.equal(gradeLabel(null), 'NO DATA');
+  assert.notEqual(gradeBlurb(95), gradeBlurb(5)); // the two extremes must not read alike
+  assert.match(gradeBlurb(5), /red flag|scam|rug/i); // low grade = danger
+  assert.match(gradeBlurb(95), /still speculative|never/i); // high grade never claims "safe"
+  assert.match(gradeBlurb(null), /not enough/i);
+});
+
+test('the "hide risky" cut-off is expressed as a grade, not an inverted score', () => {
+  // A coin at the cut-off must label into the MIXED band or better — if this
+  // ever flips, the toggle and the % on the row would disagree again.
+  assert.equal(gradeLabel(LIVE_FEED.safeMinGrade), 'MIXED');
+  assert.equal(gradeLabel(LIVE_FEED.safeMinGrade - 1), 'WEAK');
 });
 
 console.log(`\n${passed} tests passed.`);

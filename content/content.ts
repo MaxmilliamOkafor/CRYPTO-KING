@@ -21,9 +21,9 @@
  * then DOM fallback (Solscan links near the token header).
  */
 
-import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE, SIGNAL_META } from '../config.ts';
+import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
-import { computeKingGrade, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
+import { computeKingGrade, gradeBlurb, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState, LIVE_STATE_META } from '../lib/liveState.ts';
 import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
@@ -691,7 +691,7 @@ async function pollLiveFeed(): Promise<void> {
     liveRows = res.feed;
     if (!collapsed) {
       updateLiveList();
-      const worst = liveRows.filter((r) => !r.insufficientData && (r.signal === 'AVOID' || r.signal === 'HIGH_RISK')).length;
+      const worst = liveRows.filter((r) => !r.insufficientData && !passesSafeFilter(r)).length;
       const gems = liveRows.filter(isGem).length;
       setLiveStatus(
         `🔴 live · ${liveRows.length} fresh coins · ⚠ ${worst} high-risk · 💎 ${gems} candidates` +
@@ -739,22 +739,25 @@ function setLiveStatus(text: string): void {
   if (el) el.textContent = text;
 }
 
+/** The one definition of "not obviously bad" — same direction as the grade
+ *  (higher = better), so the "hide risky" toggle and the ⚠ counter can never
+ *  disagree with the % shown on the row. A null grade is NOT treated as safe. */
+function passesSafeFilter(r: FeedRow): boolean {
+  return (
+    r.grade !== null &&
+    r.grade >= LIVE_FEED.safeMinGrade &&
+    r.rugVerdict !== 'HIGH' &&
+    r.liveState !== 'DEAD' &&
+    r.liveState !== 'DUMPING'
+  );
+}
+
 function updateLiveList(): void {
   const list = shadow?.querySelector<HTMLDivElement>('.livelist');
   if (!list) return;
 
   let rows = [...liveRows];
-  if (liveSafeOnly) {
-    rows = rows.filter(
-      (r) =>
-        !r.insufficientData &&
-        r.signal !== 'AVOID' &&
-        r.signal !== 'HIGH_RISK' &&
-        r.rugVerdict !== 'HIGH' &&
-        r.liveState !== 'DEAD' &&
-        r.liveState !== 'DUMPING',
-    );
-  }
+  if (liveSafeOnly) rows = rows.filter((r) => !r.insufficientData && passesSafeFilter(r));
   // "Low caps only" keeps 💎 gem-grade coins visible even above the cap —
   // a strong candidate shouldn't vanish just because it already grew.
   if (liveLowCapOnly) {
@@ -1170,7 +1173,6 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
     return;
   }
   const body = cardBody();
-  const meta = SIGNAL_META[risk.signal];
   const kg = computeKingGrade(analysis, risk, quality);
   const gc = gradeColors(kg.grade);
   const topReason = risk.reasons[0]?.text ?? 'No individual risk factors triggered — low observed risk ≠ safe.';
@@ -1214,7 +1216,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
     ${subLine}
     <div class="row">
       <button class="details-btn">Details ▾</button>
-      <span class="muted" style="font-size:11px">${esc(meta.blurb)}</span>
+      <span class="muted" style="font-size:11px">${esc(gradeBlurb(kg.grade))}</span>
     </div>
     <div class="x-monitor"></div>
     <div class="panel" hidden></div>

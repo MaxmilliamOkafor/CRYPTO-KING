@@ -371,6 +371,33 @@ function gradeColors(grade) {
   return { color: "#e5484d", textColor: "#ffffff" };
 }
 
+// lib/linkTargets.ts
+var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
+var MINT_HREF_RES = [
+  new RegExp(`/sol/token/(${BASE58})`),
+  // gmgn.ai
+  new RegExp(`/coin/(${BASE58})`),
+  // pump.fun
+  new RegExp(`solscan\\.io/token/(${BASE58})`),
+  new RegExp(`birdeye\\.so/token/(${BASE58})`)
+];
+var PAIR_HREF_RES = [
+  new RegExp(`/pair-explorer/(${BASE58})`),
+  // dextools, all chains
+  new RegExp(`dexscreener\\.com/solana/(${BASE58})`)
+];
+function matchFirst(res, href) {
+  for (const re of res) {
+    const m = href.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+function pairLinksAreSolana(hostname, pathname) {
+  if (!hostname.endsWith("dextools.io")) return true;
+  return /(^|\/)solana(\/|$)/.test(pathname);
+}
+
 // lib/exitReality.ts
 function assessExitReality(market, mint, t = EXIT_REALITY) {
   const liquidity = market?.liquidityEur ?? null;
@@ -737,14 +764,58 @@ async function call(name, address) {
 }
 
 // content/content.ts
-var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
+var BASE582 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
 var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var URL_PATTERNS = [
-  new RegExp(`/sol/token/(${BASE58})(?:[/?#]|$)`),
+  new RegExp(`/sol/token/(${BASE582})(?:[/?#]|$)`),
   // gmgn.ai
-  new RegExp(`/coin/(${BASE58})(?:[/?#]|$)`)
+  new RegExp(`/coin/(${BASE582})(?:[/?#]|$)`)
   // pump.fun
 ];
+var isDextools = () => location.hostname.endsWith("dextools.io");
+var solanaPairRoute = () => pairLinksAreSolana(location.hostname, location.pathname);
+var pairState = /* @__PURE__ */ new Map();
+var PAIR_MAX_ATTEMPTS = 4;
+function pairsToResolve(found) {
+  const out = [];
+  for (const p of found) {
+    const e = pairState.get(p);
+    if (!e) out.push(p);
+    else if (e.state === "failed" && e.attempts < PAIR_MAX_ATTEMPTS) out.push(p);
+  }
+  return [...new Set(out)];
+}
+async function resolvePairMints(pairs) {
+  const ask = pairsToResolve(pairs);
+  const known2 = /* @__PURE__ */ new Map();
+  for (const p of pairs) {
+    const e = pairState.get(p);
+    if (e?.state === "done" && e.mint) known2.set(p, e.mint);
+  }
+  if (ask.length === 0) return known2;
+  for (const p of ask) {
+    const prev = pairState.get(p);
+    pairState.set(p, { state: "pending", attempts: (prev?.attempts ?? 0) + 1 });
+  }
+  const res = await new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: "RESOLVE_PAIRS", pairAddresses: ask },
+      (r) => resolve(r)
+    );
+  });
+  for (const p of ask) {
+    const tok = res?.ok ? res.tokens[p] : void 0;
+    const attempts = pairState.get(p)?.attempts ?? 1;
+    if (tok?.address) {
+      pairState.set(p, { state: "done", mint: tok.address, attempts });
+      known2.set(p, tok.address);
+      if (tok.symbol && !symbolHints.has(tok.address)) symbolHints.set(tok.address, tok.symbol.toUpperCase());
+    } else {
+      pairState.set(p, { state: "failed", attempts });
+    }
+  }
+  return known2;
+}
 var currentAddress = null;
 var lastHref = "";
 var view = "none";
@@ -753,12 +824,16 @@ function addressFromUrl() {
     const m = location.pathname.match(re);
     if (m) return m[1];
   }
+  if (isDextools()) return null;
   const seg = location.pathname.split("/").filter(Boolean).pop() ?? "";
   return BASE58_RE.test(seg) ? seg : null;
 }
+function pairFromUrl() {
+  return matchFirst(PAIR_HREF_RES, location.pathname);
+}
 function addressFromDom() {
   const link = document.querySelector('a[href*="solscan.io/token/"]');
-  const m = link?.href.match(new RegExp(`solscan\\.io/token/(${BASE58})`));
+  const m = link?.href.match(new RegExp(`solscan\\.io/token/(${BASE582})`));
   return m ? m[1] : null;
 }
 var lastAutoScanned = null;
@@ -770,6 +845,16 @@ function detect() {
     view = "token";
     void analyze(urlAddr);
     return;
+  }
+  const urlPair = solanaPairRoute() ? pairFromUrl() : null;
+  if (urlPair && urlPair !== lastAutoScanned) {
+    lastAutoScanned = urlPair;
+    void resolvePairMints([urlPair]).then((map) => {
+      const mint = map.get(urlPair);
+      if (!mint || collapsed || pairFromUrl() !== urlPair) return;
+      view = "token";
+      void analyze(mint);
+    });
   }
   if (view === "token") return;
   if (view !== "home") {
@@ -1137,25 +1222,32 @@ var MAX_SCAN = 40;
 var pageScan = /* @__PURE__ */ new Map();
 var symbolHints = /* @__PURE__ */ new Map();
 var scanning = false;
-function collectMints() {
+async function collectMints() {
   const set = /* @__PURE__ */ new Set();
-  const res = [
-    new RegExp(`/sol/token/(${BASE58})`),
-    new RegExp(`/coin/(${BASE58})`),
-    new RegExp(`solscan\\.io/token/(${BASE58})`)
-  ];
+  const pairLinks = /* @__PURE__ */ new Map();
   document.querySelectorAll("a[href]").forEach((a) => {
     const href = a.getAttribute("href") ?? "";
-    for (const re of res) {
-      const m = href.match(re);
-      if (m) {
-        set.add(m[1]);
-        const hint = symbolFromText(a.textContent ?? "");
-        if (hint && !symbolHints.has(m[1])) symbolHints.set(m[1], hint);
-        break;
-      }
+    const text = a.textContent ?? "";
+    const mint = matchFirst(MINT_HREF_RES, href);
+    if (mint) {
+      set.add(mint);
+      const hint = symbolFromText(text);
+      if (hint && !symbolHints.has(mint)) symbolHints.set(mint, hint);
+      return;
     }
+    if (!solanaPairRoute()) return;
+    const pair = matchFirst(PAIR_HREF_RES, href);
+    if (pair && !pairLinks.has(pair)) pairLinks.set(pair, symbolFromText(text) ?? "");
   });
+  if (pairLinks.size > 0) {
+    const pairs = [...pairLinks.keys()].slice(0, MAX_SCAN);
+    const resolved = await resolvePairMints(pairs);
+    for (const [pair, mintAddr] of resolved) {
+      set.add(mintAddr);
+      const hint = pairLinks.get(pair);
+      if (hint && !symbolHints.has(mintAddr)) symbolHints.set(mintAddr, hint);
+    }
+  }
   return [...set].slice(0, MAX_SCAN);
 }
 function symbolFromText(t) {
@@ -1164,12 +1256,19 @@ function symbolFromText(t) {
 }
 async function scanPage() {
   if (scanning || collapsed) return;
-  const queue = collectMints().filter((m) => !pageScan.has(m));
+  scanning = true;
+  let queue;
+  try {
+    queue = (await collectMints()).filter((m) => !pageScan.has(m));
+  } catch {
+    scanning = false;
+    return;
+  }
   if (queue.length === 0) {
+    scanning = false;
     updateScanList();
     return;
   }
-  scanning = true;
   setScanStatus(`Scanning ${queue.length} coin${queue.length > 1 ? "s" : ""}\u2026`);
   let i = 0;
   const worker = async () => {
@@ -1209,6 +1308,25 @@ function replicaSymbols() {
   }
   return new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
 }
+function pendingPairCount() {
+  let n = 0;
+  for (const e of pairState.values()) if (e.state === "pending" || e.state === "failed" && e.attempts < PAIR_MAX_ATTEMPTS) n++;
+  return n;
+}
+function emptyScanStatus() {
+  const p = pendingPairCount();
+  if (p > 0) return `Resolving ${p} pool${p > 1 ? "s" : ""} \u2192 token\u2026`;
+  return "No coin links found on this page.";
+}
+function emptyScanHelp() {
+  if (pendingPairCount() > 0) {
+    return "Looking up the tokens behind this page\u2019s pools \u2014 brand-new pools can take a minute to be indexed.";
+  }
+  if (isDextools()) {
+    return "DEXTools renders its table dynamically, so links may not be readable here. The \u{1F534} live feed above pulls new Solana launches directly from the API and works on every page \u2014 or paste an address into the scan box.";
+  }
+  return "No token links detected here yet. Use the scan box above, or open a coin.";
+}
 function setScanStatus(text) {
   const el = shadow?.querySelector(".scan-status");
   if (el) el.textContent = text;
@@ -1230,10 +1348,10 @@ function updateScanList() {
     parts.push(rows.length ? `${rows.length} scanned` : "");
     if (avoid) parts.push(`\u26A0 ${avoid} high-risk`);
     if (replicaCount) parts.push(`\u{1F465} ${replicaCount} possible copycat${replicaCount > 1 ? "s" : ""}`);
-    setScanStatus(parts.filter(Boolean).join(" \xB7 ") || "No linked coins found on this page.");
+    setScanStatus(parts.filter(Boolean).join(" \xB7 ") || emptyScanStatus());
   }
   if (rows.length === 0) {
-    list.innerHTML = `<div class="scan-empty">No token links detected here yet. Use the scan box above, or open a coin.</div>`;
+    list.innerHTML = `<div class="scan-empty">${esc(emptyScanHelp())}</div>`;
     return;
   }
   list.innerHTML = rows.map((r) => {
@@ -1479,61 +1597,48 @@ function ageShort(m) {
 var inlineResults = /* @__PURE__ */ new Map();
 var badgeEls = /* @__PURE__ */ new Map();
 var badgedLinks = /* @__PURE__ */ new WeakSet();
-var pairCache = /* @__PURE__ */ new Map();
 var inlineQueue = [];
 var inlineWorkers = 0;
-var MINT_HREF_RES = [
-  new RegExp(`/sol/token/(${BASE58})`),
-  new RegExp(`/coin/(${BASE58})`),
-  new RegExp(`solscan\\.io/token/(${BASE58})`)
-];
-var PAIR_HREF_RE = new RegExp(`/pair-explorer/(${BASE58})`);
+var resolvingPairs = false;
 function sweepInlineBadges() {
   if (!INLINE_BADGES.enabled || inlineResults.size >= INLINE_BADGES.maxPerPage) return;
   const pendingPairs = [];
   document.querySelectorAll("a[href]").forEach((a) => {
     if (badgedLinks.has(a)) return;
     const href = a.getAttribute("href") ?? "";
-    for (const re of MINT_HREF_RES) {
-      const m = href.match(re);
-      if (m) {
-        badgedLinks.add(a);
-        attachBadge(a, m[1]);
-        queueInlineScan(m[1]);
-        return;
-      }
+    const mint = matchFirst(MINT_HREF_RES, href);
+    if (mint) {
+      badgedLinks.add(a);
+      attachBadge(a, mint);
+      queueInlineScan(mint);
+      return;
     }
-    if (location.hostname.endsWith("dextools.io") && location.pathname.includes("/solana/")) {
-      const pm = href.match(PAIR_HREF_RE);
-      if (pm) {
-        badgedLinks.add(a);
-        const known2 = pairCache.get(pm[1]);
-        if (known2) {
-          attachBadge(a, known2);
-          queueInlineScan(known2);
-        } else if (known2 === void 0) {
-          pairCache.set(pm[1], null);
-          pendingPairs.push({ a, pair: pm[1] });
-        }
-      }
+    if (!solanaPairRoute()) return;
+    const pair = matchFirst(PAIR_HREF_RES, href);
+    if (!pair) return;
+    const entry = pairState.get(pair);
+    if (entry?.state === "done" && entry.mint) {
+      badgedLinks.add(a);
+      attachBadge(a, entry.mint);
+      queueInlineScan(entry.mint);
+    } else if (!entry || entry.state === "failed" && entry.attempts < PAIR_MAX_ATTEMPTS) {
+      pendingPairs.push({ a, pair });
     }
   });
-  if (pendingPairs.length > 0) resolvePairs(pendingPairs);
-}
-function resolvePairs(pending) {
-  chrome.runtime.sendMessage(
-    { type: "RESOLVE_PAIRS", pairAddresses: pending.map((p) => p.pair) },
-    (res) => {
-      if (chrome.runtime.lastError || !res?.ok) return;
-      for (const { a, pair } of pending) {
-        const tok = res.tokens[pair];
-        if (!tok || !a.isConnected) continue;
-        pairCache.set(pair, tok.address);
-        attachBadge(a, tok.address);
-        queueInlineScan(tok.address);
+  if (pendingPairs.length > 0 && !resolvingPairs) {
+    resolvingPairs = true;
+    void resolvePairMints(pendingPairs.map((p) => p.pair)).then((map) => {
+      for (const { a, pair } of pendingPairs) {
+        const mintAddr = map.get(pair);
+        if (!mintAddr || !a.isConnected || badgedLinks.has(a)) continue;
+        badgedLinks.add(a);
+        attachBadge(a, mintAddr);
+        queueInlineScan(mintAddr);
       }
-    }
-  );
+    }).finally(() => {
+      resolvingPairs = false;
+    });
+  }
 }
 function attachBadge(anchor, mint) {
   const chip = document.createElement("span");
@@ -1616,7 +1721,7 @@ function paintBadges(mint) {
 function extractAddress(raw) {
   const s = raw.trim();
   if (BASE58_RE.test(s)) return s;
-  const patterns = [/\/sol\/token\/(\S+)/, /\/coin\/(\S+)/, /solscan\.io\/token\/(\S+)/, new RegExp(`(${BASE58})`)];
+  const patterns = [/\/sol\/token\/(\S+)/, /\/coin\/(\S+)/, /solscan\.io\/token\/(\S+)/, new RegExp(`(${BASE582})`)];
   for (const re of patterns) {
     const m = s.match(re);
     if (m && BASE58_RE.test(m[1])) return m[1];
@@ -1802,6 +1907,7 @@ function tick() {
     inlineResults.clear();
     badgeEls.clear();
     inlineQueue = [];
+    for (const [pair, e] of pairState) if (e.state !== "done") pairState.delete(pair);
     if (!collapsed) detect();
   } else if (!collapsed) {
     detect();

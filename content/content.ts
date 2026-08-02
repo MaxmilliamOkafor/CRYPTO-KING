@@ -24,6 +24,12 @@
 import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeBlurb, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
+import {
+  matchFirst,
+  MINT_HREF_RES,
+  PAIR_HREF_RES,
+  pairLinksAreSolana as pairLinksAreSolanaFor,
+} from '../lib/linkTargets.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState, LIVE_STATE_META } from '../lib/liveState.ts';
 import { assessRugPotential, RUG_VERDICT_META } from '../lib/rugPotential.ts';
@@ -49,6 +55,63 @@ const URL_PATTERNS = [
   new RegExp(`/coin/(${BASE58})(?:[/?#]|$)`), // pump.fun
 ];
 
+const isDextools = (): boolean => location.hostname.endsWith('dextools.io');
+const solanaPairRoute = (): boolean => pairLinksAreSolanaFor(location.hostname, location.pathname);
+
+/* ── Pair → mint resolution (shared by inline badges and the page scan) ──
+ * Tri-state with a bounded retry: a pair that DexScreener hasn't indexed yet
+ * (very common on a LIVE NEW PAIRS page — the pool is seconds old) used to be
+ * cached as a permanent failure on the first miss and never looked at again.
+ */
+type PairEntry = { state: 'pending' | 'done' | 'failed'; mint?: string; attempts: number };
+const pairState = new Map<string, PairEntry>();
+const PAIR_MAX_ATTEMPTS = 4;
+
+/** Pairs we should ask about right now (never in flight, never exhausted). */
+function pairsToResolve(found: string[]): string[] {
+  const out: string[] = [];
+  for (const p of found) {
+    const e = pairState.get(p);
+    if (!e) out.push(p);
+    else if (e.state === 'failed' && e.attempts < PAIR_MAX_ATTEMPTS) out.push(p);
+  }
+  return [...new Set(out)];
+}
+
+/** Resolve pair addresses → base-token mints. Returns only what resolved. */
+async function resolvePairMints(pairs: string[]): Promise<Map<string, string>> {
+  const ask = pairsToResolve(pairs);
+  const known = new Map<string, string>();
+  for (const p of pairs) {
+    const e = pairState.get(p);
+    if (e?.state === 'done' && e.mint) known.set(p, e.mint);
+  }
+  if (ask.length === 0) return known;
+
+  for (const p of ask) {
+    const prev = pairState.get(p);
+    pairState.set(p, { state: 'pending', attempts: (prev?.attempts ?? 0) + 1 });
+  }
+  const res = await new Promise<ResolvePairsResponse | undefined>((resolve) => {
+    chrome.runtime.sendMessage({ type: 'RESOLVE_PAIRS', pairAddresses: ask }, (r: ResolvePairsResponse | undefined) =>
+      resolve(r),
+    );
+  });
+  for (const p of ask) {
+    const tok = res?.ok ? res.tokens[p] : undefined;
+    const attempts = pairState.get(p)?.attempts ?? 1;
+    if (tok?.address) {
+      pairState.set(p, { state: 'done', mint: tok.address, attempts });
+      known.set(p, tok.address);
+      if (tok.symbol && !symbolHints.has(tok.address)) symbolHints.set(tok.address, tok.symbol.toUpperCase());
+    } else {
+      // Not indexed yet → retry on a later sweep instead of dying silently.
+      pairState.set(p, { state: 'failed', attempts });
+    }
+  }
+  return known;
+}
+
 let currentAddress: string | null = null;
 let lastHref = '';
 let view: 'none' | 'home' | 'token' = 'none';
@@ -60,9 +123,18 @@ function addressFromUrl(): string | null {
     const m = location.pathname.match(re);
     if (m) return m[1];
   }
+  // A DEXTools pair-explorer URL ends in a base58 PAIR address, not a mint —
+  // scanning it as a token returns garbage, so it is handled separately by
+  // detect() (resolved through DexScreener first).
+  if (isDextools()) return null;
   // Fallback: a bare base58 mint as the last path segment (some pump.fun routes).
   const seg = location.pathname.split('/').filter(Boolean).pop() ?? '';
   return BASE58_RE.test(seg) ? seg : null;
+}
+
+/** The PAIR address in a DEXTools pair-explorer URL, if we're on one. */
+function pairFromUrl(): string | null {
+  return matchFirst(PAIR_HREF_RES, location.pathname);
 }
 
 /** DOM fallback: a Solscan token link near the header is the most stable anchor. */
@@ -87,6 +159,20 @@ function detect(): void {
     view = 'token';
     void analyze(urlAddr);
     return;
+  }
+
+  // DEXTools pair-explorer: the URL holds a POOL address. Resolve it to the
+  // base token first, then auto-scan exactly like a token page.
+  const urlPair = solanaPairRoute() ? pairFromUrl() : null;
+  if (urlPair && urlPair !== lastAutoScanned) {
+    lastAutoScanned = urlPair; // one attempt per navigation, resolved or not
+    void resolvePairMints([urlPair]).then((map) => {
+      const mint = map.get(urlPair);
+      if (!mint || collapsed || pairFromUrl() !== urlPair) return;
+      view = 'token';
+      void analyze(mint);
+    });
+    // fall through to the home view meanwhile — never leave the panel blank
   }
 
   // Everything else (list pages, or the user navigated back home on a token
@@ -499,27 +585,47 @@ const pageScan = new Map<string, ScanRow>();
 const symbolHints = new Map<string, string>(); // mint → symbol read from the page link text
 let scanning = false;
 
-/** Every distinct token mint linked from the current page (gmgn/pump/solscan links),
- *  capturing a symbol hint from each link's text for replica detection + display. */
-function collectMints(): string[] {
+/**
+ * Every distinct token mint linked from the current page, capturing a symbol
+ * hint from each link's text for replica detection + display.
+ *
+ * Two link shapes: direct MINT links (gmgn / pump.fun / solscan / birdeye) and
+ * PAIR links (dextools pair-explorer, dexscreener), which have to be resolved
+ * through DexScreener. Missing the second shape is why DEXTools list pages —
+ * live-new-pairs above all — scanned nothing at all.
+ */
+async function collectMints(): Promise<string[]> {
   const set = new Set<string>();
-  const res = [
-    new RegExp(`/sol/token/(${BASE58})`),
-    new RegExp(`/coin/(${BASE58})`),
-    new RegExp(`solscan\\.io/token/(${BASE58})`),
-  ];
+  const pairLinks = new Map<string, string>(); // pair → symbol hint from the link text
+
   document.querySelectorAll<HTMLAnchorElement>('a[href]').forEach((a) => {
     const href = a.getAttribute('href') ?? '';
-    for (const re of res) {
-      const m = href.match(re);
-      if (m) {
-        set.add(m[1]);
-        const hint = symbolFromText(a.textContent ?? '');
-        if (hint && !symbolHints.has(m[1])) symbolHints.set(m[1], hint);
-        break;
-      }
+    const text = a.textContent ?? '';
+
+    const mint = matchFirst(MINT_HREF_RES, href);
+    if (mint) {
+      set.add(mint);
+      const hint = symbolFromText(text);
+      if (hint && !symbolHints.has(mint)) symbolHints.set(mint, hint);
+      return;
     }
+
+    if (!solanaPairRoute()) return;
+    const pair = matchFirst(PAIR_HREF_RES, href);
+    if (pair && !pairLinks.has(pair)) pairLinks.set(pair, symbolFromText(text) ?? '');
   });
+
+  if (pairLinks.size > 0) {
+    // Cap the resolve batch — a virtualized DEXTools table can hold hundreds.
+    const pairs = [...pairLinks.keys()].slice(0, MAX_SCAN);
+    const resolved = await resolvePairMints(pairs);
+    for (const [pair, mintAddr] of resolved) {
+      set.add(mintAddr);
+      const hint = pairLinks.get(pair);
+      if (hint && !symbolHints.has(mintAddr)) symbolHints.set(mintAddr, hint);
+    }
+  }
+
   return [...set].slice(0, MAX_SCAN);
 }
 
@@ -531,12 +637,19 @@ function symbolFromText(t: string): string | null {
 
 async function scanPage(): Promise<void> {
   if (scanning || collapsed) return;
-  const queue = collectMints().filter((m) => !pageScan.has(m));
+  scanning = true; // held across the pair-resolution await too, so ticks don't stack
+  let queue: string[];
+  try {
+    queue = (await collectMints()).filter((m) => !pageScan.has(m));
+  } catch {
+    scanning = false;
+    return;
+  }
   if (queue.length === 0) {
+    scanning = false;
     updateScanList();
     return;
   }
-  scanning = true;
   setScanStatus(`Scanning ${queue.length} coin${queue.length > 1 ? 's' : ''}…`);
 
   let i = 0;
@@ -578,6 +691,33 @@ function replicaSymbols(): Set<string> {
   return new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
 }
 
+/**
+ * An empty list used to say nothing useful, so a page where link detection
+ * failed (DEXTools' virtualized table is the worst case) looked like a broken
+ * extension. Say what is actually happening instead.
+ */
+function pendingPairCount(): number {
+  let n = 0;
+  for (const e of pairState.values()) if (e.state === 'pending' || (e.state === 'failed' && e.attempts < PAIR_MAX_ATTEMPTS)) n++;
+  return n;
+}
+
+function emptyScanStatus(): string {
+  const p = pendingPairCount();
+  if (p > 0) return `Resolving ${p} pool${p > 1 ? 's' : ''} → token…`;
+  return 'No coin links found on this page.';
+}
+
+function emptyScanHelp(): string {
+  if (pendingPairCount() > 0) {
+    return 'Looking up the tokens behind this page’s pools — brand-new pools can take a minute to be indexed.';
+  }
+  if (isDextools()) {
+    return 'DEXTools renders its table dynamically, so links may not be readable here. The 🔴 live feed above pulls new Solana launches directly from the API and works on every page — or paste an address into the scan box.';
+  }
+  return 'No token links detected here yet. Use the scan box above, or open a coin.';
+}
+
 function setScanStatus(text: string): void {
   const el = shadow?.querySelector('.scan-status');
   if (el) el.textContent = text;
@@ -605,11 +745,11 @@ function updateScanList(): void {
     parts.push(rows.length ? `${rows.length} scanned` : '');
     if (avoid) parts.push(`⚠ ${avoid} high-risk`);
     if (replicaCount) parts.push(`👥 ${replicaCount} possible copycat${replicaCount > 1 ? 's' : ''}`);
-    setScanStatus(parts.filter(Boolean).join(' · ') || 'No linked coins found on this page.');
+    setScanStatus(parts.filter(Boolean).join(' · ') || emptyScanStatus());
   }
 
   if (rows.length === 0) {
-    list.innerHTML = `<div class="scan-empty">No token links detected here yet. Use the scan box above, or open a coin.</div>`;
+    list.innerHTML = `<div class="scan-empty">${esc(emptyScanHelp())}</div>`;
     return;
   }
 
@@ -977,16 +1117,9 @@ interface InlineResult {
 const inlineResults = new Map<string, InlineResult | 'pending'>();
 const badgeEls = new Map<string, Set<HTMLElement>>(); // mint → live badge elements
 const badgedLinks = new WeakSet<HTMLAnchorElement>();
-const pairCache = new Map<string, string | null>(); // pairAddr → mint (null = resolving/unknown)
 let inlineQueue: string[] = [];
 let inlineWorkers = 0;
-
-const MINT_HREF_RES = [
-  new RegExp(`/sol/token/(${BASE58})`),
-  new RegExp(`/coin/(${BASE58})`),
-  new RegExp(`solscan\\.io/token/(${BASE58})`),
-];
-const PAIR_HREF_RE = new RegExp(`/pair-explorer/(${BASE58})`);
+let resolvingPairs = false;
 
 function sweepInlineBadges(): void {
   if (!INLINE_BADGES.enabled || inlineResults.size >= INLINE_BADGES.maxPerPage) return;
@@ -997,50 +1130,47 @@ function sweepInlineBadges(): void {
     if (badgedLinks.has(a)) return;
     const href = a.getAttribute('href') ?? '';
 
-    for (const re of MINT_HREF_RES) {
-      const m = href.match(re);
-      if (m) {
-        badgedLinks.add(a);
-        attachBadge(a, m[1]);
-        queueInlineScan(m[1]);
-        return;
-      }
+    const mint = matchFirst(MINT_HREF_RES, href);
+    if (mint) {
+      badgedLinks.add(a);
+      attachBadge(a, mint);
+      queueInlineScan(mint);
+      return;
     }
 
-    // DEXTools: pair address links, Solana pages only.
-    if (location.hostname.endsWith('dextools.io') && location.pathname.includes('/solana/')) {
-      const pm = href.match(PAIR_HREF_RE);
-      if (pm) {
-        badgedLinks.add(a);
-        const known = pairCache.get(pm[1]);
-        if (known) {
-          attachBadge(a, known);
-          queueInlineScan(known);
-        } else if (known === undefined) {
-          pairCache.set(pm[1], null); // mark resolving
-          pendingPairs.push({ a, pair: pm[1] });
-        }
-      }
+    // Pair links (dextools pair-explorer, dexscreener) need a DexScreener
+    // lookup first. Do NOT mark the anchor as badged yet: if the pool is too
+    // new to be indexed the sweep must be able to come back to it, which is
+    // exactly the case on a "live new pairs" page.
+    if (!solanaPairRoute()) return;
+    const pair = matchFirst(PAIR_HREF_RES, href);
+    if (!pair) return;
+    const entry = pairState.get(pair);
+    if (entry?.state === 'done' && entry.mint) {
+      badgedLinks.add(a);
+      attachBadge(a, entry.mint);
+      queueInlineScan(entry.mint);
+    } else if (!entry || (entry.state === 'failed' && entry.attempts < PAIR_MAX_ATTEMPTS)) {
+      pendingPairs.push({ a, pair });
     }
   });
 
-  if (pendingPairs.length > 0) resolvePairs(pendingPairs);
-}
-
-function resolvePairs(pending: Array<{ a: HTMLAnchorElement; pair: string }>): void {
-  chrome.runtime.sendMessage(
-    { type: 'RESOLVE_PAIRS', pairAddresses: pending.map((p) => p.pair) },
-    (res: ResolvePairsResponse | undefined) => {
-      if (chrome.runtime.lastError || !res?.ok) return;
-      for (const { a, pair } of pending) {
-        const tok = res.tokens[pair];
-        if (!tok || !a.isConnected) continue;
-        pairCache.set(pair, tok.address);
-        attachBadge(a, tok.address);
-        queueInlineScan(tok.address);
-      }
-    },
-  );
+  if (pendingPairs.length > 0 && !resolvingPairs) {
+    resolvingPairs = true;
+    void resolvePairMints(pendingPairs.map((p) => p.pair))
+      .then((map) => {
+        for (const { a, pair } of pendingPairs) {
+          const mintAddr = map.get(pair);
+          if (!mintAddr || !a.isConnected || badgedLinks.has(a)) continue;
+          badgedLinks.add(a);
+          attachBadge(a, mintAddr);
+          queueInlineScan(mintAddr);
+        }
+      })
+      .finally(() => {
+        resolvingPairs = false;
+      });
+  }
 }
 
 /** Append the chip INSIDE the link (keeps table layouts intact). */
@@ -1383,6 +1513,9 @@ function tick(): void {
     inlineResults.clear(); // badges died with the old DOM; results re-serve from bg cache
     badgeEls.clear();
     inlineQueue = [];
+    // Keep resolved pair→mint mappings (they're permanent), but give pools that
+    // weren't indexed yet a fresh retry budget on the new route.
+    for (const [pair, e] of pairState) if (e.state !== 'done') pairState.delete(pair);
     if (!collapsed) detect();
   } else if (!collapsed) {
     // Same route: retry detection so we catch a late-rendering token header or

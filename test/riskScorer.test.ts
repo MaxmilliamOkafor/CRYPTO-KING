@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { GRADE_META, LIVE_FEED } from '../config.ts';
 import { computeKingGrade, gradeBlurb, gradeLabel } from '../lib/kingGrade.ts';
+import { matchFirst, MINT_HREF_RES, PAIR_HREF_RES, pairLinksAreSolana } from '../lib/linkTargets.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
 import { classifyOutcome, computeAccuracy } from '../lib/outcomeLedger.ts';
@@ -617,6 +618,33 @@ test('the "hide risky" cut-off is expressed as a grade, not an inverted score', 
   // ever flips, the toggle and the % on the row would disagree again.
   assert.equal(gradeLabel(LIVE_FEED.safeMinGrade), 'MIXED');
   assert.equal(gradeLabel(LIVE_FEED.safeMinGrade - 1), 'WEAK');
+});
+
+/* ── 🔗 Link shapes (the "dextools does nothing" bug) ───────────────────── */
+
+test('mint links are recognised on every supported site', () => {
+  assert.equal(matchFirst(MINT_HREF_RES, '/sol/token/So11111111111111111111111111111111111111112'), 'So11111111111111111111111111111111111111112');
+  assert.equal(matchFirst(MINT_HREF_RES, 'https://pump.fun/coin/So11111111111111111111111111111111111111112'), 'So11111111111111111111111111111111111111112');
+  assert.equal(matchFirst(MINT_HREF_RES, 'https://solscan.io/token/So11111111111111111111111111111111111111112'), 'So11111111111111111111111111111111111111112');
+  assert.equal(matchFirst(MINT_HREF_RES, '/about/faq'), null);
+});
+
+test('DEXTools pair-explorer links are recognised as POOLS, never as mints', () => {
+  const pair = 'So11111111111111111111111111111111111111112';
+  const href = `/app/en/solana/pair-explorer/${pair}?t=1`;
+  // The bug: this shape matched nothing, so DEXTools pages scanned zero coins.
+  assert.equal(matchFirst(PAIR_HREF_RES, href), pair);
+  // And it must NOT be mistaken for a mint — scanning a pool address as a token
+  // returns garbage.
+  assert.equal(matchFirst(MINT_HREF_RES, href), null);
+  assert.equal(matchFirst(PAIR_HREF_RES, `https://dexscreener.com/solana/${pair}`), pair);
+});
+
+test('pair links are only followed on Solana routes', () => {
+  assert.equal(pairLinksAreSolana('www.dextools.io', '/app/en/solana/live-new-pairs'), true);
+  assert.equal(pairLinksAreSolana('www.dextools.io', '/app/solana/live-new-pairs'), true);
+  assert.equal(pairLinksAreSolana('www.dextools.io', '/app/en/ether/live-new-pairs'), false);
+  assert.equal(pairLinksAreSolana('gmgn.ai', '/sol/token/abc'), true); // non-dextools carries its own chain
 });
 
 console.log(`\n${passed} tests passed.`);

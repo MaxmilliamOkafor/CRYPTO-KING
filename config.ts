@@ -153,6 +153,18 @@ export const LIVE_FEED = {
 };
 
 /**
+ * Jupiter quote API — keyless, read-only. Used ONLY to request a sell QUOTE
+ * (never a swap: no wallet, no signing) so the "can I actually exit?" check
+ * works on every site, not just gmgn.ai. See lib/jupiterClient.ts.
+ */
+export const JUPITER = {
+  enabled: true,
+  quoteUrl: 'https://lite-api.jup.ag/swap/v1/quote',
+  /** Wide tolerance: we want the route and its price impact, not a tight fill. */
+  slippageBps: 5000,
+};
+
+/**
  * DexScreener — keyless, CORS-friendly public API. Used as a FALLBACK source of
  * fresh Solana token addresses for the Live feed, and to resolve DEXTools pair
  * addresses → base token mints for inline badges.
@@ -201,8 +213,11 @@ export const SOLANA = {
     return this.rpcUrl.includes('helius');
   },
   /**
-   * Token accounts owned by these authorities are treated as pool/LP accounts
-   * and EXCLUDED from holder-concentration math. Extend as needed.
+   * Belt-and-braces only. Pools are recognised STRUCTURALLY (any token-account
+   * owner that is itself owned by a program rather than the System Program —
+   * see lib/holderMath.ts), which covers PumpSwap, Meteora, Orca and bonding
+   * curves that no static list can enumerate. These entries just guarantee
+   * the two big Raydium authorities are excluded even if that lookup fails.
    */
   knownPoolAuthorities: [
     '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Raydium AMM v4 authority
@@ -252,6 +267,10 @@ export const RUGCHECK = {
 export const RATE_LIMITS_MS: Record<string, number> = {
   default: 1100,
   'gmgn.ai': 400,
+  /** DexScreener publishes 300 req/min for its token/pair endpoints (=200ms);
+   *  250ms stays under it. It drives the rug/dump checks, so it must not crawl
+   *  at the 1.1s default. */
+  'api.dexscreener.com': 250,
 };
 /** Per-request timeout. */
 export const FETCH_TIMEOUT_MS = 10_000;

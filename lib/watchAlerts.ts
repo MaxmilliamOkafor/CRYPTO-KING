@@ -59,6 +59,14 @@ export function computeWatchAlerts(baseline: WatchSnapshot, current: WatchSnapsh
     });
   }
 
+  // Live state: fires on the transition INTO trouble, not if the coin was
+  // already dumping when you started watching (you knew then).
+  if (current.liveState === 'DEAD' && baseline.liveState !== 'DEAD') {
+    alerts.push({ kind: 'dead', message: 'Liquidity pulled / price collapsed — this coin looks rugged. Exit if you still can.' });
+  } else if (current.liveState === 'DUMPING' && baseline.liveState !== 'DUMPING' && baseline.liveState !== 'DEAD') {
+    alerts.push({ kind: 'dumping', message: 'Dumping right now — sharp drop and/or sells dominating in the last hour.' });
+  }
+
   if (baseline.grade !== null && current.grade !== null && baseline.grade - current.grade >= t.gradeDrop) {
     alerts.push({
       kind: 'grade-collapse',

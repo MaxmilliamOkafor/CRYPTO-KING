@@ -18,6 +18,7 @@ import {
   CACHE_TTL_MS,
   DEBUG,
   EUR_PER_USD,
+  EXIT_REALITY,
   LIVE_FEED,
   MOCK_MODE,
   OUTCOME_LEDGER,
@@ -30,10 +31,14 @@ import {
   fetchDexscreenerNewSolana,
   fetchDexscreenerToken,
   fetchPairBaseTokens,
+  lookupDexscreenerToken,
+  peekDexscreenerToken,
+  primeDexscreenerTokens,
   type DexTokenMarket,
 } from '../lib/dexscreenerClient.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
-import { computeKingGrade } from '../lib/kingGrade.ts';
+import { fetchSellQuote, type SellQuote } from '../lib/jupiterClient.ts';
+import { computeKingGrade, gradeLabel } from '../lib/kingGrade.ts';
 import { assessLiveState } from '../lib/liveState.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { emptyGmgnData, fetchGmgnData, parseGmgn, type GmgnData, type GmgnRaw } from '../lib/gmgnClient.ts';
@@ -90,6 +95,35 @@ interface CacheEntry {
 
 const cache = new Map<string, CacheEntry>();
 const inFlight = new Map<string, Promise<AnalyzeResponse>>();
+
+/**
+ * Overlay the latest DexScreener market data onto a cached analysis and
+ * re-score it (the scorers are pure and cheap). The structural scan (mint,
+ * holders, LP) is good for minutes; the MARKET can collapse in seconds — so a
+ * coin that rugs after it was first scanned must not keep its old grade.
+ */
+function refreshMarket(entry: CacheEntry): CacheEntry {
+  const dex = peekDexscreenerToken(entry.analysis.identity.address); // primed by the sweep; no network
+  if (!dex) return entry;
+  const prev = entry.analysis.market;
+  const market: MarketInfo = {
+    priceEur: dex.priceUsd ?? prev?.priceEur ?? null,
+    marketCapEur: dex.marketCapUsd ?? prev?.marketCapEur ?? null,
+    liquidityEur: dex.liquidityUsd ?? prev?.liquidityEur ?? null,
+    volume24hEur: dex.volume24hUsd ?? prev?.volume24hEur ?? null,
+    lpStatus: prev?.lpStatus ?? 'unknown',
+    sellSimulation: prev?.sellSimulation ?? null,
+    priceChange1h: dex.priceChange1h,
+    priceChange6h: dex.priceChange6h,
+    priceChange24h: dex.priceChange24h,
+    buys1h: dex.buys1h,
+    sells1h: dex.sells1h,
+  };
+  const analysis: TokenAnalysis = { ...entry.analysis, market };
+  const next: CacheEntry = { ...entry, analysis, risk: scoreToken(analysis), quality: scoreQuality(analysis) };
+  cache.set(analysis.identity.address, next);
+  return next;
+}
 
 chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => {
   handle(msg)
@@ -221,6 +255,14 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
     })
     .sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0))
     .slice(0, effectiveScanBudget()); // 3× more coins per poll when a Helius key is set
+
+  // Market data for the WHOLE sweep in a couple of batched DexScreener calls
+  // (30 mints each). Without this, lite scans had no liquidity / price change /
+  // buy-sell flow, so "already rugged" and "dumping right now" could never be
+  // detected in the feed — the exact way coins that had already rugged were
+  // being surfaced. Rows already in the feed are refreshed too, so a coin that
+  // rugs AFTER it was scanned drops out instead of lingering with a stale grade.
+  await primeDexscreenerTokens([...coins.map((c) => c.mint), ...feed.keys()]);
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -237,6 +279,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
   for (const c of coins) {
     let entry = cache.get(c.mint);
     if (!entry) continue;
+    entry = refreshMarket(entry); // re-check DEAD / DUMPING every sweep
 
     // Auto-upgrade: graduated + low-risk + some quality on the lite pass →
     // run the full background check now so a real gem can actually surface.
@@ -287,7 +330,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       scannedAt: Date.now(),
     };
     feed.set(c.mint, row);
-    maybeNotifyLowRisk(row, entry.risk);
+    maybeNotifyLowRisk(row);
   }
 
   // Newest first, capped.
@@ -308,7 +351,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
  * (graduated, LP secured, no whale wallet, creator history screened). Fires
  * once per mint; copy stays risk-framed — "passed checks", never "buy".
  */
-function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
+function maybeNotifyLowRisk(row: FeedRow): void {
   if (!LIVE_FEED.notifyLowRisk || MOCK_MODE) return;
   if (!row.gem) return;
   if (notified.has(row.address)) return;
@@ -319,7 +362,9 @@ function maybeNotifyLowRisk(row: FeedRow, risk: RiskResult): void {
   chrome.notifications.create(`ck-${row.address}`, {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
-    title: `💎 ${sym} — King Grade ${row.grade ?? '?'}% (risk ${risk.riskScore}, quality ${row.qualityScore ?? '?'})`,
+    // King Grade only — one number, higher = better. (This used to append the
+    // raw risk score, which runs the OPPOSITE direction.)
+    title: `💎 ${sym} — King Grade ${row.grade ?? '?'}% ${gradeLabel(row.grade)}`,
     message:
       'Graduated, LP secured, no whale wallet, creator screened. Still speculative — research it yourself. Click to open on GMGN.',
   });
@@ -369,14 +414,15 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     // (excluded from concentration math so the curve doesn't read as a whale).
     const pumpfun = await fetchPumpfunData(address);
     // Remaining adapters degrade to honest "unavailable" internally; Promise.all is safe.
-    // DexScreener gives authoritative USD price/mcap/liquidity for LISTED coins —
-    // fetched only on full scans (fresh on-curve coins aren't listed yet, and it
-    // keeps the lite feed sweep fast).
+    // DexScreener gives authoritative USD price/mcap/liquidity for LISTED coins
+    // (fresh on-curve coins aren't listed yet → null, cached as a real answer).
     const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete),
       rugcheckAdapter.fetchAudit(address),
-      lite ? Promise.resolve(null) : fetchDexscreenerToken(address),
+      // Always fetched: served from the sweep's batch cache for lite scans, so
+      // rug/dump detection runs on EVERY coin, not just the ones you open.
+      fetchDexscreenerToken(address),
     ]);
     // Full scans check the creator's launch history (serial-deployer signal);
     // lite feed sweeps skip it to stay within the per-poll budget. Either way,
@@ -386,7 +432,20 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
       : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
     deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
 
-    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, {
+    // "Can I actually sell?" — a Jupiter sell QUOTE for the user's reference
+    // position (read-only; never a swap). Full scans only, and only when GMGN
+    // didn't already answer: it's one more rate-limited call.
+    const sellQuote =
+      lite || gmgn.isHoneypot !== null || gmgn.sellSlippagePct !== null
+        ? null
+        : await fetchSellQuote(
+            address,
+            dexMarket?.priceUsd ?? gmgn.priceEur ?? pumpfun.priceEur,
+            solana.decimals,
+            EXIT_REALITY.referencePositionUsd,
+          );
+
+    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, sellQuote, {
       gmgn: gmgn.status,
       solana: solana.status,
       pumpfun: pumpfun.status,
@@ -430,6 +489,7 @@ function mergeSources(
   auditLpStatus: MarketInfo['lpStatus'] | null,
   deployer: TokenAnalysis['deployer'],
   dexMarket: DexTokenMarket | null,
+  sellQuote: SellQuote | null,
   sources: TokenAnalysis['sources'],
 ): TokenAnalysis {
   // In mock mode the fixture IS the truth — the mock adapters all slice the
@@ -478,14 +538,20 @@ function mergeSources(
 
   /* market: GMGN primary; pump.fun fills mcap; RugCheck may settle LP status. */
   const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== 'unknown' ? gmgn.lpStatus : (auditLpStatus ?? gmgn.lpStatus ?? 'unknown');
+  // Sell simulation precedence: GMGN's honeypot verdict (it simulates the
+  // actual sell tx) → GMGN slippage → a real Jupiter route with its price
+  // impact → GMGN "not a honeypot" alone → unknown. Jupiter only ever adds
+  // POSITIVE evidence (a route exists); "no route" stays unknown, never "fail".
   const sellSimulation: MarketInfo['sellSimulation'] =
     gmgn.isHoneypot === true
       ? { ok: false, slippagePct: gmgn.sellSlippagePct }
       : gmgn.sellSlippagePct !== null
         ? { ok: true, slippagePct: gmgn.sellSlippagePct }
-        : gmgn.isHoneypot === false
-          ? { ok: true, slippagePct: null }
-          : null;
+        : sellQuote !== null
+          ? { ok: true, slippagePct: sellQuote.priceImpactPct }
+          : gmgn.isHoneypot === false
+            ? { ok: true, slippagePct: null }
+            : null;
   // Market data precedence for price/mcap/liquidity: DexScreener first — it
   // returns authoritative USD values that MATCH the sites (no derivation) — then
   // GMGN (same-origin), then pump.fun (derived). Values are USD (EUR_PER_USD=1).
@@ -618,6 +684,25 @@ async function applyCreatorMemory(
   return hist;
 }
 
+/* ── Storage lock ────────────────────────────────────────────────────────
+ * chrome.storage has no transactions. Every read-modify-write below used to
+ * be load → (await network for seconds) → save, so a concurrent writer's
+ * change was silently overwritten: clicking Watch/Unwatch during a watchlist
+ * sweep was lost, and parallel full scans dropped ledger predictions.
+ * withLock() serialises writers per key; slow network work happens OUTSIDE
+ * the lock and results are merged into a FRESH read inside it.
+ */
+const locks = new Map<string, Promise<unknown>>();
+function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = locks.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  locks.set(
+    key,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
 /* ── 👁 Watchlist: post-entry rug alerts ─────────────────────────────────
  * The pre-buy scan can't see a dev who dumps tomorrow. Watched coins are
  * re-scanned on a chrome.alarms timer; lib/watchAlerts.ts diffs each fresh
@@ -645,6 +730,7 @@ function snapshotOf(entry: CacheEntry): WatchSnapshot {
     lpStatus: entry.analysis.market?.lpStatus ?? 'unknown',
     devHoldsPct: entry.analysis.holders?.devHoldsPct ?? null,
     largestNonLpWalletPct: entry.analysis.holders?.largestNonLpWalletPct ?? null,
+    liveState: assessLiveState(entry.analysis.market).state,
   };
 }
 
@@ -670,15 +756,27 @@ async function watchToken(address: string, symbol: string | null): Promise<Watch
     last: snap,
     alerted: [],
   };
-  const next = [...list, coin];
-  await saveWatchlist(next);
+  // Re-read under the lock: the scan above took seconds and the list may have
+  // changed meanwhile (another tab, or a sweep finishing).
+  const next = await withLock(WATCHLIST_KEY, async () => {
+    const fresh = await loadWatchlist();
+    if (fresh.some((w) => w.address === address)) return fresh;
+    if (fresh.length >= WATCHLIST.maxCoins) return null;
+    const out = [...fresh, coin];
+    await saveWatchlist(out);
+    return out;
+  });
+  if (!next) return { ok: false, error: `Watchlist is full (${WATCHLIST.maxCoins} coins) — unwatch one first.` };
   ensureWatchAlarm();
   return { ok: true, watchlist: next };
 }
 
 async function unwatchToken(address: string): Promise<WatchlistResponse> {
-  const next = (await loadWatchlist()).filter((w) => w.address !== address);
-  await saveWatchlist(next);
+  const next = await withLock(WATCHLIST_KEY, async () => {
+    const out = (await loadWatchlist()).filter((w) => w.address !== address);
+    await saveWatchlist(out);
+    return out;
+  });
   return { ok: true, watchlist: next };
 }
 
@@ -686,27 +784,44 @@ async function sweepWatchlist(): Promise<void> {
   const list = await loadWatchlist();
   if (list.length === 0) return;
 
+  // Scan OUTSIDE the lock (this takes a while), collect fresh snapshots…
+  const fresh = new Map<string, WatchSnapshot>();
   for (const coin of list) {
     const res = await analyzeToken(coin.address, /*force*/ true); // fresh full scan
     if (!res.ok) continue; // transient failure → try again next sweep, never alert on missing data
     const entry = cache.get(coin.address);
-    if (!entry) continue;
-    coin.last = snapshotOf(entry);
-
-    for (const alert of computeWatchAlerts(coin.baseline, coin.last)) {
-      if (coin.alerted.includes(alert.kind)) continue;
-      coin.alerted.push(alert.kind);
-      const sym = coin.symbol ?? `${coin.address.slice(0, 4)}…${coin.address.slice(-4)}`;
-      chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
-        type: 'basic',
-        iconUrl: 'icons/icon128.png',
-        title: `🚨 ${sym} — watched coin alert`,
-        message: `${alert.message} Click to open on GMGN.`,
-        priority: 2,
-      });
-    }
+    if (entry) fresh.set(coin.address, snapshotOf(entry));
   }
-  await saveWatchlist(list);
+  if (fresh.size === 0) return;
+
+  // …then merge into the CURRENT list under the lock, so a Watch/Unwatch that
+  // happened during the scans survives, and alerts fire exactly once.
+  const toNotify: Array<{ coin: WatchedCoin; alert: { kind: string; message: string } }> = [];
+  await withLock(WATCHLIST_KEY, async () => {
+    const current = await loadWatchlist();
+    for (const coin of current) {
+      const snap = fresh.get(coin.address);
+      if (!snap) continue; // unwatched mid-sweep, or scan failed
+      coin.last = snap;
+      for (const alert of computeWatchAlerts(coin.baseline, snap)) {
+        if (coin.alerted.includes(alert.kind)) continue;
+        coin.alerted.push(alert.kind);
+        toNotify.push({ coin, alert });
+      }
+    }
+    await saveWatchlist(current);
+  });
+
+  for (const { coin, alert } of toNotify) {
+    const sym = coin.symbol ?? `${coin.address.slice(0, 4)}…${coin.address.slice(-4)}`;
+    chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: `🚨 ${sym} — watched coin alert`,
+      message: `${alert.message} Click to open on GMGN.`,
+      priority: 2,
+    });
+  }
 }
 
 function ensureWatchAlarm(): void {
@@ -746,51 +861,94 @@ async function loadLedger(): Promise<LedgerEntry[]> {
 
 async function recordPrediction(analysis: TokenAnalysis, grade: number | null, rugVerdict: string): Promise<void> {
   if (!OUTCOME_LEDGER.enabled || MOCK_MODE || grade === null) return;
-  const ledger = await loadLedger();
-  if (ledger.some((e) => e.address === analysis.identity.address)) return; // first grade only
-  ledger.unshift({
-    address: analysis.identity.address,
-    symbol: analysis.identity.symbol,
-    gradedAt: Date.now(),
-    grade,
-    rugVerdict,
-    baselineMcap: analysis.market?.marketCapEur ?? null,
+  // No baseline market cap → the outcome can never be measured; don't log a
+  // prediction that would sit as PENDING forever and skew the report card.
+  const baselineMcap = analysis.market?.marketCapEur ?? null;
+  if (baselineMcap === null || baselineMcap <= 0) return;
+  await withLock(LEDGER_KEY, async () => {
+    const ledger = await loadLedger();
+    if (ledger.some((e) => e.address === analysis.identity.address)) return; // first grade only
+    ledger.unshift({
+      address: analysis.identity.address,
+      symbol: analysis.identity.symbol,
+      gradedAt: Date.now(),
+      grade,
+      rugVerdict,
+      baselineMcap,
+    });
+    await chrome.storage.local.set({ [LEDGER_KEY]: ledger.slice(0, OUTCOME_LEDGER.maxEntries) });
   });
-  await chrome.storage.local.set({ [LEDGER_KEY]: ledger.slice(0, OUTCOME_LEDGER.maxEntries) });
 }
 
 /** Re-check due predictions and score them. Bounded per sweep to stay cheap. */
 async function recheckLedger(): Promise<void> {
   if (!OUTCOME_LEDGER.enabled || MOCK_MODE) return;
-  const ledger = await loadLedger();
   const dueAt = Date.now() - OUTCOME_LEDGER.recheckAfterHours * 3_600_000;
-  const due = ledger.filter((e) => !e.outcome && e.gradedAt <= dueAt).slice(0, 5);
+  const due = (await loadLedger()).filter((e) => !e.outcome && e.gradedAt <= dueAt).slice(0, 5);
   if (due.length === 0) return;
 
+  // Network OUTSIDE the lock; results applied to a fresh read inside it.
+  const results = new Map<string, Pick<LedgerEntry, 'checkedAt' | 'finalMcap' | 'outcome'>>();
   for (const entry of due) {
-    const dex = await fetchDexscreenerToken(entry.address);
-    const nowMcap = dex?.marketCapUsd ?? null;
-    const isDead =
-      dex === null // delisted entirely = dead
-        ? true
-        : assessLiveState({
-            priceEur: dex.priceUsd,
-            marketCapEur: dex.marketCapUsd,
-            liquidityEur: dex.liquidityUsd,
-            volume24hEur: dex.volume24hUsd,
-            lpStatus: 'unknown',
-            sellSimulation: null,
-            priceChange1h: dex.priceChange1h,
-            priceChange6h: dex.priceChange6h,
-            priceChange24h: dex.priceChange24h,
-            buys1h: dex.buys1h,
-            sells1h: dex.sells1h,
-          }).state === 'DEAD';
-    entry.checkedAt = Date.now();
-    entry.finalMcap = nowMcap;
-    entry.outcome = classifyOutcome(entry.baselineMcap, nowMcap, isDead);
+    const r = await lookupDexscreenerToken(entry.address);
+    // A failed request is NOT evidence of a rug — skip and retry next tick.
+    if (r.status === 'error') continue;
+
+    let nowMcap: number | null;
+    let isDead: boolean;
+    if (r.market) {
+      nowMcap = r.market.marketCapUsd;
+      isDead = assessLiveState(marketFromDex(r.market)).state === 'DEAD';
+    } else {
+      // Not on any DEX. For a coin graded on the bonding curve that's normal —
+      // it may still be trading there, so ask pump.fun before calling it dead.
+      const pump = await fetchPumpfunData(entry.address);
+      if (pump.marketCapEur !== null) {
+        nowMcap = pump.marketCapEur;
+        isDead = false;
+      } else {
+        // Listed nowhere. pump.fun keeps records of dead coins, so this is
+        // usually a vanished token — but it can also be pump.fun being down.
+        // Only conclude "dead" once it has stayed that way well past the
+        // normal re-check window; until then, retry.
+        if (entry.gradedAt > Date.now() - OUTCOME_LEDGER.recheckAfterHours * 3 * 3_600_000) continue;
+        isDead = true;
+        nowMcap = null;
+      }
+    }
+    results.set(entry.address, {
+      checkedAt: Date.now(),
+      finalMcap: nowMcap,
+      outcome: classifyOutcome(entry.baselineMcap, nowMcap, isDead),
+    });
   }
-  await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+  if (results.size === 0) return;
+
+  await withLock(LEDGER_KEY, async () => {
+    const ledger = await loadLedger();
+    for (const e of ledger) {
+      const res = results.get(e.address);
+      if (res && !e.outcome) Object.assign(e, res);
+    }
+    await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+  });
+}
+
+/** DexScreener market → the MarketInfo shape the pure assessors take. */
+function marketFromDex(dex: DexTokenMarket): MarketInfo {
+  return {
+    priceEur: dex.priceUsd,
+    marketCapEur: dex.marketCapUsd,
+    liquidityEur: dex.liquidityUsd,
+    volume24hEur: dex.volume24hUsd,
+    lpStatus: 'unknown',
+    sellSimulation: null,
+    priceChange1h: dex.priceChange1h,
+    priceChange6h: dex.priceChange6h,
+    priceChange24h: dex.priceChange24h,
+    buys1h: dex.buys1h,
+    sells1h: dex.sells1h,
+  };
 }
 
 /* ── Recent-tokens persistence (dashboard) ────────────────────────────── */

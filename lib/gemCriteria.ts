@@ -8,13 +8,16 @@
  *  - LP not burned/locked → NEVER a gem (classic pull)
  *  - any wallet > GEM_CRITERIA.maxLargestWalletPct → NEVER a gem (one-seller crash)
  *  - holders/LP unverified (lite scan) → NEVER a gem (no highlight on partial data)
+ *  - mint/freeze authority not PROVEN revoked, any Token-2022 trap, live fee
+ *    authority, honeypot → NEVER a gem (explicit gates, not score arithmetic)
+ *  - already dead / dumping → NEVER a gem
  *  - plus the score gates: risk ≤ LIVE_FEED.notifyMaxScore, quality ≥ LIVE_FEED.gemMinQuality
  *
  * Passing every gate still does NOT mean "buy" — it means "survived the
  * background check; worth your own research". Most meme coins die regardless.
  */
 
-import { GEM_CRITERIA, LIVE_FEED } from '../config.ts';
+import { GEM_CRITERIA, LIMITS, LIVE_FEED } from '../config.ts';
 import { assessLiveState } from './liveState.ts';
 import type { QualityResult, RiskResult, TokenAnalysis } from './types.ts';
 
@@ -40,6 +43,35 @@ export function gemBackgroundCheck(a: TokenAnalysis, risk: RiskResult, quality: 
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
     blockers.push('Not enough positive signals yet (liquidity depth, holder spread, socials, age).');
   }
+
+  // HARD mechanism gates — checked explicitly, never left to the risk score.
+  // The score gate alone let a coin with a LIVE MINT AUTHORITY through: +25
+  // for the authority, minus mitigations for good socials/smart money, landed
+  // at 10 — under the 39 gate — and the coin pulsed gold as a "gem". Any of
+  // these alone is a one-transaction rug, so no amount of good signal offsets it.
+  // Unknown (null) blocks too: a gem must be PROVEN clean, not assumed clean.
+  const m = a.mint;
+  if (!m) {
+    blockers.push('Mint account not verified — cannot rule out mint/freeze authority.');
+  } else {
+    if (m.mintAuthorityActive !== false) {
+      blockers.push(m.mintAuthorityActive ? 'Mint authority is ACTIVE — dev can print unlimited supply.' : 'Mint authority not verified.');
+    }
+    if (m.freezeAuthorityActive !== false) {
+      blockers.push(m.freezeAuthorityActive ? 'Freeze authority is ACTIVE — your wallet can be frozen.' : 'Freeze authority not verified.');
+    }
+    if (m.permanentDelegateActive === true) blockers.push('Permanent delegate — dev can take tokens out of your wallet.');
+    if (m.nonTransferable === true) blockers.push('Non-transferable token — you cannot sell.');
+    if (m.defaultAccountFrozen === true) blockers.push('New holder accounts start frozen.');
+    if (m.transferHookActive === true) blockers.push('Transfer hook — dev code runs on every transfer and can block sells.');
+    if (m.isToken2022 === true && m.feeAuthorityActive === true) {
+      blockers.push('Fee authority live — the transfer tax can be raised after you buy.');
+    }
+    if (m.transferFeeBps !== null && m.transferFeeBps > LIMITS.transferFeeHighBps) {
+      blockers.push(`Transfer tax ${(m.transferFeeBps / 100).toFixed(1)}% on every sell.`);
+    }
+  }
+  if (a.market?.sellSimulation?.ok === false) blockers.push('Simulated sell FAILS — honeypot.');
 
   // Dev-dump window: on the bonding curve, insiders can sell any second.
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {

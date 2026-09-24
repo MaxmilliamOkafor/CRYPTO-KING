@@ -1,10 +1,13 @@
 /**
- * lib/dexscreenerClient.ts — DexScreener adapter (keyless fallback source).
+ * lib/dexscreenerClient.ts — DexScreener adapter (keyless).
  *
- * Only used to obtain a list of fresh Solana token addresses for the Live feed
- * when pump.fun is unavailable. Risk scoring still happens via the normal
- * pipeline (Solana RPC + GMGN + pump.fun) per address — DexScreener here is
- * purely a candidate-address source, so the tool never depends on one endpoint.
+ * Three jobs:
+ *  1. AUTHORITATIVE MARKET DATA: USD price, market cap, liquidity, price change
+ *     and buy/sell flow — the inputs for "already rugged / dumping right now"
+ *     (lib/liveState.ts). Batched 30 mints per request for the live feed, with
+ *     a short cache shared by every lookup.
+ *  2. Fresh Solana token addresses for the Live feed.
+ *  3. Resolving DEX pair (pool) addresses → base-token mints (DEXTools links).
  */
 
 import { DEXSCREENER, MOCK_MODE } from '../config.ts';
@@ -58,32 +61,8 @@ export interface DexTokenMarket {
   pairCreatedMs: number | null;
 }
 
-/**
- * Reliable price/market-cap/liquidity for a token, straight from DexScreener's
- * token endpoint (returns `priceUsd`, `marketCap`, `liquidity.usd` directly —
- * no derivation, matches what the sites show). Picks the deepest-liquidity
- * Solana pair. null when the token isn't listed on any DEX yet (fresh pump
- * coins on the bonding curve) or on failure.
- */
-export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarket | null> {
-  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE.test(mint)) return null;
-  const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-  const pairs = (json as { pairs?: unknown[] } | null)?.pairs;
-  if (!Array.isArray(pairs) || pairs.length === 0) return null;
-
-  // Deepest Solana pair = the canonical market for the token.
-  let best: unknown = null;
-  let bestLiq = -1;
-  for (const p of pairs) {
-    if (asString(pick(p, ['chainId'])) !== 'solana') continue;
-    const liq = asNumber(pick(p, ['liquidity.usd'])) ?? 0;
-    if (liq > bestLiq) {
-      bestLiq = liq;
-      best = p;
-    }
-  }
-  if (!best) return null;
-
+/** Map one DexScreener pair object → our market shape. */
+function toMarket(best: unknown): DexTokenMarket {
   return {
     priceUsd: asNumber(pick(best, ['priceUsd'])),
     marketCapUsd: asNumber(pick(best, ['marketCap', 'fdv'])),
@@ -99,6 +78,128 @@ export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarke
     name: asString(pick(best, ['baseToken.name'])),
     pairCreatedMs: asNumber(pick(best, ['pairCreatedAt'])),
   };
+}
+
+/**
+ * Deepest-liquidity Solana pair wins — that's the canonical market for a token.
+ * Pairs from a batch response are grouped by base-token mint first.
+ */
+function deepestByMint(pairs: unknown[]): Map<string, unknown> {
+  const best = new Map<string, unknown>();
+  const bestLiq = new Map<string, number>();
+  for (const p of pairs) {
+    if (asString(pick(p, ['chainId'])) !== 'solana') continue;
+    const base = asString(pick(p, ['baseToken.address']));
+    if (!base) continue;
+    const liq = asNumber(pick(p, ['liquidity.usd'])) ?? 0;
+    if (liq > (bestLiq.get(base) ?? -1)) {
+      bestLiq.set(base, liq);
+      best.set(base, p);
+    }
+  }
+  return best;
+}
+
+/**
+ * Short-lived market cache shared by the batch primer and single lookups.
+ * A `null` entry is a REAL answer ("not listed on any DEX yet"), cached so a
+ * whole sweep of on-curve coins doesn't re-ask for each one.
+ */
+const marketCache = new Map<string, { m: DexTokenMarket | null; at: number }>();
+const MARKET_TTL_MS = 60_000; // market data has to stay fresh — this drives rug detection
+const MARKET_CACHE_MAX = 600;
+
+function cacheMarket(mint: string, m: DexTokenMarket | null): void {
+  if (marketCache.size > MARKET_CACHE_MAX) marketCache.clear();
+  marketCache.set(mint, { m, at: Date.now() });
+}
+
+/**
+ * Batch-load market data for many mints at once (30 per request).
+ *
+ * This exists because the Live feed's LITE scans used to skip DexScreener
+ * entirely, which meant liquidity, price change and buy/sell flow were all
+ * null for every coin in the feed — so `assessLiveState` could only ever
+ * answer UNKNOWN and an ALREADY-RUGGED coin sailed into the feed looking
+ * normal. One batched call per 30 coins makes the rug checks actually run
+ * there, at roughly the cost of a single-token lookup.
+ */
+export async function primeDexscreenerTokens(mints: string[]): Promise<void> {
+  if (MOCK_MODE || !DEXSCREENER.enabled) return;
+  const now = Date.now();
+  const need = [
+    ...new Set(
+      mints.filter((m) => {
+        if (!BASE58_RE.test(m)) return false;
+        const hit = marketCache.get(m);
+        return !hit || now - hit.at > MARKET_TTL_MS;
+      }),
+    ),
+  ];
+
+  for (let i = 0; i < need.length; i += 30) {
+    const chunk = need.slice(i, i + 30);
+    const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(',')}`);
+    if (json === null) continue; // request failed → leave uncached so it retries
+    // `pairs: null` = none of these are listed yet (typical for fresh curve coins).
+    const pairs = (json as { pairs?: unknown[] | null }).pairs;
+    const best = deepestByMint(Array.isArray(pairs) ? pairs : []);
+    // Every mint in the chunk gets an entry: a hit, or a cached "not listed".
+    for (const mint of chunk) {
+      const p = best.get(mint);
+      cacheMarket(mint, p ? toMarket(p) : null);
+    }
+  }
+}
+
+/**
+ * Reliable price/market-cap/liquidity for a token, straight from DexScreener's
+ * token endpoint (returns `priceUsd`, `marketCap`, `liquidity.usd` directly —
+ * no derivation, matches what the sites show). Picks the deepest-liquidity
+ * Solana pair. null when the token isn't listed on any DEX yet (fresh pump
+ * coins on the bonding curve) or on failure. Served from the batch cache when
+ * a sweep already primed it.
+ */
+/**
+ * Cached market ONLY — never touches the network. `undefined` = not cached.
+ * Used by the feed's per-row refresh, which must stay O(batch calls), not
+ * O(coins): the sweep primes everything first, then every row reads from here.
+ */
+export function peekDexscreenerToken(mint: string): DexTokenMarket | null | undefined {
+  const hit = marketCache.get(mint);
+  return hit && Date.now() - hit.at < MARKET_TTL_MS ? hit.m : undefined;
+}
+
+export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarket | null> {
+  const r = await lookupDexscreenerToken(mint);
+  return r.status === 'ok' ? r.market : null;
+}
+
+/**
+ * Same lookup, but tells "not listed" apart from "request failed". Anything
+ * that records a VERDICT (the outcome ledger) must use this: treating a
+ * network blip as "delisted" used to stamp every due prediction RUGGED.
+ */
+export async function lookupDexscreenerToken(
+  mint: string,
+): Promise<{ status: 'ok'; market: DexTokenMarket | null } | { status: 'error' }> {
+  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE.test(mint)) return { status: 'error' };
+  const hit = marketCache.get(mint);
+  if (hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: 'ok', market: hit.m };
+
+  const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  const pairs = (json as { pairs?: unknown[] | null } | null)?.pairs;
+  // DexScreener answers an unlisted token with `pairs: null` — that's a real
+  // "not listed". A null BODY is a failed request.
+  if (json === null) return { status: 'error' }; // failure → do NOT cache, so it retries
+  if (!Array.isArray(pairs)) {
+    cacheMarket(mint, null);
+    return { status: 'ok', market: null };
+  }
+  const best = deepestByMint(pairs).get(mint) ?? null;
+  const market = best ? toMarket(best) : null;
+  cacheMarket(mint, market);
+  return { status: 'ok', market };
 }
 
 /** Fresh Solana token mint addresses from DexScreener's latest profiles. [] on failure. */

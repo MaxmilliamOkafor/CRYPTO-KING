@@ -245,6 +245,9 @@ export interface WatchSnapshot {
   lpStatus: LpStatus;
   devHoldsPct: number | null;
   largestNonLpWalletPct: number | null;
+  /** Live market state at snapshot time. Optional: snapshots stored before
+   *  this field existed load without it. */
+  liveState?: LiveState;
 }
 
 /** A coin the user is holding/watching — re-scanned periodically for rug alerts. */

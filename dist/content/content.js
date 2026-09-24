@@ -89,7 +89,11 @@ var INLINE_BADGES = {
 };
 var RATE_LIMITS_MS = {
   default: 1100,
-  "gmgn.ai": 400
+  "gmgn.ai": 400,
+  /** DexScreener publishes 300 req/min for its token/pair endpoints (=200ms);
+   *  250ms stays under it. It drives the rug/dump checks, so it must not crawl
+   *  at the 1.1s default. */
+  "api.dexscreener.com": 250
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
@@ -265,6 +269,28 @@ function gemBackgroundCheck(a, risk, quality) {
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
     blockers.push("Not enough positive signals yet (liquidity depth, holder spread, socials, age).");
   }
+  const m = a.mint;
+  if (!m) {
+    blockers.push("Mint account not verified \u2014 cannot rule out mint/freeze authority.");
+  } else {
+    if (m.mintAuthorityActive !== false) {
+      blockers.push(m.mintAuthorityActive ? "Mint authority is ACTIVE \u2014 dev can print unlimited supply." : "Mint authority not verified.");
+    }
+    if (m.freezeAuthorityActive !== false) {
+      blockers.push(m.freezeAuthorityActive ? "Freeze authority is ACTIVE \u2014 your wallet can be frozen." : "Freeze authority not verified.");
+    }
+    if (m.permanentDelegateActive === true) blockers.push("Permanent delegate \u2014 dev can take tokens out of your wallet.");
+    if (m.nonTransferable === true) blockers.push("Non-transferable token \u2014 you cannot sell.");
+    if (m.defaultAccountFrozen === true) blockers.push("New holder accounts start frozen.");
+    if (m.transferHookActive === true) blockers.push("Transfer hook \u2014 dev code runs on every transfer and can block sells.");
+    if (m.isToken2022 === true && m.feeAuthorityActive === true) {
+      blockers.push("Fee authority live \u2014 the transfer tax can be raised after you buy.");
+    }
+    if (m.transferFeeBps !== null && m.transferFeeBps > LIMITS.transferFeeHighBps) {
+      blockers.push(`Transfer tax ${(m.transferFeeBps / 100).toFixed(1)}% on every sell.`);
+    }
+  }
+  if (a.market?.sellSimulation?.ok === false) blockers.push("Simulated sell FAILS \u2014 honeypot.");
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
     blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
   }
@@ -444,6 +470,12 @@ function assessRugPotential(a, risk) {
     if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
     if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
     if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.transferFeeBps !== null && mint.transferFeeBps > LIMITS.transferFeeVeryHighBps) {
+      hard.push(`Every sell pays a ${(mint.transferFeeBps / 100).toFixed(1)}% transfer tax \u2014 exit is taxed away.`);
+    }
+    if (mint.isToken2022 === true && mint.feeAuthorityActive === true) {
+      soft.push("Fee authority is live \u2014 the transfer tax can be raised after you buy.");
+    }
     if (mint.mintAuthorityActive === null) unverified.push("mint authority");
     if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
   }
@@ -1869,17 +1901,18 @@ function fillPanel(panel, analysis, risk, quality) {
   const exitSection = `<h4>Can you actually get out?</h4><ul>
       <li><span class="pts ${xr.maxGentleUsd !== null && xr.maxGentleUsd < 50 ? "bad" : "good"}">\u21A9</span><span>${esc(xr.note)}</span></li>
       ${xr.transferFeePct ? `<li><span class="pts bad">+${xr.transferFeePct.toFixed(1)}%</span><span>Token-2022 transfer fee charged on the way out too.</span></li>` : ""}
+      ${sellQuoteLine(analysis)}
     </ul>`;
   const rugSection = rugItems ? `<h4>Rug-pull vectors</h4><ul>${rugItems}</ul>` : `<h4>Rug-pull vectors</h4><ul><li><span class="pts good">\u2713</span><span>None found on verified data \u2014 market risk still applies.</span></li></ul>`;
   const verdict = gemBackgroundCheck(analysis, risk, quality);
   const kg = computeKingGrade(analysis, risk, quality);
   const capItems = kg.caps.map((c) => `<li><span class="pts bad">\u25BC</span><span>${esc(c)}</span></li>`).join("");
-  const gemSection = (verdict.gem ? `<h4>\u{1F48E} Background check</h4><ul><li><span class="pts good">\u2713</span><span>PASSED \u2014 graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>` : `<h4>\u{1F48E} Background check \u2014 not passed</h4><ul>${verdict.blockers.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`).join("")}</ul>`) + (capItems ? `<h4>Why the grade is capped</h4><ul>${capItems}</ul>` : "");
+  const gemSection = (verdict.gem ? `<h4>\u{1F48E} Background check</h4><ul><li><span class="pts good">\u2713</span><span>PASSED \u2014 mint &amp; freeze authority revoked, no Token-2022 traps, graduated, LP secured, no whale or dev bag, creator screened, not dumping. Still speculative; research it yourself.</span></li></ul>` : `<h4>\u{1F48E} Background check \u2014 not passed</h4><ul>${verdict.blockers.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`).join("")}</ul>`) + (capItems ? `<h4>Why the grade is capped</h4><ul>${capItems}</ul>` : "");
   const gaps = risk.dataGaps.slice(0, 5).map((g) => `<li class="gap">${esc(g)}</li>`).join("");
   panel.innerHTML = `
     ${rugSection}
     ${exitSection}
-    ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
+    ${reasons ? `<h4>Red flags (each one lowers the grade)</h4><ul>${reasons}</ul>` : '<h4>Red flags</h4><ul><li class="gap">None triggered on the data we could check.</li></ul>'}
     ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ""}
     ${qualityItems ? `<h4>Quality signals (not a profit prediction)</h4><ul>${qualityItems}</ul>` : ""}
@@ -1889,6 +1922,20 @@ function fillPanel(panel, analysis, risk, quality) {
       <a href="https://rugcheck.xyz/tokens/${addr}" target="_blank" rel="noreferrer">RugCheck \u2197</a>
     </div>
     <div class="disclaimer">${esc(DISCLAIMER)}</div>`;
+}
+function sellQuoteLine(a) {
+  const sim = a.market?.sellSimulation;
+  if (!sim) {
+    return '<li class="gap">No live sell quote yet \u2014 sellability not confirmed.</li>';
+  }
+  if (!sim.ok) {
+    return '<li><span class="pts bad">\u2717</span><span>A simulated SELL FAILS \u2014 honeypot behaviour. Do not buy.</span></li>';
+  }
+  if (sim.slippagePct === null) {
+    return '<li><span class="pts good">\u2713</span><span>A sell route exists (not a honeypot on current checks).</span></li>';
+  }
+  const bad = sim.slippagePct > 10;
+  return `<li><span class="pts ${bad ? "bad" : "good"}">${bad ? "\u26A0" : "\u2713"}</span><span>Live sell check: selling costs ~${sim.slippagePct.toFixed(1)}% in slippage right now (sized at ~$${EXIT_REALITY.referencePositionUsd}).</span></li>`;
 }
 function short(addr) {
   return `${addr.slice(0, 4)}\u2026${addr.slice(-4)}`;

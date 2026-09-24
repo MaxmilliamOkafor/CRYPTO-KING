@@ -21,7 +21,7 @@
  * then DOM fallback (Solscan links near the token header).
  */
 
-import { DISCLAIMER, INLINE_BADGES, LIVE_FEED, MOCK_MODE } from '../config.ts';
+import { DISCLAIMER, EXIT_REALITY, INLINE_BADGES, LIVE_FEED, MOCK_MODE } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeBlurb, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
 import {
@@ -1458,6 +1458,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
   const exitSection = `<h4>Can you actually get out?</h4><ul>
       <li><span class="pts ${xr.maxGentleUsd !== null && xr.maxGentleUsd < 50 ? 'bad' : 'good'}">↩</span><span>${esc(xr.note)}</span></li>
       ${xr.transferFeePct ? `<li><span class="pts bad">+${xr.transferFeePct.toFixed(1)}%</span><span>Token-2022 transfer fee charged on the way out too.</span></li>` : ''}
+      ${sellQuoteLine(analysis)}
     </ul>`;
   const rugSection = rugItems
     ? `<h4>Rug-pull vectors</h4><ul>${rugItems}</ul>`
@@ -1467,7 +1468,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
   const capItems = kg.caps.map((c) => `<li><span class="pts bad">▼</span><span>${esc(c)}</span></li>`).join('');
   const gemSection =
     (verdict.gem
-      ? `<h4>💎 Background check</h4><ul><li><span class="pts good">✓</span><span>PASSED — graduated, LP secured, no whale wallet, creator screened. Still speculative; research it yourself.</span></li></ul>`
+      ? `<h4>💎 Background check</h4><ul><li><span class="pts good">✓</span><span>PASSED — mint &amp; freeze authority revoked, no Token-2022 traps, graduated, LP secured, no whale or dev bag, creator screened, not dumping. Still speculative; research it yourself.</span></li></ul>`
       : `<h4>💎 Background check — not passed</h4><ul>${verdict.blockers
           .map((b) => `<li><span class="pts bad">✗</span><span>${esc(b)}</span></li>`)
           .join('')}</ul>`) +
@@ -1480,7 +1481,7 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
   panel.innerHTML = `
     ${rugSection}
     ${exitSection}
-    ${reasons ? `<h4>Why this score</h4><ul>${reasons}</ul>` : '<h4>Why this score</h4><ul><li class="gap">No risk factors triggered.</li></ul>'}
+    ${reasons ? `<h4>Red flags (each one lowers the grade)</h4><ul>${reasons}</ul>` : '<h4>Red flags</h4><ul><li class="gap">None triggered on the data we could check.</li></ul>'}
     ${gemSection}
     ${mitigations ? `<h4>Mitigating signals</h4><ul>${mitigations}</ul>` : ''}
     ${qualityItems ? `<h4>Quality signals (not a profit prediction)</h4><ul>${qualityItems}</ul>` : ''}
@@ -1490,6 +1491,23 @@ function fillPanel(panel: HTMLDivElement, analysis: TokenAnalysis, risk: RiskRes
       <a href="https://rugcheck.xyz/tokens/${addr}" target="_blank" rel="noreferrer">RugCheck ↗</a>
     </div>
     <div class="disclaimer">${esc(DISCLAIMER)}</div>`;
+}
+
+/** A REAL sell quote (Jupiter / GMGN), when one exists — the formula above is
+ *  an estimate from pool size; this is what a sell actually costs right now. */
+function sellQuoteLine(a: TokenAnalysis): string {
+  const sim = a.market?.sellSimulation;
+  if (!sim) {
+    return '<li class="gap">No live sell quote yet — sellability not confirmed.</li>';
+  }
+  if (!sim.ok) {
+    return '<li><span class="pts bad">✗</span><span>A simulated SELL FAILS — honeypot behaviour. Do not buy.</span></li>';
+  }
+  if (sim.slippagePct === null) {
+    return '<li><span class="pts good">✓</span><span>A sell route exists (not a honeypot on current checks).</span></li>';
+  }
+  const bad = sim.slippagePct > 10;
+  return `<li><span class="pts ${bad ? 'bad' : 'good'}">${bad ? '⚠' : '✓'}</span><span>Live sell check: selling costs ~${sim.slippagePct.toFixed(1)}% in slippage right now (sized at ~$${EXIT_REALITY.referencePositionUsd}).</span></li>`;
 }
 
 /* ── Utilities & SPA watch loop ────────────────────────────────────────── */

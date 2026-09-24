@@ -248,6 +248,28 @@ function gemBackgroundCheck(a, risk, quality) {
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
     blockers.push("Not enough positive signals yet (liquidity depth, holder spread, socials, age).");
   }
+  const m = a.mint;
+  if (!m) {
+    blockers.push("Mint account not verified \u2014 cannot rule out mint/freeze authority.");
+  } else {
+    if (m.mintAuthorityActive !== false) {
+      blockers.push(m.mintAuthorityActive ? "Mint authority is ACTIVE \u2014 dev can print unlimited supply." : "Mint authority not verified.");
+    }
+    if (m.freezeAuthorityActive !== false) {
+      blockers.push(m.freezeAuthorityActive ? "Freeze authority is ACTIVE \u2014 your wallet can be frozen." : "Freeze authority not verified.");
+    }
+    if (m.permanentDelegateActive === true) blockers.push("Permanent delegate \u2014 dev can take tokens out of your wallet.");
+    if (m.nonTransferable === true) blockers.push("Non-transferable token \u2014 you cannot sell.");
+    if (m.defaultAccountFrozen === true) blockers.push("New holder accounts start frozen.");
+    if (m.transferHookActive === true) blockers.push("Transfer hook \u2014 dev code runs on every transfer and can block sells.");
+    if (m.isToken2022 === true && m.feeAuthorityActive === true) {
+      blockers.push("Fee authority live \u2014 the transfer tax can be raised after you buy.");
+    }
+    if (m.transferFeeBps !== null && m.transferFeeBps > LIMITS.transferFeeHighBps) {
+      blockers.push(`Transfer tax ${(m.transferFeeBps / 100).toFixed(1)}% on every sell.`);
+    }
+  }
+  if (a.market?.sellSimulation?.ok === false) blockers.push("Simulated sell FAILS \u2014 honeypot.");
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
     blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
   }
@@ -369,6 +391,12 @@ function assessRugPotential(a, risk) {
     if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
     if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
     if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.transferFeeBps !== null && mint.transferFeeBps > LIMITS.transferFeeVeryHighBps) {
+      hard.push(`Every sell pays a ${(mint.transferFeeBps / 100).toFixed(1)}% transfer tax \u2014 exit is taxed away.`);
+    }
+    if (mint.isToken2022 === true && mint.feeAuthorityActive === true) {
+      soft.push("Fee authority is live \u2014 the transfer tax can be raised after you buy.");
+    }
     if (mint.mintAuthorityActive === null) unverified.push("mint authority");
     if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
   }

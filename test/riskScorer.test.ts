@@ -12,6 +12,8 @@ import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { GRADE_META, LIVE_FEED } from '../config.ts';
 import { computeKingGrade, gradeBlurb, gradeLabel } from '../lib/kingGrade.ts';
 import { matchFirst, MINT_HREF_RES, PAIR_HREF_RES, pairLinksAreSolana } from '../lib/linkTargets.ts';
+import { computeConcentration, effectiveTransferFeeBps, SYSTEM_PROGRAM, uiAmountOf } from '../lib/holderMath.ts';
+import { parseSellQuote, rawAmountFor } from '../lib/jupiterClient.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
 import { classifyOutcome, computeAccuracy } from '../lib/outcomeLedger.ts';
@@ -24,6 +26,9 @@ import { FIXTURE_AVOID, FIXTURE_NEUTRAL, FIXTURE_WATCH } from '../mock/fixtures.
 import type { TokenAnalysis } from '../lib/types.ts';
 
 let passed = 0;
+/** Percent math is floating point — compare to 1e-9. */
+const near = (actual: number | null, expected: number) =>
+  assert.ok(actual !== null && Math.abs(actual - expected) < 1e-9, `expected ≈${expected}, got ${actual}`);
 function test(name: string, fn: () => void): void {
   try {
     fn();
@@ -645,6 +650,120 @@ test('pair links are only followed on Solana routes', () => {
   assert.equal(pairLinksAreSolana('www.dextools.io', '/app/solana/live-new-pairs'), true);
   assert.equal(pairLinksAreSolana('www.dextools.io', '/app/en/ether/live-new-pairs'), false);
   assert.equal(pairLinksAreSolana('gmgn.ai', '/sol/token/abc'), true); // non-dextools carries its own chain
+});
+
+/* ── 🔍 Full-audit regressions: each test pins a bug that cost real money ── */
+
+test('AUDIT: a live MINT AUTHORITY can never pass as a gem, however low the risk score', () => {
+  // The bug: +25 for the authority, minus mitigations, landed at risk 10 —
+  // under the gate — and the coin pulsed gold as a 💎 with a desktop alert.
+  const t: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  t.mint = { ...t.mint!, mintAuthorityActive: true };
+  const r = scoreToken(t);
+  assert.ok(r.riskScore <= LIVE_FEED.notifyMaxScore, 'precondition: score alone would have let it through');
+  const v = gemBackgroundCheck(t, r, scoreQuality(t));
+  assert.equal(v.gem, false);
+  assert.ok(v.blockers.some((b) => /Mint authority is ACTIVE/.test(b)));
+});
+
+test('AUDIT: unverified authorities, freeze authority and honeypots also block the gem', () => {
+  const unknown: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  unknown.mint = { ...unknown.mint!, mintAuthorityActive: null };
+  assert.equal(gemBackgroundCheck(unknown, scoreToken(unknown), scoreQuality(unknown)).gem, false);
+
+  const freeze: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  freeze.mint = { ...freeze.mint!, freezeAuthorityActive: true };
+  assert.equal(gemBackgroundCheck(freeze, scoreToken(freeze), scoreQuality(freeze)).gem, false);
+
+  const honeypot: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  honeypot.market = { ...honeypot.market!, sellSimulation: { ok: false, slippagePct: null } };
+  assert.equal(gemBackgroundCheck(honeypot, scoreToken(honeypot), scoreQuality(honeypot)).gem, false);
+
+  // …and the clean fixture still passes, so the gates aren't just "block everything".
+  assert.equal(gemBackgroundCheck(FIXTURE_NEUTRAL, scoreToken(FIXTURE_NEUTRAL), scoreQuality(FIXTURE_NEUTRAL)).gem, true);
+});
+
+test('AUDIT: a liquidity POOL is not a whale — program-owned vaults are excluded', () => {
+  const W = SYSTEM_PROGRAM;
+  const conc = computeConcentration(
+    [
+      // PumpSwap / Meteora / Orca vault: owned by a per-pool PDA that no static
+      // list contains. It used to be reported as "a single wallet holds 70%".
+      { address: 'vault', amount: 700, owner: 'poolPda', ownerProgram: 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA' },
+      { address: 'a1', amount: 40, owner: 'alice', ownerProgram: W },
+      { address: 'b1', amount: 30, owner: 'bob', ownerProgram: W },
+    ],
+    1000,
+    new Set(),
+  )!;
+  near(conc.largestWalletPct, 4); // alice, not the pool
+  near(conc.programHeldPct, 70);
+  near(conc.top10Pct, 7);
+});
+
+test('AUDIT: a whale splitting across token accounts is summed, burns excluded, unknowns kept', () => {
+  const W = SYSTEM_PROGRAM;
+  const conc = computeConcentration(
+    [
+      { address: 'burn', amount: 500, owner: '1nc1nerator11111111111111111111111111111111', ownerProgram: W },
+      { address: 'w1', amount: 80, owner: 'whale', ownerProgram: W },
+      { address: 'w2', amount: 80, owner: 'whale', ownerProgram: W },
+      { address: 'x', amount: 100, owner: null, ownerProgram: null }, // unresolved → still counted
+    ],
+    1000,
+    new Set(['1nc1nerator11111111111111111111111111111111']),
+  )!;
+  near(conc.largestWalletPct, 16); // 80+80 → one person
+  near(conc.burnedPct, 50);
+  near(conc.top5Pct, 26); // whale 16 + unresolved 10: when unsure, never hide concentration
+});
+
+test('AUDIT: Token-2022 fee = the WORSE of current and scheduled; exact amounts preferred', () => {
+  assert.equal(effectiveTransferFeeBps(0, 5000), 5000); // 0% now, 50% scheduled → it's a 50% trap
+  assert.equal(effectiveTransferFeeBps(300, 0), 300);
+  assert.equal(effectiveTransferFeeBps(null, null), null);
+  assert.equal(uiAmountOf({ uiAmountString: '1000000000.123456', uiAmount: null }), 1000000000.123456);
+  assert.equal(uiAmountOf({ uiAmount: 42 }), 42);
+  assert.equal(uiAmountOf({}), null);
+});
+
+test('AUDIT: a live fee authority / heavy transfer tax is a RUG vector, not just a cost', () => {
+  const feeAuth: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  feeAuth.mint = { ...feeAuth.mint!, isToken2022: true, transferFeeBps: 0, feeAuthorityActive: true };
+  const r1 = assessRugPotential(feeAuth, scoreToken(feeAuth));
+  assert.notEqual(r1.verdict, 'LOW');
+  assert.ok(r1.vectors.some((v) => /tax can be raised/.test(v)));
+
+  const taxed: TokenAnalysis = structuredClone(FIXTURE_NEUTRAL);
+  taxed.mint = { ...taxed.mint!, isToken2022: true, transferFeeBps: 3000, feeAuthorityActive: false };
+  assert.equal(assessRugPotential(taxed, scoreToken(taxed)).verdict, 'HIGH');
+});
+
+test('AUDIT: watch alerts fire on the transition INTO dumping / dead — early, and only once', () => {
+  const base = { at: 0, grade: 60, liquidityEur: 100_000, marketCapEur: 500_000, lpStatus: 'burned' as const, devHoldsPct: 0, largestNonLpWalletPct: 3 };
+  const dumping = computeWatchAlerts({ ...base, liveState: 'HEALTHY' }, { ...base, at: 1, liveState: 'DUMPING' });
+  assert.ok(dumping.some((a) => a.kind === 'dumping'));
+  const dead = computeWatchAlerts({ ...base, liveState: 'DUMPING' }, { ...base, at: 1, liveState: 'DEAD' });
+  assert.ok(dead.some((a) => a.kind === 'dead'));
+  // Already dumping when you started watching → you knew; no alert spam.
+  assert.equal(computeWatchAlerts({ ...base, liveState: 'DUMPING' }, { ...base, at: 1, liveState: 'DUMPING' }).length, 0);
+  // Snapshots stored before liveState existed must not crash or alert.
+  assert.equal(computeWatchAlerts(base, { ...base, at: 1 }).length, 0);
+});
+
+test('AUDIT: Jupiter sell quote — fraction → percent, no route → unknown (never "honeypot")', () => {
+  assert.deepEqual(parseSellQuote({ outAmount: '12345', priceImpactPct: '0.0123', routePlan: [{}] }, 100), {
+    priceImpactPct: 1.2,
+    sizeUsd: 100,
+  });
+  assert.equal(parseSellQuote({ error: 'Could not find any route', errorCode: 'COULD_NOT_FIND_ANY_ROUTE' }, 100), null);
+  assert.equal(parseSellQuote(null, 100), null);
+  assert.equal(parseSellQuote({ outAmount: '0', priceImpactPct: '0', routePlan: [{}] }, 100), null);
+  // $100 at $0.0001 = 1,000,000 tokens; 6 decimals → 1e12 base units, exact.
+  assert.equal(rawAmountFor(100, 0.0001, 6), '1000000000000');
+  assert.equal(rawAmountFor(100, 0, 6), null);
+  // 18 decimals must not overflow into exponent notation.
+  assert.match(rawAmountFor(1, 1, 18)!, /^1000000000000000000$/);
 });
 
 console.log(`\n${passed} tests passed.`);

@@ -114,3 +114,17 @@ For 5 real coins spanning fresh→graduated, scanned live:
 
 Fix data mappings only; keep the risk model, King Grade ceilings, gem gate, and honest
 framing ("not a buy signal", "unknown ≠ safe") intact.
+
+## Added in the full audit — verify these live too
+
+- **Jupiter sell quote** (`lib/jupiterClient.ts`): confirm `lite-api.jup.ag/swap/v1/quote`
+  returns `priceImpactPct` as a decimal FRACTION string (`"0.0123"` = 1.23%). If it is
+  already a percent, drop the `* 100` in `parseSellQuote()`. With `DEBUG = true`, the
+  card's "Live sell check" line should roughly match the price impact jup.ag shows
+  for the same size.
+- **Batch DexScreener** (`primeDexscreenerTokens`): `/latest/dex/tokens/<a>,<b>,…`
+  (≤30) should return `pairs` for every listed mint; unlisted batches return
+  `pairs: null`. Spot-check that a feed coin's liquidity matches dexscreener.com.
+- **Pool detection** (`lib/holderMath.ts`): on a graduated pump.fun coin, the card's
+  "largest wallet" should now be a real wallet, NOT the PumpSwap pool. Compare the
+  top holders against solscan.io's holder tab (pool accounts are labelled there).

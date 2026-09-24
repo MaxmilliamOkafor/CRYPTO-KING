@@ -48,6 +48,15 @@ export function assessRugPotential(a: TokenAnalysis, risk: RiskResult): RugPoten
     if (mint.nonTransferable === true) hard.push('Token is soulbound — you cannot sell.');
     if (mint.defaultAccountFrozen === true) hard.push('New holder accounts start frozen.');
     if (mint.transferHookActive === true) hard.push('Transfers run dev code that can block sells.');
+    // Token-2022 fees are a rug vector too, not just a cost: every sell pays
+    // them, and a live fee authority can raise them toward 100% after you buy
+    // (a delayed honeypot). These were scored as risk but never as a rug.
+    if (mint.transferFeeBps !== null && mint.transferFeeBps > LIMITS.transferFeeVeryHighBps) {
+      hard.push(`Every sell pays a ${(mint.transferFeeBps / 100).toFixed(1)}% transfer tax — exit is taxed away.`);
+    }
+    if (mint.isToken2022 === true && mint.feeAuthorityActive === true) {
+      soft.push('Fee authority is live — the transfer tax can be raised after you buy.');
+    }
     if (mint.mintAuthorityActive === null) unverified.push('mint authority');
     if (mint.freezeAuthorityActive === null) unverified.push('freeze authority');
   }

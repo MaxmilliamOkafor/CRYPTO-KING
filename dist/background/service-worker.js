@@ -92,6 +92,12 @@ var LIVE_FEED = {
    */
   safeMinGrade: 40
 };
+var JUPITER = {
+  enabled: true,
+  quoteUrl: "https://lite-api.jup.ag/swap/v1/quote",
+  /** Wide tolerance: we want the route and its price impact, not a tight fill. */
+  slippageBps: 5e3
+};
 var DEXSCREENER = {
   enabled: true,
   /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
@@ -122,8 +128,11 @@ var SOLANA = {
     return this.rpcUrl.includes("helius");
   },
   /**
-   * Token accounts owned by these authorities are treated as pool/LP accounts
-   * and EXCLUDED from holder-concentration math. Extend as needed.
+   * Belt-and-braces only. Pools are recognised STRUCTURALLY (any token-account
+   * owner that is itself owned by a program rather than the System Program —
+   * see lib/holderMath.ts), which covers PumpSwap, Meteora, Orca and bonding
+   * curves that no static list can enumerate. These entries just guarantee
+   * the two big Raydium authorities are excluded even if that lookup fails.
    */
   knownPoolAuthorities: [
     "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
@@ -155,7 +164,11 @@ var RUGCHECK = {
 };
 var RATE_LIMITS_MS = {
   default: 1100,
-  "gmgn.ai": 400
+  "gmgn.ai": 400,
+  /** DexScreener publishes 300 req/min for its token/pair endpoints (=200ms);
+   *  250ms stays under it. It drives the rug/dump checks, so it must not crawl
+   *  at the 1.1s default. */
+  "api.dexscreener.com": 250
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
@@ -348,6 +361,16 @@ var OUTCOME_LEDGER = {
   fadedRatio: 0.7,
   /** ≥ this = winner. */
   winnerRatio: 2
+};
+var EXIT_REALITY = {
+  /** Your typical position size (USD) — the card reports its real exit cost. */
+  referencePositionUsd: 100,
+  /** "Gentle" exit: price impact you'd barely notice. */
+  gentleImpactPct: 2,
+  /** Most you'd tolerate losing to slippage on the way out. */
+  toleratedImpactPct: 5,
+  /** If even a gentle exit is under this, the pool is unusably thin. */
+  dangerouslyThinUsd: 50
 };
 var LIVE_STATE = {
   /** Liquidity below this (USD) on a listed coin = effectively pulled. */
@@ -971,22 +994,7 @@ async function fetchPairBaseTokens(pairAddresses) {
   }
   return out;
 }
-async function fetchDexscreenerToken(mint) {
-  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE2.test(mint)) return null;
-  const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-  const pairs = json?.pairs;
-  if (!Array.isArray(pairs) || pairs.length === 0) return null;
-  let best = null;
-  let bestLiq = -1;
-  for (const p of pairs) {
-    if (asString(pick(p, ["chainId"])) !== "solana") continue;
-    const liq = asNumber(pick(p, ["liquidity.usd"])) ?? 0;
-    if (liq > bestLiq) {
-      bestLiq = liq;
-      best = p;
-    }
-  }
-  if (!best) return null;
+function toMarket(best) {
   return {
     priceUsd: asNumber(pick(best, ["priceUsd"])),
     marketCapUsd: asNumber(pick(best, ["marketCap", "fdv"])),
@@ -1002,6 +1010,76 @@ async function fetchDexscreenerToken(mint) {
     name: asString(pick(best, ["baseToken.name"])),
     pairCreatedMs: asNumber(pick(best, ["pairCreatedAt"]))
   };
+}
+function deepestByMint(pairs) {
+  const best = /* @__PURE__ */ new Map();
+  const bestLiq = /* @__PURE__ */ new Map();
+  for (const p of pairs) {
+    if (asString(pick(p, ["chainId"])) !== "solana") continue;
+    const base = asString(pick(p, ["baseToken.address"]));
+    if (!base) continue;
+    const liq = asNumber(pick(p, ["liquidity.usd"])) ?? 0;
+    if (liq > (bestLiq.get(base) ?? -1)) {
+      bestLiq.set(base, liq);
+      best.set(base, p);
+    }
+  }
+  return best;
+}
+var marketCache = /* @__PURE__ */ new Map();
+var MARKET_TTL_MS = 6e4;
+var MARKET_CACHE_MAX = 600;
+function cacheMarket(mint, m) {
+  if (marketCache.size > MARKET_CACHE_MAX) marketCache.clear();
+  marketCache.set(mint, { m, at: Date.now() });
+}
+async function primeDexscreenerTokens(mints) {
+  if (MOCK_MODE || !DEXSCREENER.enabled) return;
+  const now2 = Date.now();
+  const need = [
+    ...new Set(
+      mints.filter((m) => {
+        if (!BASE58_RE2.test(m)) return false;
+        const hit = marketCache.get(m);
+        return !hit || now2 - hit.at > MARKET_TTL_MS;
+      })
+    )
+  ];
+  for (let i = 0; i < need.length; i += 30) {
+    const chunk = need.slice(i, i + 30);
+    const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${chunk.join(",")}`);
+    if (json === null) continue;
+    const pairs = json.pairs;
+    const best = deepestByMint(Array.isArray(pairs) ? pairs : []);
+    for (const mint of chunk) {
+      const p = best.get(mint);
+      cacheMarket(mint, p ? toMarket(p) : null);
+    }
+  }
+}
+function peekDexscreenerToken(mint) {
+  const hit = marketCache.get(mint);
+  return hit && Date.now() - hit.at < MARKET_TTL_MS ? hit.m : void 0;
+}
+async function fetchDexscreenerToken(mint) {
+  const r = await lookupDexscreenerToken(mint);
+  return r.status === "ok" ? r.market : null;
+}
+async function lookupDexscreenerToken(mint) {
+  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE2.test(mint)) return { status: "error" };
+  const hit = marketCache.get(mint);
+  if (hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: "ok", market: hit.m };
+  const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+  const pairs = json?.pairs;
+  if (json === null) return { status: "error" };
+  if (!Array.isArray(pairs)) {
+    cacheMarket(mint, null);
+    return { status: "ok", market: null };
+  }
+  const best = deepestByMint(pairs).get(mint) ?? null;
+  const market = best ? toMarket(best) : null;
+  cacheMarket(mint, market);
+  return { status: "ok", market };
 }
 async function fetchDexscreenerNewSolana(limit) {
   if (MOCK_MODE || !DEXSCREENER.enabled) return [];
@@ -1069,6 +1147,28 @@ function gemBackgroundCheck(a, risk, quality) {
   if (quality.qualityScore < LIVE_FEED.gemMinQuality) {
     blockers.push("Not enough positive signals yet (liquidity depth, holder spread, socials, age).");
   }
+  const m = a.mint;
+  if (!m) {
+    blockers.push("Mint account not verified \u2014 cannot rule out mint/freeze authority.");
+  } else {
+    if (m.mintAuthorityActive !== false) {
+      blockers.push(m.mintAuthorityActive ? "Mint authority is ACTIVE \u2014 dev can print unlimited supply." : "Mint authority not verified.");
+    }
+    if (m.freezeAuthorityActive !== false) {
+      blockers.push(m.freezeAuthorityActive ? "Freeze authority is ACTIVE \u2014 your wallet can be frozen." : "Freeze authority not verified.");
+    }
+    if (m.permanentDelegateActive === true) blockers.push("Permanent delegate \u2014 dev can take tokens out of your wallet.");
+    if (m.nonTransferable === true) blockers.push("Non-transferable token \u2014 you cannot sell.");
+    if (m.defaultAccountFrozen === true) blockers.push("New holder accounts start frozen.");
+    if (m.transferHookActive === true) blockers.push("Transfer hook \u2014 dev code runs on every transfer and can block sells.");
+    if (m.isToken2022 === true && m.feeAuthorityActive === true) {
+      blockers.push("Fee authority live \u2014 the transfer tax can be raised after you buy.");
+    }
+    if (m.transferFeeBps !== null && m.transferFeeBps > LIMITS.transferFeeHighBps) {
+      blockers.push(`Transfer tax ${(m.transferFeeBps / 100).toFixed(1)}% on every sell.`);
+    }
+  }
+  if (a.market?.sellSimulation?.ok === false) blockers.push("Simulated sell FAILS \u2014 honeypot.");
   if (GEM_CRITERIA.requireGraduated && a.launch?.bondingCurveComplete === false) {
     blockers.push("Still on the bonding curve \u2014 dev/insiders can dump at any moment.");
   }
@@ -1098,6 +1198,34 @@ function gemBackgroundCheck(a, risk, quality) {
     blockers.push("Creator's launch history not checked yet.");
   }
   return { gem: blockers.length === 0, blockers };
+}
+
+// lib/jupiterClient.ts
+var SOL_MINT = "So11111111111111111111111111111111111111112";
+async function fetchSellQuote(mint, priceUsd, decimals, sizeUsd) {
+  if (MOCK_MODE || !JUPITER.enabled) return null;
+  if (priceUsd === null || !(priceUsd > 0) || decimals === null || decimals < 0 || decimals > 18) return null;
+  const raw = rawAmountFor(sizeUsd, priceUsd, decimals);
+  if (raw === null) return null;
+  const url = `${JUPITER.quoteUrl}?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${raw}&slippageBps=${JUPITER.slippageBps}&swapMode=ExactIn`;
+  const json = await fetchJson(url);
+  return parseSellQuote(json, sizeUsd);
+}
+function rawAmountFor(sizeUsd, priceUsd, decimals) {
+  const tokens = sizeUsd / priceUsd;
+  if (!Number.isFinite(tokens) || tokens <= 0) return null;
+  const [whole, frac = ""] = tokens.toFixed(Math.min(decimals, 12)).split(".");
+  const digits = (whole + frac.padEnd(decimals, "0").slice(0, decimals)).replace(/^0+/, "");
+  return digits.length > 0 ? digits : null;
+}
+function parseSellQuote(json, sizeUsd) {
+  if (!json || typeof json !== "object") return null;
+  const q = json;
+  const out = asNumber(q.outAmount);
+  if (out === null || out <= 0 || !Array.isArray(q.routePlan) || q.routePlan.length === 0) return null;
+  const frac = asNumber(q.priceImpactPct);
+  if (frac === null || frac < 0) return null;
+  return { priceImpactPct: Math.min(100, Math.round(frac * 1e3) / 10), sizeUsd };
 }
 
 // lib/kingGrade.ts
@@ -1421,7 +1549,7 @@ function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
   const m = a.market;
   if (m?.liquidityEur !== null && m?.liquidityEur !== void 0 && m.marketCapEur !== null) {
     if (m.liquidityEur >= l.minLiquidityEur && m.liquidityEur / m.marketCapEur >= l.minLiqMcapRatio) {
-      hit(w.liquidityDepth, `Real liquidity depth (\u20AC${Math.round(m.liquidityEur / 1e3)}k, ${(m.liquidityEur / m.marketCapEur * 100).toFixed(0)}% of cap).`);
+      hit(w.liquidityDepth, `Real liquidity depth ($${Math.round(m.liquidityEur / 1e3)}k, ${(m.liquidityEur / m.marketCapEur * 100).toFixed(0)}% of cap).`);
     }
     if (m.volume24hEur !== null && m.marketCapEur > 0) {
       const ratio = m.volume24hEur / m.marketCapEur;
@@ -1436,7 +1564,7 @@ function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
     const progress = Math.min(1, a.market.marketCapEur / GRAD_CAP_EUR);
     const pts = Math.round(w.curveTraction * progress);
     if (pts > 0) {
-      hit(pts, `Curve traction: \u20AC${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
+      hit(pts, `Curve traction: $${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
     }
   }
   if (a.launch?.replyCount !== null && a.launch?.replyCount !== void 0 && a.launch.replyCount >= l.minReplies) {
@@ -1544,11 +1672,11 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
       if (market.liquidityEur < l.thinLiquidityEur && market.marketCapEur > l.thinLiqMcapEur) {
         hit(
           w.thinLiquidityVsMcap,
-          `Thin liquidity (\u20AC${fmtK2(market.liquidityEur)}) vs. cap (\u20AC${fmtK2(market.marketCapEur)}) \u2014 easy to manipulate.`
+          `Thin liquidity ($${fmtK2(market.liquidityEur)}) vs. cap ($${fmtK2(market.marketCapEur)}) \u2014 easy to manipulate.`
         );
       }
       if (market.marketCapEur < l.microMcapEur && lpSecured === false) {
-        hit(w.microMcapUnlockedLp, `Micro cap (\u20AC${fmtK2(market.marketCapEur)}) with unsecured LP \u2014 high rug exposure.`);
+        hit(w.microMcapUnlockedLp, `Micro cap ($${fmtK2(market.marketCapEur)}) with unsecured LP \u2014 high rug exposure.`);
       }
     } else {
       gap("Liquidity/market-cap figures incomplete.");
@@ -1719,6 +1847,12 @@ function assessRugPotential(a, risk) {
     if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
     if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
     if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.transferFeeBps !== null && mint.transferFeeBps > LIMITS.transferFeeVeryHighBps) {
+      hard.push(`Every sell pays a ${(mint.transferFeeBps / 100).toFixed(1)}% transfer tax \u2014 exit is taxed away.`);
+    }
+    if (mint.isToken2022 === true && mint.feeAuthorityActive === true) {
+      soft.push("Fee authority is live \u2014 the transfer tax can be raised after you buy.");
+    }
     if (mint.mintAuthorityActive === null) unverified.push("mint authority");
     if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
   }
@@ -1849,6 +1983,11 @@ function computeWatchAlerts(baseline, current2) {
       message: `Dev wallet cut holdings from ${baseline.devHoldsPct.toFixed(1)}% to ${current2.devHoldsPct.toFixed(1)}% \u2014 dev is selling.`
     });
   }
+  if (current2.liveState === "DEAD" && baseline.liveState !== "DEAD") {
+    alerts.push({ kind: "dead", message: "Liquidity pulled / price collapsed \u2014 this coin looks rugged. Exit if you still can." });
+  } else if (current2.liveState === "DUMPING" && baseline.liveState !== "DUMPING" && baseline.liveState !== "DEAD") {
+    alerts.push({ kind: "dumping", message: "Dumping right now \u2014 sharp drop and/or sells dominating in the last hour." });
+  }
   if (baseline.grade !== null && current2.grade !== null && baseline.grade - current2.grade >= t.gradeDrop) {
     alerts.push({
       kind: "grade-collapse",
@@ -1880,20 +2019,66 @@ var rugcheckAdapter = {
   }
 };
 
+// lib/holderMath.ts
+var SYSTEM_PROGRAM = "11111111111111111111111111111111";
+function classifyHolder(acc, burnAddresses, knownPoolOwners) {
+  if (acc.owner !== null && burnAddresses.has(acc.owner)) return "burn";
+  if (acc.owner !== null && knownPoolOwners.has(acc.owner)) return "program";
+  if (acc.ownerProgram !== null && acc.ownerProgram !== SYSTEM_PROGRAM) return "program";
+  return "wallet";
+}
+function computeConcentration(accounts, supply, burnAddresses, knownPoolOwners = /* @__PURE__ */ new Set()) {
+  if (!(supply > 0)) return null;
+  const pct = (xs) => Math.min(100, xs.reduce((s, a) => s + a.amount, 0) / supply * 100);
+  const wallets = [];
+  const programs = [];
+  const burns = [];
+  for (const a of accounts) {
+    const kind = classifyHolder(a, burnAddresses, knownPoolOwners);
+    (kind === "wallet" ? wallets : kind === "program" ? programs : burns).push(a);
+  }
+  const byOwner = /* @__PURE__ */ new Map();
+  for (const w of wallets) {
+    const k = w.owner ?? `acct:${w.address}`;
+    byOwner.set(k, (byOwner.get(k) ?? 0) + w.amount);
+  }
+  const ranked = [...byOwner.values()].sort((a, b) => b - a).map((amount) => ({ amount }));
+  return {
+    top5Pct: pct(ranked.slice(0, 5)),
+    top10Pct: pct(ranked.slice(0, 10)),
+    largestWalletPct: ranked.length > 0 ? pct(ranked.slice(0, 1)) : null,
+    programHeldPct: pct(programs),
+    burnedPct: pct(burns)
+  };
+}
+function effectiveTransferFeeBps(olderBps, newerBps) {
+  if (olderBps === null && newerBps === null) return null;
+  return Math.max(olderBps ?? 0, newerBps ?? 0);
+}
+function uiAmountOf(v) {
+  if (!v) return null;
+  for (const raw of [v.uiAmountString, v.uiAmount]) {
+    const n = typeof raw === "string" ? Number(raw) : typeof raw === "number" ? raw : NaN;
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 // lib/solanaClient.ts
 var TOKEN_2022_PROGRAM2 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [], creatorAddress = null) {
+async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [], creatorAddress = null, curveComplete = null) {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
-    return { mint: f.mint, holders: f.holders, status: "mock" };
+    return { mint: f.mint, holders: f.holders, decimals: null, status: "mock" };
   }
   if (lite) {
-    const [mint2, holders2] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts)]);
-    return { mint: mint2, holders: holders2, status: mint2 ? "partial" : "unavailable" };
+    const [mi2, holders2] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete)]);
+    return { mint: mi2?.mint ?? null, holders: holders2, decimals: mi2?.decimals ?? null, status: mi2 ? "partial" : "unavailable" };
   }
-  const [mint, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address, creatorAddress)]);
+  const [mi, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address, creatorAddress)]);
+  const mint = mi?.mint ?? null;
   const status = mint && holders ? "ok" : mint || holders ? "partial" : "unavailable";
-  return { mint, holders, status };
+  return { mint, holders, decimals: mi?.decimals ?? null, status };
 }
 async function fetchMintInfo(address) {
   const result = await rpcCall(rpcUrlPool(), "getAccountInfo", [
@@ -1918,8 +2103,9 @@ async function fetchMintInfo(address) {
     const state = ext.state ?? {};
     switch (ext.extension) {
       case "transferFeeConfig": {
+        const older = state.olderTransferFee ?? {};
         const newer = state.newerTransferFee ?? {};
-        transferFeeBps = asNumber(newer.transferFeeBasisPoints) ?? 0;
+        transferFeeBps = effectiveTransferFeeBps(asNumber(older.transferFeeBasisPoints), asNumber(newer.transferFeeBasisPoints)) ?? 0;
         feeAuthorityActive = state.transferFeeConfigAuthority != null || state.withdrawWithheldAuthority != null;
         break;
       }
@@ -1939,16 +2125,19 @@ async function fetchMintInfo(address) {
     }
   }
   return {
-    mintAuthorityActive,
-    freezeAuthorityActive,
-    metadataMutable: await fetchMetadataMutable(address),
-    isToken2022,
-    transferFeeBps,
-    feeAuthorityActive,
-    permanentDelegateActive,
-    transferHookActive,
-    defaultAccountFrozen,
-    nonTransferable
+    mint: {
+      mintAuthorityActive,
+      freezeAuthorityActive,
+      metadataMutable: await fetchMetadataMutable(address),
+      isToken2022,
+      transferFeeBps,
+      feeAuthorityActive,
+      permanentDelegateActive,
+      transferHookActive,
+      defaultAccountFrozen,
+      nonTransferable
+    },
+    decimals: asNumber(info.decimals)
   };
 }
 async function fetchMetadataMutable(address) {
@@ -1961,45 +2150,53 @@ async function fetchHolderInfo(address, creatorAddress = null) {
     rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]),
     rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
   ]);
-  const supply = asNumber(supplyRes?.value?.uiAmount);
-  const accounts = (largestRes?.value ?? []).map((a) => ({ address: a.address ?? "", amount: asNumber(a.uiAmount) ?? 0 })).filter((a) => a.address && a.amount > 0);
-  if (supply === null || supply <= 0 || accounts.length === 0) return null;
-  const owners = await fetchOwners(accounts.map((a) => a.address));
-  const excluded = /* @__PURE__ */ new Set([...SOLANA.knownPoolAuthorities, ...SOLANA.burnAddresses]);
-  const realHolders = accounts.filter((_a, i) => {
-    const owner = owners[i];
-    return owner === null || !excluded.has(owner);
-  });
-  const pct = (slice) => Math.min(100, slice.reduce((s, a) => s + a.amount, 0) / supply * 100);
+  const supply = uiAmountOf(supplyRes?.value);
+  const raw = parseLargest(largestRes);
+  if (supply === null || supply <= 0 || raw.length === 0) return null;
+  const owners = await fetchOwners(raw.map((a) => a.address));
+  const ownerPrograms = await fetchOwnerPrograms(owners);
+  const accounts = raw.map((a, i) => ({
+    address: a.address,
+    amount: a.amount,
+    owner: owners[i],
+    ownerProgram: owners[i] ? ownerPrograms.get(owners[i]) ?? null : null
+  }));
+  const conc = computeConcentration(
+    accounts,
+    supply,
+    new Set(SOLANA.burnAddresses),
+    new Set(SOLANA.knownPoolAuthorities)
+  );
+  if (!conc) return null;
+  const pctOf = (pred) => Math.min(100, accounts.reduce((s, a) => pred(a) ? s + a.amount : s, 0) / supply * 100);
   const smartSet = new Set(SMART_MONEY_WALLETS);
-  const smartMoneyPct = smartSet.size === 0 ? null : Math.min(
-    100,
-    accounts.reduce((s, a, i) => owners[i] !== null && smartSet.has(owners[i]) ? s + a.amount : s, 0) / supply * 100
-  );
-  const devHoldsPct = creatorAddress === null ? null : Math.min(
-    100,
-    accounts.reduce((s, a, i) => owners[i] === creatorAddress ? s + a.amount : s, 0) / supply * 100
-  );
+  const smartMoneyPct = smartSet.size === 0 ? null : pctOf((a) => a.owner !== null && smartSet.has(a.owner));
+  const devHoldsPct = creatorAddress === null ? null : pctOf((a) => a.owner === creatorAddress);
   return {
     holderCount: null,
     // plain RPC has no cheap holder count; GMGN fills this in when live
-    top5Pct: pct(realHolders.slice(0, 5)),
-    top10Pct: pct(realHolders.slice(0, 10)),
-    largestNonLpWalletPct: realHolders.length > 0 ? pct(realHolders.slice(0, 1)) : null,
+    top5Pct: conc.top5Pct,
+    top10Pct: conc.top10Pct,
+    largestNonLpWalletPct: conc.largestWalletPct,
     bundledLaunchPct: null,
     // needs block-0..2 funding-graph analysis; honest "unknown" for now
     smartMoneyPct,
     devHoldsPct
   };
 }
-async function fetchHolderInfoLite(address, excludeTokenAccounts) {
+function parseLargest(largestRes) {
+  const value = largestRes?.value;
+  return (value ?? []).map((a) => ({ address: a.address ?? "", amount: uiAmountOf(a) ?? 0 })).filter((a) => a.address && a.amount > 0);
+}
+async function fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete) {
+  if (curveComplete !== false) return null;
   const [supplyRes, largestRes] = await Promise.all([
     rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]),
     rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
   ]);
-  const supply = asNumber(supplyRes?.value?.uiAmount);
+  const supply = uiAmountOf(supplyRes?.value);
   const excluded = new Set(excludeTokenAccounts);
-  const accounts = (largestRes?.value ?? []).map((a) => ({ address: a.address ?? "", amount: asNumber(a.uiAmount) ?? 0 })).filter((a) => a.address && a.amount > 0 && !excluded.has(a.address));
+  const accounts = parseLargest(largestRes).filter((a) => !excluded.has(a.address));
   if (supply === null || supply <= 0 || accounts.length === 0) return null;
   const pct = (slice) => Math.min(100, slice.reduce((s, a) => s + a.amount, 0) / supply * 100);
   return {
@@ -2022,12 +2219,49 @@ async function fetchOwners(tokenAccounts) {
   const values = result?.value ?? [];
   return tokenAccounts.map((_, i) => values[i]?.data?.parsed?.info?.owner ?? null);
 }
+async function fetchOwnerPrograms(owners) {
+  const unique = [...new Set(owners.filter((o) => o !== null))];
+  const out = /* @__PURE__ */ new Map();
+  if (unique.length === 0) return out;
+  const result = await rpcCall(rpcUrlPool(), "getMultipleAccounts", [
+    unique,
+    { encoding: "base64", dataSlice: { offset: 0, length: 0 }, commitment: "confirmed" }
+  ]);
+  const values = result?.value ?? [];
+  unique.forEach((o, i) => {
+    const prog = values[i]?.owner;
+    if (typeof prog === "string") out.set(o, prog);
+  });
+  return out;
+}
 
 // background/service-worker.ts
 var RECENT_KEY = "ck:recent";
 var BASE58_RE3 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var cache = /* @__PURE__ */ new Map();
 var inFlight = /* @__PURE__ */ new Map();
+function refreshMarket(entry) {
+  const dex = peekDexscreenerToken(entry.analysis.identity.address);
+  if (!dex) return entry;
+  const prev = entry.analysis.market;
+  const market = {
+    priceEur: dex.priceUsd ?? prev?.priceEur ?? null,
+    marketCapEur: dex.marketCapUsd ?? prev?.marketCapEur ?? null,
+    liquidityEur: dex.liquidityUsd ?? prev?.liquidityEur ?? null,
+    volume24hEur: dex.volume24hUsd ?? prev?.volume24hEur ?? null,
+    lpStatus: prev?.lpStatus ?? "unknown",
+    sellSimulation: prev?.sellSimulation ?? null,
+    priceChange1h: dex.priceChange1h,
+    priceChange6h: dex.priceChange6h,
+    priceChange24h: dex.priceChange24h,
+    buys1h: dex.buys1h,
+    sells1h: dex.sells1h
+  };
+  const analysis = { ...entry.analysis, market };
+  const next = { ...entry, analysis, risk: scoreToken(analysis), quality: scoreQuality(analysis) };
+  cache.set(analysis.identity.address, next);
+  return next;
+}
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   handle(msg).then(sendResponse).catch((err) => sendResponse({ ok: false, error: String(err) }));
   return true;
@@ -2124,6 +2358,7 @@ async function doLiveFeedSweep() {
     const cached = cache.get(c.mint);
     return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
   }).sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0)).slice(0, effectiveScanBudget());
+  await primeDexscreenerTokens([...coins.map((c) => c.mint), ...feed.keys()]);
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -2143,6 +2378,7 @@ async function doLiveFeedSweep() {
   for (const c of coins) {
     let entry = cache.get(c.mint);
     if (!entry) continue;
+    entry = refreshMarket(entry);
     if (entry.lite && fullUpgradesThisPoll < 3 && !entry.risk.insufficientData && entry.risk.riskScore <= LIVE_FEED.notifyMaxScore && entry.analysis.launch?.bondingCurveComplete !== false) {
       fullUpgradesThisPoll++;
       await analyzeToken(
@@ -2180,7 +2416,7 @@ async function doLiveFeedSweep() {
       scannedAt: Date.now()
     };
     feed.set(c.mint, row);
-    maybeNotifyLowRisk(row, entry.risk);
+    maybeNotifyLowRisk(row);
   }
   const rows = [...feed.values()].sort((a, b) => (a.ageMinutes ?? 1e9) - (b.ageMinutes ?? 1e9)).slice(0, LIVE_FEED.maxRows);
   if (feed.size > LIVE_FEED.maxRows * 2) {
@@ -2189,7 +2425,7 @@ async function doLiveFeedSweep() {
   }
   return { ok: true, feed: rows, source: MOCK_MODE ? "mock" : "ok", scannedThisPoll };
 }
-function maybeNotifyLowRisk(row, risk) {
+function maybeNotifyLowRisk(row) {
   if (!LIVE_FEED.notifyLowRisk || MOCK_MODE) return;
   if (!row.gem) return;
   if (notified.has(row.address)) return;
@@ -2199,7 +2435,9 @@ function maybeNotifyLowRisk(row, risk) {
   chrome.notifications.create(`ck-${row.address}`, {
     type: "basic",
     iconUrl: "icons/icon128.png",
-    title: `\u{1F48E} ${sym} \u2014 King Grade ${row.grade ?? "?"}% (risk ${risk.riskScore}, quality ${row.qualityScore ?? "?"})`,
+    // King Grade only — one number, higher = better. (This used to append the
+    // raw risk score, which runs the OPPOSITE direction.)
+    title: `\u{1F48E} ${sym} \u2014 King Grade ${row.grade ?? "?"}% ${gradeLabel(row.grade)}`,
     message: "Graduated, LP secured, no whale wallet, creator screened. Still speculative \u2014 research it yourself. Click to open on GMGN."
   });
 }
@@ -2229,13 +2467,21 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     const pumpfun = await fetchPumpfunData(address);
     const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete),
       rugcheckAdapter.fetchAudit(address),
-      lite ? Promise.resolve(null) : fetchDexscreenerToken(address)
+      // Always fetched: served from the sweep's batch cache for lite scans, so
+      // rug/dump detection runs on EVERY coin, not just the ones you open.
+      fetchDexscreenerToken(address)
     ]);
     let deployerHist = lite ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator) : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
     deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
-    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, {
+    const sellQuote = lite || gmgn.isHoneypot !== null || gmgn.sellSlippagePct !== null ? null : await fetchSellQuote(
+      address,
+      dexMarket?.priceUsd ?? gmgn.priceEur ?? pumpfun.priceEur,
+      solana.decimals,
+      EXIT_REALITY.referencePositionUsd
+    );
+    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, sellQuote, {
       gmgn: gmgn.status,
       solana: solana.status,
       pumpfun: pumpfun.status,
@@ -2264,7 +2510,7 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     return { ok: false, error: "Analysis failed \u2014 data unavailable." };
   }
 }
-function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, dexMarket, sources) {
+function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, dexMarket, sellQuote, sources) {
   let mint = solana.mint;
   if (!mint && (gmgn.mintRenounced !== null || gmgn.freezeRenounced !== null || gmgn.taxBps !== null)) {
     mint = {
@@ -2298,7 +2544,7 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
     devHoldsPct: solana.holders?.devHoldsPct ?? null
   } : null;
   const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== "unknown" ? gmgn.lpStatus : auditLpStatus ?? gmgn.lpStatus ?? "unknown";
-  const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
+  const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : sellQuote !== null ? { ok: true, slippagePct: sellQuote.priceImpactPct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
   const hasMarket = dexMarket !== null || gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== "unknown";
   const market = hasMarket ? {
     priceEur: dexMarket?.priceUsd ?? gmgn.priceEur ?? pumpfun.priceEur,
@@ -2386,6 +2632,16 @@ async function applyCreatorMemory(creator, hist) {
   }
   return hist;
 }
+var locks = /* @__PURE__ */ new Map();
+function withLock(key, fn) {
+  const prev = locks.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  locks.set(
+    key,
+    run.catch(() => void 0)
+  );
+  return run;
+}
 var WATCHLIST_KEY = "ck:watchlist";
 async function loadWatchlist() {
   const data = await chrome.storage.local.get(WATCHLIST_KEY);
@@ -2402,7 +2658,8 @@ function snapshotOf(entry) {
     marketCapEur: entry.analysis.market?.marketCapEur ?? null,
     lpStatus: entry.analysis.market?.lpStatus ?? "unknown",
     devHoldsPct: entry.analysis.holders?.devHoldsPct ?? null,
-    largestNonLpWalletPct: entry.analysis.holders?.largestNonLpWalletPct ?? null
+    largestNonLpWalletPct: entry.analysis.holders?.largestNonLpWalletPct ?? null,
+    liveState: assessLiveState(entry.analysis.market).state
   };
 }
 async function watchToken(address, symbol) {
@@ -2425,19 +2682,30 @@ async function watchToken(address, symbol) {
     last: snap,
     alerted: []
   };
-  const next = [...list, coin];
-  await saveWatchlist(next);
+  const next = await withLock(WATCHLIST_KEY, async () => {
+    const fresh = await loadWatchlist();
+    if (fresh.some((w) => w.address === address)) return fresh;
+    if (fresh.length >= WATCHLIST.maxCoins) return null;
+    const out = [...fresh, coin];
+    await saveWatchlist(out);
+    return out;
+  });
+  if (!next) return { ok: false, error: `Watchlist is full (${WATCHLIST.maxCoins} coins) \u2014 unwatch one first.` };
   ensureWatchAlarm();
   return { ok: true, watchlist: next };
 }
 async function unwatchToken(address) {
-  const next = (await loadWatchlist()).filter((w) => w.address !== address);
-  await saveWatchlist(next);
+  const next = await withLock(WATCHLIST_KEY, async () => {
+    const out = (await loadWatchlist()).filter((w) => w.address !== address);
+    await saveWatchlist(out);
+    return out;
+  });
   return { ok: true, watchlist: next };
 }
 async function sweepWatchlist() {
   const list = await loadWatchlist();
   if (list.length === 0) return;
+  const fresh = /* @__PURE__ */ new Map();
   for (const coin of list) {
     const res = await analyzeToken(
       coin.address,
@@ -2446,22 +2714,34 @@ async function sweepWatchlist() {
     );
     if (!res.ok) continue;
     const entry = cache.get(coin.address);
-    if (!entry) continue;
-    coin.last = snapshotOf(entry);
-    for (const alert of computeWatchAlerts(coin.baseline, coin.last)) {
-      if (coin.alerted.includes(alert.kind)) continue;
-      coin.alerted.push(alert.kind);
-      const sym = coin.symbol ?? `${coin.address.slice(0, 4)}\u2026${coin.address.slice(-4)}`;
-      chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
-        type: "basic",
-        iconUrl: "icons/icon128.png",
-        title: `\u{1F6A8} ${sym} \u2014 watched coin alert`,
-        message: `${alert.message} Click to open on GMGN.`,
-        priority: 2
-      });
-    }
+    if (entry) fresh.set(coin.address, snapshotOf(entry));
   }
-  await saveWatchlist(list);
+  if (fresh.size === 0) return;
+  const toNotify = [];
+  await withLock(WATCHLIST_KEY, async () => {
+    const current2 = await loadWatchlist();
+    for (const coin of current2) {
+      const snap = fresh.get(coin.address);
+      if (!snap) continue;
+      coin.last = snap;
+      for (const alert of computeWatchAlerts(coin.baseline, snap)) {
+        if (coin.alerted.includes(alert.kind)) continue;
+        coin.alerted.push(alert.kind);
+        toNotify.push({ coin, alert });
+      }
+    }
+    await saveWatchlist(current2);
+  });
+  for (const { coin, alert } of toNotify) {
+    const sym = coin.symbol ?? `${coin.address.slice(0, 4)}\u2026${coin.address.slice(-4)}`;
+    chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title: `\u{1F6A8} ${sym} \u2014 watched coin alert`,
+      message: `${alert.message} Click to open on GMGN.`,
+      priority: 2
+    });
+  }
 }
 function ensureWatchAlarm() {
   chrome.alarms.create("ck-watch", { periodInMinutes: WATCHLIST.pollMinutes });
@@ -2488,45 +2768,77 @@ async function loadLedger() {
 }
 async function recordPrediction(analysis, grade, rugVerdict) {
   if (!OUTCOME_LEDGER.enabled || MOCK_MODE || grade === null) return;
-  const ledger = await loadLedger();
-  if (ledger.some((e) => e.address === analysis.identity.address)) return;
-  ledger.unshift({
-    address: analysis.identity.address,
-    symbol: analysis.identity.symbol,
-    gradedAt: Date.now(),
-    grade,
-    rugVerdict,
-    baselineMcap: analysis.market?.marketCapEur ?? null
+  const baselineMcap = analysis.market?.marketCapEur ?? null;
+  if (baselineMcap === null || baselineMcap <= 0) return;
+  await withLock(LEDGER_KEY, async () => {
+    const ledger = await loadLedger();
+    if (ledger.some((e) => e.address === analysis.identity.address)) return;
+    ledger.unshift({
+      address: analysis.identity.address,
+      symbol: analysis.identity.symbol,
+      gradedAt: Date.now(),
+      grade,
+      rugVerdict,
+      baselineMcap
+    });
+    await chrome.storage.local.set({ [LEDGER_KEY]: ledger.slice(0, OUTCOME_LEDGER.maxEntries) });
   });
-  await chrome.storage.local.set({ [LEDGER_KEY]: ledger.slice(0, OUTCOME_LEDGER.maxEntries) });
 }
 async function recheckLedger() {
   if (!OUTCOME_LEDGER.enabled || MOCK_MODE) return;
-  const ledger = await loadLedger();
   const dueAt = Date.now() - OUTCOME_LEDGER.recheckAfterHours * 36e5;
-  const due = ledger.filter((e) => !e.outcome && e.gradedAt <= dueAt).slice(0, 5);
+  const due = (await loadLedger()).filter((e) => !e.outcome && e.gradedAt <= dueAt).slice(0, 5);
   if (due.length === 0) return;
+  const results = /* @__PURE__ */ new Map();
   for (const entry of due) {
-    const dex = await fetchDexscreenerToken(entry.address);
-    const nowMcap = dex?.marketCapUsd ?? null;
-    const isDead = dex === null ? true : assessLiveState({
-      priceEur: dex.priceUsd,
-      marketCapEur: dex.marketCapUsd,
-      liquidityEur: dex.liquidityUsd,
-      volume24hEur: dex.volume24hUsd,
-      lpStatus: "unknown",
-      sellSimulation: null,
-      priceChange1h: dex.priceChange1h,
-      priceChange6h: dex.priceChange6h,
-      priceChange24h: dex.priceChange24h,
-      buys1h: dex.buys1h,
-      sells1h: dex.sells1h
-    }).state === "DEAD";
-    entry.checkedAt = Date.now();
-    entry.finalMcap = nowMcap;
-    entry.outcome = classifyOutcome(entry.baselineMcap, nowMcap, isDead);
+    const r = await lookupDexscreenerToken(entry.address);
+    if (r.status === "error") continue;
+    let nowMcap;
+    let isDead;
+    if (r.market) {
+      nowMcap = r.market.marketCapUsd;
+      isDead = assessLiveState(marketFromDex(r.market)).state === "DEAD";
+    } else {
+      const pump = await fetchPumpfunData(entry.address);
+      if (pump.marketCapEur !== null) {
+        nowMcap = pump.marketCapEur;
+        isDead = false;
+      } else {
+        if (entry.gradedAt > Date.now() - OUTCOME_LEDGER.recheckAfterHours * 3 * 36e5) continue;
+        isDead = true;
+        nowMcap = null;
+      }
+    }
+    results.set(entry.address, {
+      checkedAt: Date.now(),
+      finalMcap: nowMcap,
+      outcome: classifyOutcome(entry.baselineMcap, nowMcap, isDead)
+    });
   }
-  await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+  if (results.size === 0) return;
+  await withLock(LEDGER_KEY, async () => {
+    const ledger = await loadLedger();
+    for (const e of ledger) {
+      const res = results.get(e.address);
+      if (res && !e.outcome) Object.assign(e, res);
+    }
+    await chrome.storage.local.set({ [LEDGER_KEY]: ledger });
+  });
+}
+function marketFromDex(dex) {
+  return {
+    priceEur: dex.priceUsd,
+    marketCapEur: dex.marketCapUsd,
+    liquidityEur: dex.liquidityUsd,
+    volume24hEur: dex.volume24hUsd,
+    lpStatus: "unknown",
+    sellSimulation: null,
+    priceChange1h: dex.priceChange1h,
+    priceChange6h: dex.priceChange6h,
+    priceChange24h: dex.priceChange24h,
+    buys1h: dex.buys1h,
+    sells1h: dex.sells1h
+  };
 }
 async function loadRecent() {
   const data = await chrome.storage.local.get(RECENT_KEY);

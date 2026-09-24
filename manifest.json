@@ -3,7 +3,12 @@
   "name": "CRYPTO-KING — Solana Meme-Coin Risk Scanner",
   "version": "0.1.0",
   "description": "Read-only risk scanner for Solana meme coins on GMGN.AI and pump.fun. Shows risk information only — cannot detect all scams, does not guarantee profits. Not financial advice.",
-  "permissions": ["storage", "tabs", "notifications", "alarms"],
+  "permissions": [
+    "storage",
+    "tabs",
+    "notifications",
+    "alarms"
+  ],
   "host_permissions": [
     "https://gmgn.ai/*",
     "https://frontend-api-v3.pump.fun/*",
@@ -11,7 +16,8 @@
     "https://api.mainnet-beta.solana.com/*",
     "https://*.helius-rpc.com/*",
     "https://api.rugcheck.xyz/*",
-    "https://api.twitter.com/*"
+    "https://api.twitter.com/*",
+    "https://lite-api.jup.ag/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",
@@ -26,7 +32,9 @@
         "https://dextools.io/*",
         "https://www.dextools.io/*"
       ],
-      "js": ["content/content.js"],
+      "js": [
+        "content/content.js"
+      ],
       "run_at": "document_idle"
     }
   ],

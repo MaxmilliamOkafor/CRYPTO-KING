@@ -99,7 +99,7 @@ export function scoreQuality(a: TokenAnalysis, w: QWeights = QUALITY_WEIGHTS, l:
   const m = a.market;
   if (m?.liquidityEur !== null && m?.liquidityEur !== undefined && m.marketCapEur !== null) {
     if (m.liquidityEur >= l.minLiquidityEur && m.liquidityEur / m.marketCapEur >= l.minLiqMcapRatio) {
-      hit(w.liquidityDepth, `Real liquidity depth (€${Math.round(m.liquidityEur / 1000)}k, ${((m.liquidityEur / m.marketCapEur) * 100).toFixed(0)}% of cap).`);
+      hit(w.liquidityDepth, `Real liquidity depth ($${Math.round(m.liquidityEur / 1000)}k, ${((m.liquidityEur / m.marketCapEur) * 100).toFixed(0)}% of cap).`);
     }
     if (m.volume24hEur !== null && m.marketCapEur > 0) {
       const ratio = m.volume24hEur / m.marketCapEur;
@@ -119,7 +119,7 @@ export function scoreQuality(a: TokenAnalysis, w: QWeights = QUALITY_WEIGHTS, l:
     const progress = Math.min(1, a.market.marketCapEur / GRAD_CAP_EUR);
     const pts = Math.round(w.curveTraction * progress);
     if (pts > 0) {
-      hit(pts, `Curve traction: €${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
+      hit(pts, `Curve traction: $${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
     }
   }
   if (a.launch?.replyCount !== null && a.launch?.replyCount !== undefined && a.launch.replyCount >= l.minReplies) {

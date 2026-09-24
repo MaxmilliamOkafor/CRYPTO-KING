@@ -126,11 +126,11 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
       if (market.liquidityEur < l.thinLiquidityEur && market.marketCapEur > l.thinLiqMcapEur) {
         hit(
           w.thinLiquidityVsMcap,
-          `Thin liquidity (€${fmtK(market.liquidityEur)}) vs. cap (€${fmtK(market.marketCapEur)}) — easy to manipulate.`,
+          `Thin liquidity ($${fmtK(market.liquidityEur)}) vs. cap ($${fmtK(market.marketCapEur)}) — easy to manipulate.`,
         );
       }
       if (market.marketCapEur < l.microMcapEur && lpSecured === false) {
-        hit(w.microMcapUnlockedLp, `Micro cap (€${fmtK(market.marketCapEur)}) with unsecured LP — high rug exposure.`);
+        hit(w.microMcapUnlockedLp, `Micro cap ($${fmtK(market.marketCapEur)}) with unsecured LP — high rug exposure.`);
       }
     } else {
       gap('Liquidity/market-cap figures incomplete.');

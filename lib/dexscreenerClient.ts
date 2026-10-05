@@ -59,6 +59,10 @@ export interface DexTokenMarket {
   symbol: string | null;
   name: string | null;
   pairCreatedMs: number | null;
+  /** The deepest pool's address — keys GeckoTerminal's price history. */
+  pairAddress: string | null;
+  /** Venue of the deepest pool ("pumpswap", "raydium", "meteora", …). */
+  dexId: string | null;
 }
 
 /** Map one DexScreener pair object → our market shape. */
@@ -77,6 +81,8 @@ function toMarket(best: unknown): DexTokenMarket {
     symbol: asString(pick(best, ['baseToken.symbol'])),
     name: asString(pick(best, ['baseToken.name'])),
     pairCreatedMs: asNumber(pick(best, ['pairCreatedAt'])),
+    pairAddress: asString(pick(best, ['pairAddress'])),
+    dexId: asString(pick(best, ['dexId'])),
   };
 }
 

@@ -153,6 +153,74 @@ export const LIVE_FEED = {
 };
 
 /**
+ * GeckoTerminal public API — keyless (~30 calls/min). Provides what every other
+ * source lacks: DAILY PRICE HISTORY (did the coin survive its crashes?), holder
+ * counts, unique buyers/sellers, and lists of established Solana pools for the
+ * long-hold radar. See lib/geckoClient.ts.
+ */
+export const GECKO = {
+  enabled: true,
+  baseUrl: 'https://api.geckoterminal.com/api/v2',
+  /** Daily candles to request per coin (max useful window for the pillars). */
+  historyDays: 90,
+  /** Discovery lists for the long-hold radar (trending + most-traded Solana pools). */
+  discoveryPaths: [
+    '/networks/solana/trending_pools?page=1',
+    '/networks/solana/pools?page=1&sort=h24_tx_count_desc',
+  ],
+};
+
+/* ────────────── 🏔 Long-hold radar ("staying power") ─────────────────────
+ * Research-based screen for coins that might be HELD for weeks/months, the way
+ * early PEPE/BONK/WIF holders did — as opposed to the live feed's minutes-old
+ * launches. Grounded in what the data says (sources in README):
+ *   - 68.7% of pump.fun coins die on launch day, 80% within 48h, 4.55% last
+ *     90+ days → age past the rug window is the strongest single filter.
+ *   - Telegram presence: 8.9× graduation rate; all three socials: 17.4×.
+ *   - 82.6% of 100%+ gainers showed ARTIFICIAL growth (wash trading, LP price
+ *     inflation) → fast pumps are suspect; real unique buyers matter.
+ *   - Whale dominance + persistent extreme volatility = measurable fragility.
+ *   - Survivors (BONK: −96% then recovered) are defined by recovery and higher
+ *     lows, not by never crashing.
+ * Score = "Staying Power" 0–100%, higher = better. NEVER a profit prediction.
+ */
+export const LONG_HOLD = {
+  enabled: true,
+  /** Younger than this = inside the rug/abandon window — can't judge durability. */
+  minAgeDays: 3,
+  /** Above this market cap the coin is already "discovered" — tier LATE. */
+  lateMcapUsd: 250_000_000,
+  /** "Still early" strength shown below this cap. */
+  earlyMcapUsd: 10_000_000,
+  /** Score thresholds for tiers. */
+  candidateScore: 70,
+  watchScore: 50,
+  /** Hard disqualifiers (any one → NOT A HOLD). */
+  maxLargestWalletPct: 5,
+  maxDevPct: 5,
+  maxTop10Pct: 40,
+  /** Daily volume ÷ liquidity above this is almost certainly wash trading. */
+  washVolLiqRatio: 10,
+  /** …above this it's suspicious (scored, not disqualified). */
+  suspiciousVolLiqRatio: 5,
+  /** Close below this share of the all-time high WITH lower lows = death spiral. */
+  deathSpiralAthShare: 0.1,
+  /** Radar sweep: how often, and how many new candidates to deep-check per sweep. */
+  radarEveryMinutes: 30,
+  radarDeepChecksPerSweep: 4,
+  /** Radar candidate filters (applied before any deep check). */
+  radarMinLiquidityUsd: 40_000,
+  radarMinMcapUsd: 150_000,
+  radarMaxAgeDays: 365,
+  /** Keep this many assessed coins in the radar list. */
+  radarMaxRows: 40,
+  /** Re-assess a radar coin after this long. */
+  reassessHours: 6,
+  /** Outcome checks for the long-hold report card. */
+  ledgerCheckDays: [7, 30],
+} as const;
+
+/**
  * Jupiter quote API — keyless, read-only. Used ONLY to request a sell QUOTE
  * (never a swap: no wallet, no signing) so the "can I actually exit?" check
  * works on every site, not just gmgn.ai. See lib/jupiterClient.ts.
@@ -252,10 +320,11 @@ export const TRENDING_NARRATIVES: Record<string, string[]> = {
 };
 
 export const RUGCHECK = {
-  /** Optional pluggable adapter — OFF by default; the API spec may drift. */
-  enabled: false,
-  /** Public report endpoint as of 2025; verify against rugcheck.xyz docs before enabling. */
-  endpoint: 'https://api.rugcheck.xyz/v1/tokens/{address}/report',
+  /** ON: the keyless summary is the only source of LP lock status off gmgn.ai
+   *  (see lib/lpStatus.ts). Full scans only — never the lite feed sweep. */
+  enabled: true,
+  /** Public, keyless summary endpoint (lighter than the full report). */
+  endpoint: 'https://api.rugcheck.xyz/v1/tokens/{address}/report/summary',
 };
 
 /* ─────────────────────────── Networking behavior ─────────────────────────── */
@@ -271,6 +340,8 @@ export const RATE_LIMITS_MS: Record<string, number> = {
    *  250ms stays under it. It drives the rug/dump checks, so it must not crawl
    *  at the 1.1s default. */
   'api.dexscreener.com': 250,
+  /** GeckoTerminal's public limit is 30 calls/min → 2s; 2.1s keeps a margin. */
+  'api.geckoterminal.com': 2100,
 };
 /** Per-request timeout. */
 export const FETCH_TIMEOUT_MS = 10_000;

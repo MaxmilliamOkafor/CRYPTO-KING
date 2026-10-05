@@ -20,12 +20,24 @@ import {
   EUR_PER_USD,
   EXIT_REALITY,
   LIVE_FEED,
+  LONG_HOLD,
   MOCK_MODE,
   OUTCOME_LEDGER,
   RECENT_MAX,
   WATCHLIST,
 } from '../config.ts';
-import { classifyOutcome, computeAccuracy, type LedgerEntry } from '../lib/outcomeLedger.ts';
+import { classifyOutcome, computeAccuracy, computeLongHoldAccuracy, type LedgerEntry, type Outcome } from '../lib/outcomeLedger.ts';
+import {
+  fetchDailyCandles,
+  fetchPool,
+  fetchRadarPools,
+  fetchTokenInfo,
+  type Candle,
+  type GeckoTokenInfo,
+  type RadarPool,
+} from '../lib/geckoClient.ts';
+import { assessLongHold } from '../lib/longHold.ts';
+import { resolveLpStatus } from '../lib/lpStatus.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import {
   fetchDexscreenerNewSolana,
@@ -66,9 +78,16 @@ import type {
   BgRequest,
   FeedRow,
   LiveFeedResponse,
+  LongHoldAccuracyResponse,
+  LongHoldLedgerEntry,
+  LongHoldResponse,
+  LongHoldResult,
+  LongHoldTier,
   MarketInfo,
   MintInfo,
   QualityResult,
+  RadarResponse,
+  RadarRow,
   RecentResponse,
   RecentToken,
   ResolvePairsResponse,
@@ -143,6 +162,9 @@ async function handle(
   | SettingsResponse
   | XBuzzResponse
   | AccuracyResponse
+  | RadarResponse
+  | LongHoldResponse
+  | LongHoldAccuracyResponse
 > {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
@@ -186,6 +208,19 @@ async function handle(
     }
     case 'GET_ACCURACY':
       return { ok: true, accuracy: computeAccuracy(await loadLedger()) };
+    case 'GET_RADAR':
+      return getRadar(false);
+    case 'RUN_RADAR':
+      return getRadar(true);
+    case 'GET_LONGHOLD': {
+      if (!BASE58_RE.test(msg.address)) return { ok: false, error: 'Not a valid Solana address.' };
+      const res = await assessLongHoldFor(msg.address);
+      return res ? { ok: true, result: res.result, symbol: res.symbol } : { ok: false, error: 'Long-hold check unavailable.' };
+    }
+    case 'GET_LH_ACCURACY': {
+      const entries = await loadLhLedger();
+      return { ok: true, rows: computeLongHoldAccuracy(entries, LONG_HOLD.ledgerCheckDays), tracked: entries.length };
+    }
     default:
       return { ok: false, error: `Unknown message type: ${(msg as { type?: string }).type}` };
   }
@@ -371,7 +406,8 @@ function maybeNotifyLowRisk(row: FeedRow): void {
 }
 
 chrome.notifications?.onClicked.addListener((id) => {
-  if (!id.startsWith('ck-') || id.startsWith('ck-watch-')) return; // watch alerts have their own handler
+  // Watch alerts and long-hold alerts have their own handlers.
+  if (!id.startsWith('ck-') || id.startsWith('ck-watch-') || id.startsWith('ck-lh-')) return;
   const address = id.slice(3);
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
@@ -419,7 +455,9 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
     const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
       fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete),
-      rugcheckAdapter.fetchAudit(address),
+      // RugCheck = LP lock status off gmgn.ai. Full scans only: one more
+      // rate-limited call per coin would stall the lite feed sweep.
+      lite ? Promise.resolve({ status: 'disabled' as const, lpStatus: null, externalFlags: [] }) : rugcheckAdapter.fetchAudit(address),
       // Always fetched: served from the sweep's batch cache for lite scans, so
       // rug/dump detection runs on EVERY coin, not just the ones you open.
       fetchDexscreenerToken(address),
@@ -537,7 +575,13 @@ function mergeSources(
       : null;
 
   /* market: GMGN primary; pump.fun fills mcap; RugCheck may settle LP status. */
-  const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== 'unknown' ? gmgn.lpStatus : (auditLpStatus ?? gmgn.lpStatus ?? 'unknown');
+  // GMGN → pump.fun protocol burn (graduated + migration venue) → RugCheck.
+  const lpStatus = resolveLpStatus({
+    gmgn: gmgn.lpStatus,
+    pumpGraduated: pumpfun.status === 'ok' ? pumpfun.bondingCurveComplete : null,
+    deepestDexId: dexMarket?.dexId ?? null,
+    audit: auditLpStatus,
+  });
   // Sell simulation precedence: GMGN's honeypot verdict (it simulates the
   // actual sell tx) → GMGN slippage → a real Jupiter route with its price
   // impact → GMGN "not a honeypot" alone → unknown. Jupiter only ever adds
@@ -826,12 +870,18 @@ async function sweepWatchlist(): Promise<void> {
 
 function ensureWatchAlarm(): void {
   chrome.alarms.create('ck-watch', { periodInMinutes: WATCHLIST.pollMinutes });
+  if (LONG_HOLD.enabled && !MOCK_MODE) {
+    chrome.alarms.create('ck-radar', { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
+  }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'ck-watch') {
     void sweepWatchlist();
     void recheckLedger(); // score past predictions on the same tick
+    void recheckLhLedger();
+  } else if (alarm.name === 'ck-radar') {
+    void runRadarSweep();
   }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
@@ -949,6 +999,329 @@ function marketFromDex(dex: DexTokenMarket): MarketInfo {
     buys1h: dex.buys1h,
     sells1h: dex.sells1h,
   };
+}
+
+/* ── 🏔 Long-hold radar ───────────────────────────────────────────────────
+ * Finds coins that are days-to-months old (past the window where ~95% of
+ * launches die) and scores their STAYING POWER (lib/longHold.ts). Sources:
+ * GeckoTerminal trending + most-traded Solana pools, plus any coin the user
+ * opens. Each assessment = full scan + daily price history + unique buyers +
+ * holder count. GeckoTerminal allows ~30 calls/min, so sweeps are small and
+ * spread out (LONG_HOLD.radarDeepChecksPerSweep every radarEveryMinutes).
+ */
+
+const RADAR_KEY = 'ck:radar';
+const LH_HIST_KEY = 'ck:lh-hist';
+const LH_LEDGER_KEY = 'ck:lh-ledger';
+
+interface RadarStore {
+  rows: RadarRow[];
+  sweptAt: number | null;
+  checked: number;
+  /** Mints already announced as CANDIDATE (never notify twice). */
+  notified: string[];
+}
+
+const lhCache = new Map<string, { result: LongHoldResult; symbol: string | null; at: number }>();
+const LH_CACHE_MS = 30 * 60_000;
+const candleCache = new Map<string, { k: Candle[] | null; at: number }>();
+let radarSweep: Promise<void> | null = null;
+
+async function loadRadar(): Promise<RadarStore> {
+  const d = await chrome.storage.local.get(RADAR_KEY);
+  const v = d[RADAR_KEY] as Partial<RadarStore> | undefined;
+  return { rows: v?.rows ?? [], sweptAt: v?.sweptAt ?? null, checked: v?.checked ?? 0, notified: v?.notified ?? [] };
+}
+
+async function getRadar(force: boolean): Promise<RadarResponse> {
+  if (!LONG_HOLD.enabled) return { ok: false, error: 'Long-hold radar disabled in config.' };
+  if (MOCK_MODE) return { ok: false, error: 'Long-hold radar needs live mode (MOCK_MODE=false).' };
+  const store = await loadRadar();
+  const stale = !store.sweptAt || Date.now() - store.sweptAt > LONG_HOLD.radarEveryMinutes * 60_000;
+  if ((force || stale) && !radarSweep) void runRadarSweep(); // don't block the UI on a slow sweep
+  return { ok: true, rows: store.rows, sweptAt: store.sweptAt, sweeping: radarSweep !== null, checked: store.checked };
+}
+
+function runRadarSweep(): Promise<void> {
+  if (radarSweep) return radarSweep;
+  radarSweep = doRadarSweep()
+    .catch((err: unknown) => console.warn('[CRYPTO-KING] radar sweep failed:', err))
+    .finally(() => {
+      radarSweep = null;
+    });
+  return radarSweep;
+}
+
+async function doRadarSweep(): Promise<void> {
+  if (!LONG_HOLD.enabled || MOCK_MODE) return;
+  const pools = await fetchRadarPools();
+  const store = await loadRadar();
+  const recent = new Map(store.rows.map((r) => [r.address, r.checkedAt]));
+  const now = Date.now();
+
+  // Cheap pre-filter on the discovery data, BEFORE any expensive deep check.
+  const candidates = pools
+    .filter((p) => {
+      const ageDays = p.createdMs ? (now - p.createdMs) / 86_400_000 : null;
+      if (ageDays === null || ageDays < LONG_HOLD.minAgeDays || ageDays > LONG_HOLD.radarMaxAgeDays) return false;
+      if ((p.liquidityUsd ?? 0) < LONG_HOLD.radarMinLiquidityUsd) return false;
+      const mc = p.marketCapUsd ?? 0;
+      if (mc < LONG_HOLD.radarMinMcapUsd || mc > LONG_HOLD.lateMcapUsd) return false;
+      // Wash-trading pre-screen — don't spend a deep check on obvious fakes.
+      if (p.volume24hUsd !== null && p.liquidityUsd && p.volume24hUsd / p.liquidityUsd > LONG_HOLD.washVolLiqRatio) return false;
+      const last = recent.get(p.mint);
+      return !last || now - last > LONG_HOLD.reassessHours * 3_600_000;
+    })
+    // Most unique buyers first: real participation is the scarcest signal.
+    .sort((a, b) => (b.buyers24h ?? 0) - (a.buyers24h ?? 0))
+    .slice(0, LONG_HOLD.radarDeepChecksPerSweep);
+
+  const fresh: RadarRow[] = [];
+  for (const p of candidates) {
+    const res = await assessLongHoldFor(p.mint, p);
+    if (!res) continue;
+    fresh.push(radarRowOf(p.mint, res.symbol ?? p.name, res.result, res.mcap, res.liq));
+  }
+
+  const toNotify: RadarRow[] = [];
+  await withLock(RADAR_KEY, async () => {
+    const cur = await loadRadar();
+    const byMint = new Map(cur.rows.map((r) => [r.address, r]));
+    for (const r of fresh) byMint.set(r.address, r);
+    // Drop rows nobody re-checked in 2 days — stale verdicts are misleading.
+    const rows = [...byMint.values()]
+      .filter((r) => now - r.checkedAt < 48 * 3_600_000)
+      .sort((a, b) => tierRank(a.tier) - tierRank(b.tier) || (b.score ?? -1) - (a.score ?? -1))
+      .slice(0, LONG_HOLD.radarMaxRows);
+    const notified = new Set(cur.notified);
+    for (const r of fresh) {
+      if (r.tier === 'CANDIDATE' && !notified.has(r.address)) {
+        notified.add(r.address);
+        toNotify.push(r);
+      }
+    }
+    await chrome.storage.local.set({
+      [RADAR_KEY]: {
+        rows,
+        sweptAt: now,
+        checked: cur.checked + fresh.length,
+        notified: [...notified].slice(-500),
+      } satisfies RadarStore,
+    });
+  });
+
+  for (const r of toNotify) {
+    const sym = r.symbol ?? `${r.address.slice(0, 4)}…${r.address.slice(-4)}`;
+    chrome.notifications.create(`ck-lh-${r.address}`, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: `🏔 Long-hold candidate: ${sym} — Staying Power ${r.score ?? '?'}%`,
+      message: `${r.headline ?? 'Passed the long-hold screen.'} Has the traits survivors had — not a buy signal; size it to lose. Click to open.`,
+    });
+  }
+}
+
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith('ck-lh-')) return;
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${id.slice('ck-lh-'.length)}` });
+  chrome.notifications.clear(id);
+});
+
+const TIER_ORDER: LongHoldTier[] = ['CANDIDATE', 'WATCH', 'LATE', 'TOO_EARLY', 'WEAK', 'NOT_A_HOLD', 'NO_DATA'];
+const tierRank = (t: LongHoldTier) => TIER_ORDER.indexOf(t);
+
+function radarRowOf(
+  address: string,
+  symbol: string | null,
+  r: LongHoldResult,
+  mcap: number | null,
+  liq: number | null,
+): RadarRow {
+  return {
+    address,
+    symbol,
+    name: null,
+    tier: r.tier,
+    score: r.score,
+    ageDays: r.ageDays,
+    marketCapUsd: mcap,
+    liquidityUsd: liq,
+    headline: r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? null,
+    checkedAt: Date.now(),
+  };
+}
+
+/**
+ * Full staying-power assessment for one coin. `hint` = discovery data from the
+ * radar (saves calls); without it, the pool is found via DexScreener.
+ */
+type LhOut = { result: LongHoldResult; symbol: string | null; mcap: number | null; liq: number | null } | null;
+const lhInFlight = new Map<string, Promise<LhOut>>();
+
+/** De-duplicated: overlapping requests for one coin (card re-render, radar,
+ *  popup) share a single assessment — GeckoTerminal allows only ~30 calls/min. */
+function assessLongHoldFor(address: string, hint?: RadarPool): Promise<LhOut> {
+  const pending = lhInFlight.get(address);
+  if (pending) return pending;
+  const job = doAssessLongHold(address, hint).finally(() => lhInFlight.delete(address));
+  lhInFlight.set(address, job);
+  return job;
+}
+
+const infoCache = new Map<string, { v: GeckoTokenInfo | null; at: number }>();
+async function cachedTokenInfo(mint: string): Promise<GeckoTokenInfo | null> {
+  const hit = infoCache.get(mint);
+  if (hit && Date.now() - hit.at < LH_CACHE_MS) return hit.v;
+  const v = await fetchTokenInfo(mint);
+  if (v !== null) {
+    if (infoCache.size > 300) infoCache.clear();
+    infoCache.set(mint, { v, at: Date.now() });
+  }
+  return v;
+}
+
+async function doAssessLongHold(address: string, hint?: RadarPool): Promise<LhOut> {
+  const hit = lhCache.get(address);
+  if (hit && Date.now() - hit.at < LH_CACHE_MS && !hint) {
+    return { result: hit.result, symbol: hit.symbol, mcap: null, liq: null };
+  }
+
+  const res = await analyzeToken(address, false); // full scan (cached for 5 min)
+  if (!res.ok) return null;
+  const { analysis, risk } = res;
+
+  const dex = await fetchDexscreenerToken(address);
+  const pool = hint?.pool ?? dex?.pairAddress ?? null;
+  const [candles, poolStats, info] = await Promise.all([
+    pool ? cachedCandles(pool) : Promise.resolve(null),
+    hint ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
+    cachedTokenInfo(address),
+  ]);
+
+  const holderCount = analysis.holders?.holderCount ?? info?.holderCount ?? null;
+  const holderHistory = await recordHolderSnapshot(address, holderCount);
+
+  // Age: the OLDEST credible evidence of trading wins.
+  const ages = [
+    analysis.identity.ageMinutes !== null ? analysis.identity.ageMinutes / 1440 : null,
+    dex?.pairCreatedMs ? (Date.now() - dex.pairCreatedMs) / 86_400_000 : null,
+    hint?.createdMs ? (Date.now() - hint.createdMs) / 86_400_000 : null,
+    candles && candles.length ? (Date.now() / 1000 - candles[0].t) / 86_400 : null,
+  ].filter((v): v is number => v !== null && Number.isFinite(v) && v >= 0);
+
+  const so = analysis.socials;
+  const result = assessLongHold(analysis, risk, {
+    ageDays: ages.length ? Math.max(...ages) : null,
+    candles,
+    buyers24h: poolStats?.buyers24h ?? null,
+    sellers24h: poolStats?.sellers24h ?? null,
+    holderCount,
+    holderHistory,
+    socials: {
+      twitter: Boolean(so?.twitter || info?.twitter),
+      telegram: Boolean(so?.telegram || info?.telegram),
+      website: Boolean(so?.website || info?.website),
+    },
+  });
+
+  const symbol = analysis.identity.symbol;
+  lhCache.set(address, { result, symbol, at: Date.now() });
+  if (lhCache.size > 300) lhCache.clear();
+  const mcap = analysis.market?.marketCapEur ?? null;
+  await recordLhPrediction(address, symbol, result, mcap);
+  return { result, symbol, mcap, liq: analysis.market?.liquidityEur ?? null };
+}
+
+async function cachedCandles(pool: string): Promise<Candle[] | null> {
+  const hit = candleCache.get(pool);
+  if (hit && Date.now() - hit.at < LONG_HOLD.reassessHours * 3_600_000) return hit.k;
+  const k = await fetchDailyCandles(pool);
+  if (k !== null) {
+    if (candleCache.size > 300) candleCache.clear();
+    candleCache.set(pool, { k, at: Date.now() });
+  }
+  return k;
+}
+
+/**
+ * Holder GROWTH can't be read from any single API call — so we build our own
+ * history: one snapshot per coin per ~6h, last 30 kept. Returns the history.
+ */
+async function recordHolderSnapshot(
+  mint: string,
+  holderCount: number | null,
+): Promise<Array<{ at: number; holderCount: number }>> {
+  return withLock(LH_HIST_KEY, async () => {
+    const d = await chrome.storage.local.get(LH_HIST_KEY);
+    const all = (d[LH_HIST_KEY] ?? {}) as Record<string, Array<{ at: number; holderCount: number }>>;
+    const h = all[mint] ?? [];
+    const last = h[h.length - 1];
+    if (holderCount !== null && holderCount > 0 && (!last || Date.now() - last.at > 6 * 3_600_000)) {
+      h.push({ at: Date.now(), holderCount });
+      all[mint] = h.slice(-30);
+      // Bound total storage: keep the 400 most recently updated coins.
+      const keys = Object.keys(all);
+      if (keys.length > 400) {
+        keys
+          .sort((a, b) => (all[a].at(-1)?.at ?? 0) - (all[b].at(-1)?.at ?? 0))
+          .slice(0, keys.length - 400)
+          .forEach((k) => delete all[k]);
+      }
+      await chrome.storage.local.set({ [LH_HIST_KEY]: all });
+    }
+    return all[mint] ?? h;
+  });
+}
+
+/* Long-hold report card: record verdicts, check them at 7d and 30d. */
+
+async function loadLhLedger(): Promise<LongHoldLedgerEntry[]> {
+  const d = await chrome.storage.local.get(LH_LEDGER_KEY);
+  return Array.isArray(d[LH_LEDGER_KEY]) ? (d[LH_LEDGER_KEY] as LongHoldLedgerEntry[]) : [];
+}
+
+async function recordLhPrediction(address: string, symbol: string | null, r: LongHoldResult, mcap: number | null): Promise<void> {
+  // Only tiers that make a claim are worth scoring; TOO_EARLY/LATE/NO_DATA aren't predictions.
+  if (!['CANDIDATE', 'WATCH', 'WEAK', 'NOT_A_HOLD'].includes(r.tier) || mcap === null || mcap <= 0) return;
+  await withLock(LH_LEDGER_KEY, async () => {
+    const ledger = await loadLhLedger();
+    if (ledger.some((e) => e.address === address)) return; // first verdict only
+    ledger.unshift({ address, symbol, at: Date.now(), tier: r.tier, score: r.score, baselineMcap: mcap, outcomes: {} });
+    await chrome.storage.local.set({ [LH_LEDGER_KEY]: ledger.slice(0, 600) });
+  });
+}
+
+async function recheckLhLedger(): Promise<void> {
+  if (!LONG_HOLD.enabled || MOCK_MODE) return;
+  const ledger = await loadLhLedger();
+  const due: Array<{ e: LongHoldLedgerEntry; day: number }> = [];
+  for (const e of ledger) {
+    for (const day of LONG_HOLD.ledgerCheckDays) {
+      if (!e.outcomes[String(day)] && Date.now() - e.at >= day * 86_400_000) due.push({ e, day });
+    }
+  }
+  if (due.length === 0) return;
+
+  const results: Array<{ address: string; day: number; outcome: Outcome; mcap: number | null }> = [];
+  for (const { e, day } of due.slice(0, 5)) {
+    const r = await lookupDexscreenerToken(e.address);
+    if (r.status === 'error') continue; // a failed request is not evidence
+    const isDead = r.market === null || assessLiveState(marketFromDex(r.market)).state === 'DEAD';
+    const mcap = r.market?.marketCapUsd ?? null;
+    results.push({ address: e.address, day, outcome: classifyOutcome(e.baselineMcap, mcap, isDead), mcap });
+  }
+  if (results.length === 0) return;
+
+  await withLock(LH_LEDGER_KEY, async () => {
+    const cur = await loadLhLedger();
+    for (const r of results) {
+      const e = cur.find((x) => x.address === r.address);
+      if (e && !e.outcomes[String(r.day)]) {
+        e.outcomes[String(r.day)] = { outcome: r.outcome, mcap: r.mcap, checkedAt: Date.now() };
+      }
+    }
+    await chrome.storage.local.set({ [LH_LEDGER_KEY]: cur });
+  });
 }
 
 /* ── Recent-tokens persistence (dashboard) ────────────────────────────── */

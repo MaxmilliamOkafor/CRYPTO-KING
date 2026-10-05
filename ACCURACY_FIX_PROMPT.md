@@ -128,3 +128,15 @@ framing ("not a buy signal", "unknown ≠ safe") intact.
 - **Pool detection** (`lib/holderMath.ts`): on a graduated pump.fun coin, the card's
   "largest wallet" should now be a real wallet, NOT the PumpSwap pool. Compare the
   top holders against solscan.io's holder tab (pool accounts are labelled there).
+
+## Added with the long-hold radar — verify these live
+
+- **GeckoTerminal** (`lib/geckoClient.ts`): `ohlcv_list` rows are `[unix_s, o, h, l, c, volume_usd]`
+  newest-first (parser sorts them). Compare a coin's 🏔 "price history" days and crash/recovery
+  claims with its daily chart on geckoterminal.com. `holders.count` should match the site's
+  holder count. Pools list: `relationships.base_token.data.id` = `solana_<mint>`,
+  `attributes.transactions.h24.buyers` = unique buyers.
+- **RugCheck summary** (`/v1/tokens/<mint>/report/summary`): confirm `lpLockedPct` is present
+  and matches rugcheck.xyz's "LP locked" figure.
+- **pump.fun LP burn rule** (`lib/lpStatus.ts`): for a graduated pump.fun coin whose deepest
+  DexScreener pool has `dexId` `pumpswap`, solscan should show the pool's LP tokens burned.

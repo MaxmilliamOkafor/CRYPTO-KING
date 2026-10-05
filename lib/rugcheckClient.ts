@@ -10,6 +10,7 @@
 
 import { MOCK_MODE, RUGCHECK } from '../config.ts';
 import { asNumber, fetchJson, pick } from './http.ts';
+import { lpStatusFromLockedPct } from './lpStatus.ts';
 import type { LpStatus, SourceStatus } from './types.ts';
 
 export interface AuditData {
@@ -42,9 +43,7 @@ export const rugcheckAdapter: AuditAdapter = {
       }
     }
 
-    let lpStatus: LpStatus | null = null;
-    const lockedPct = asNumber(pick(json, ['markets.0.lp.lpLockedPct', 'lpLockedPct']));
-    if (lockedPct !== null) lpStatus = lockedPct >= 90 ? 'locked' : 'unlocked';
+    const lpStatus = lpStatusFromLockedPct(asNumber(pick(json, ['lpLockedPct', 'markets.0.lp.lpLockedPct'])));
 
     return { status: 'ok', lpStatus, externalFlags };
   },

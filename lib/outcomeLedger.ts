@@ -16,6 +16,7 @@
  */
 
 import { OUTCOME_LEDGER } from '../config.ts';
+import type { LongHoldAccuracyRow, LongHoldLedgerEntry } from './types.ts';
 
 export type Outcome = 'RUGGED' | 'FADED' | 'SURVIVED' | 'WINNER' | 'PENDING';
 
@@ -106,4 +107,46 @@ export function computeAccuracy(entries: LedgerEntry[]): Accuracy {
     b.survivalPct = b.total > 0 ? Math.round(((b.total - b.rugged) / b.total) * 100) : 0;
   }
   return { bands, totalChecked, pending };
+}
+
+/* ── 🏔 Long-hold report card ──────────────────────────────────────────────
+ * Same idea, longer horizon: every radar verdict is a prediction about staying
+ * power. Checked at LONG_HOLD.ledgerCheckDays (7 and 30). If CANDIDATE coins
+ * don't survive more often than WEAK ones, the radar isn't working — and this
+ * table is where that shows up first.
+ */
+
+/** Per tier × check-day survival, winners and median market-cap multiple. Pure. */
+export function computeLongHoldAccuracy(
+  entries: LongHoldLedgerEntry[],
+  days: readonly number[],
+): LongHoldAccuracyRow[] {
+  const tiers = ['CANDIDATE', 'WATCH', 'WEAK', 'NOT_A_HOLD'] as const;
+  const rows: LongHoldAccuracyRow[] = [];
+  for (const tier of tiers) {
+    for (const day of days) {
+      const done = entries
+        .filter((e) => e.tier === tier)
+        .map((e) => ({ e, o: e.outcomes[String(day)] }))
+        .filter((x) => x.o && x.o.outcome !== 'PENDING');
+      const multiples = done
+        .map((x) => (x.o.mcap !== null && x.e.baselineMcap > 0 ? x.o.mcap / x.e.baselineMcap : x.o.outcome === 'RUGGED' ? 0 : null))
+        .filter((m): m is number => m !== null)
+        .sort((a, b) => a - b);
+      rows.push({
+        tier,
+        day,
+        checked: done.length,
+        survived: done.filter((x) => x.o.outcome === 'SURVIVED' || x.o.outcome === 'WINNER').length,
+        winners: done.filter((x) => x.o.outcome === 'WINNER').length,
+        medianMultiple: multiples.length ? median(multiples) : null,
+      });
+    }
+  }
+  return rows;
+}
+
+function median(sorted: number[]): number {
+  const m = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
 }

@@ -17,7 +17,8 @@
     "https://*.helius-rpc.com/*",
     "https://api.rugcheck.xyz/*",
     "https://api.twitter.com/*",
-    "https://lite-api.jup.ag/*"
+    "https://lite-api.jup.ag/*",
+    "https://api.geckoterminal.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

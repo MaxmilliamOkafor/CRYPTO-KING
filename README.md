@@ -30,6 +30,17 @@ The repo ships with a pre-built **`dist/`** folder running in **live mode** — 
    - **💀 Already-rugged detection on every coin, every sweep:** the live feed batch-loads DexScreener market data (30 coins per request) so liquidity, price change and buy/sell flow are checked for *every* feed coin — and re-checked each sweep, so a coin that rugs after it was first scanned drops to DEAD/DUMPING instead of keeping its old grade.
    - **↩ Live sell check (keyless):** full scans ask Jupiter for a sell *quote* (read-only — never a swap) of your reference position, so "is there an exit, and what does selling cost right now?" is answered on every site, not only gmgn.ai. "No route" is reported as *unknown*, never as a honeypot.
    - **🏊 Pools aren't whales:** holder concentration counts only real wallets. Pool vaults, bonding curves and escrows are recognised by the *program* that owns them, so PumpSwap/Meteora/Orca liquidity no longer shows up as "a single wallet holds 70%".
+   - **🏔 Long-hold radar — "Staying Power" (research-based):** a second screen for coins you might HOLD for weeks/months, the way early PEPE/BONK/WIF holders did — not minutes-old launches. In the panel: a radar list (swept in the background every 30 min) and, on every coin's card, a 🏔 verdict with a 6-pillar breakdown. Scored 0–100% (higher = better) from what the research shows separates survivors from the ~95% that die:
+     - **Survival (20):** 68.7% of pump.fun coins die on launch day, 80% within 48h, only 4.55% reach 90 days ([CoinGecko, 18.6M tokens](https://www.coingecko.com/research/publications/average-lifespan-of-pumpfun-tokens)). Under 3 days old → ⏳ TOO EARLY.
+     - **Community (15):** Telegram = 8.9× graduation rate; X + Telegram + website = 17.4× ([survival analysis of 832,941 launches](https://arxiv.org/abs/2607.02823)). Plus holder count and holder GROWTH (tracked by the extension itself over time).
+     - **Fair distribution (20):** whale dominance is a core measured fragility dimension ([ME2F](https://arxiv.org/html/2512.00377v1)). Pools are excluded structurally.
+     - **Liquidity (15):** burned LP, depth vs market cap.
+     - **Organic demand (15):** 82.6% of 100%+ gainers showed *artificial* growth — wash trading or LP-based price inflation ([USENIX Security '26](https://arxiv.org/abs/2507.01963)). So: unique buyers (not raw volume), volume ÷ liquidity in a sane band, volume persisting week over week, and "big pump on thin volume" is penalised.
+     - **Price resilience (15):** from 90 days of daily candles — higher lows, recovered from a crash (BONK fell 96% and came back; the crash isn't the problem, staying down is), volatility calming, not a death spiral.
+     - **Hard disqualifiers** (⛔ NOT A HOLD, whatever the score): already dead/dumping, live mint/freeze authority, open rug vector, pullable LP, a wallet > 5% or dev > 5%, top-10 > 40%, volume > 10× liquidity (wash trading), death spiral, serial deployer. Over $250M → 📈 ALREADY BIG.
+     - **Its own report card** (dashboard): every verdict is re-checked at 7 and 30 days. If 🏔 CANDIDATE coins don't outlive WEAK ones, don't trust the radar.
+     - Data: [GeckoTerminal](https://www.geckoterminal.com) public API (keyless; daily OHLCV, holders, unique buyers/sellers, trending pools). *This improves the odds of durability; it cannot pick the next PEPE — thousands of coins had PEPE's early traits and still died.*
+   - **🔥 LP status everywhere (not just gmgn.ai):** graduated pump.fun coins are marked LP-burned (pump.fun burns migration LP — PumpSwap since March 2025, Raydium before), and RugCheck's keyless summary fills the rest. Previously LP was "unknown" off gmgn.ai, which capped every grade at 50%.
    - **👨‍💻 Dev-wallet holdings:** full scans match the creator's wallet against the top holders — "Dev holds 12%" is a risk factor (+10 at ≥5%), blocks gem grade above 10%, and its *decrease* over time is the watchlist's dev-selling alert.
    - **🧠 Persistent creator memory:** every deployer-history lookup is remembered (`chrome.storage`, last 500 creators), so a serial rugger — or a proven creator — is recognized instantly on their next launch even when the launchpad endpoint is down.
    - **🛡 Modern rug-trick detection (Token-2022 traps):** the on-chain scan reads the current generation of scam mechanics from the mint account itself — **permanent delegate** (dev can seize tokens out of your wallet, +30), **non-transferable/soulbound** (you can't sell, +30), **default-frozen accounts** (+25), **transfer hooks** (programmable sell-blocking, +20) — plus **serial-deployer detection** via pump.fun launch records (creator with many dead prior launches, +15).
@@ -49,7 +60,8 @@ If you edit any source file (including `config.ts`), rebuild `dist/` and hit ↻
 ```bash
 npm install
 npm run build     # bundles into dist/
-npm test          # riskScorer unit tests (3 fixtures + edge cases)
+npm test          # unit tests (scoring, rug checks, long-hold model, parsers)
+npm run test:e2e  # loads dist/ in Chromium with a fake network — every layer end to end
 ```
 
 Mock mode (opt-in) ships three fixture tokens — **RUGKING** (90 → AVOID), **WIFCAT** (45 → WATCH), **QUOKKA** (0 → NEUTRAL) — and deterministically maps any real address you browse onto one of them. See `mock/fixtures.ts` for the worked point-by-point walkthroughs.

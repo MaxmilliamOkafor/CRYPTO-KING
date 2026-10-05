@@ -92,6 +92,52 @@ var LIVE_FEED = {
    */
   safeMinGrade: 40
 };
+var GECKO = {
+  enabled: true,
+  baseUrl: "https://api.geckoterminal.com/api/v2",
+  /** Daily candles to request per coin (max useful window for the pillars). */
+  historyDays: 90,
+  /** Discovery lists for the long-hold radar (trending + most-traded Solana pools). */
+  discoveryPaths: [
+    "/networks/solana/trending_pools?page=1",
+    "/networks/solana/pools?page=1&sort=h24_tx_count_desc"
+  ]
+};
+var LONG_HOLD = {
+  enabled: true,
+  /** Younger than this = inside the rug/abandon window — can't judge durability. */
+  minAgeDays: 3,
+  /** Above this market cap the coin is already "discovered" — tier LATE. */
+  lateMcapUsd: 25e7,
+  /** "Still early" strength shown below this cap. */
+  earlyMcapUsd: 1e7,
+  /** Score thresholds for tiers. */
+  candidateScore: 70,
+  watchScore: 50,
+  /** Hard disqualifiers (any one → NOT A HOLD). */
+  maxLargestWalletPct: 5,
+  maxDevPct: 5,
+  maxTop10Pct: 40,
+  /** Daily volume ÷ liquidity above this is almost certainly wash trading. */
+  washVolLiqRatio: 10,
+  /** …above this it's suspicious (scored, not disqualified). */
+  suspiciousVolLiqRatio: 5,
+  /** Close below this share of the all-time high WITH lower lows = death spiral. */
+  deathSpiralAthShare: 0.1,
+  /** Radar sweep: how often, and how many new candidates to deep-check per sweep. */
+  radarEveryMinutes: 30,
+  radarDeepChecksPerSweep: 4,
+  /** Radar candidate filters (applied before any deep check). */
+  radarMinLiquidityUsd: 4e4,
+  radarMinMcapUsd: 15e4,
+  radarMaxAgeDays: 365,
+  /** Keep this many assessed coins in the radar list. */
+  radarMaxRows: 40,
+  /** Re-assess a radar coin after this long. */
+  reassessHours: 6,
+  /** Outcome checks for the long-hold report card. */
+  ledgerCheckDays: [7, 30]
+};
 var JUPITER = {
   enabled: true,
   quoteUrl: "https://lite-api.jup.ag/swap/v1/quote",
@@ -157,10 +203,11 @@ var TRENDING_NARRATIVES = {
   Frog: ["pepe", "frog", "toad"]
 };
 var RUGCHECK = {
-  /** Optional pluggable adapter — OFF by default; the API spec may drift. */
-  enabled: false,
-  /** Public report endpoint as of 2025; verify against rugcheck.xyz docs before enabling. */
-  endpoint: "https://api.rugcheck.xyz/v1/tokens/{address}/report"
+  /** ON: the keyless summary is the only source of LP lock status off gmgn.ai
+   *  (see lib/lpStatus.ts). Full scans only — never the lite feed sweep. */
+  enabled: true,
+  /** Public, keyless summary endpoint (lighter than the full report). */
+  endpoint: "https://api.rugcheck.xyz/v1/tokens/{address}/report/summary"
 };
 var RATE_LIMITS_MS = {
   default: 1100,
@@ -168,7 +215,9 @@ var RATE_LIMITS_MS = {
   /** DexScreener publishes 300 req/min for its token/pair endpoints (=200ms);
    *  250ms stays under it. It drives the rug/dump checks, so it must not crawl
    *  at the 1.1s default. */
-  "api.dexscreener.com": 250
+  "api.dexscreener.com": 250,
+  /** GeckoTerminal's public limit is 30 calls/min → 2s; 2.1s keeps a margin. */
+  "api.geckoterminal.com": 2100
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
@@ -507,6 +556,581 @@ function computeAccuracy(entries) {
   }
   return { bands, totalChecked, pending };
 }
+function computeLongHoldAccuracy(entries, days) {
+  const tiers = ["CANDIDATE", "WATCH", "WEAK", "NOT_A_HOLD"];
+  const rows = [];
+  for (const tier of tiers) {
+    for (const day of days) {
+      const done = entries.filter((e) => e.tier === tier).map((e) => ({ e, o: e.outcomes[String(day)] })).filter((x) => x.o && x.o.outcome !== "PENDING");
+      const multiples = done.map((x) => x.o.mcap !== null && x.e.baselineMcap > 0 ? x.o.mcap / x.e.baselineMcap : x.o.outcome === "RUGGED" ? 0 : null).filter((m) => m !== null).sort((a, b) => a - b);
+      rows.push({
+        tier,
+        day,
+        checked: done.length,
+        survived: done.filter((x) => x.o.outcome === "SURVIVED" || x.o.outcome === "WINNER").length,
+        winners: done.filter((x) => x.o.outcome === "WINNER").length,
+        medianMultiple: multiples.length ? median(multiples) : null
+      });
+    }
+  }
+  return rows;
+}
+function median(sorted) {
+  const m = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
+}
+
+// lib/http.ts
+function rateLimitFor(host) {
+  const bare = host.replace(/^www\./, "");
+  return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
+}
+var hostState = /* @__PURE__ */ new Map();
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "invalid";
+  }
+}
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function fetchJson(url, init) {
+  const host = hostOf(url);
+  let st = hostState.get(host);
+  if (!st) {
+    st = { nextAt: 0, chain: Promise.resolve() };
+    hostState.set(host, st);
+  }
+  const run = st.chain.then(async () => {
+    const wait = st.nextAt - Date.now();
+    if (wait > 0) await sleep(wait);
+    st.nextAt = Date.now() + rateLimitFor(host);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      if (!res.ok) {
+        console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
+        return null;
+      }
+      return await res.json();
+    } catch (err) {
+      console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  st.chain = run.catch(() => void 0);
+  return run;
+}
+async function rpcCall(rpcUrl, method, params) {
+  const urls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
+  const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
+  for (const url of urls) {
+    const json = await fetchJson(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body
+    });
+    if (json && typeof json === "object" && "result" in json) {
+      return json.result ?? null;
+    }
+  }
+  return null;
+}
+function pick(obj, paths) {
+  for (const path of paths) {
+    let cur = obj;
+    let ok = true;
+    for (const key of path.split(".")) {
+      if (cur !== null && typeof cur === "object" && key in cur) {
+        cur = cur[key];
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (ok && cur !== void 0 && cur !== null) return cur;
+  }
+  return void 0;
+}
+function asNumber(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+function asString(v) {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+// lib/geckoClient.ts
+var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+async function fetchDailyCandles(poolAddress, days = GECKO.historyDays) {
+  if (MOCK_MODE || !GECKO.enabled || !BASE58_RE.test(poolAddress)) return null;
+  const url = `${GECKO.baseUrl}/networks/solana/pools/${poolAddress}/ohlcv/day?aggregate=1&limit=${days}&currency=usd`;
+  return parseCandles(await fetchJson(url));
+}
+function parseCandles(json) {
+  const list = pick(json, ["data.attributes.ohlcv_list"]);
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const row of list) {
+    if (!Array.isArray(row) || row.length < 6) continue;
+    const [t, o, h, l, c, v] = row.map((x) => asNumber(x));
+    if (t === null || o === null || h === null || l === null || c === null || v === null) continue;
+    if (h <= 0 || l <= 0 || c <= 0) continue;
+    out.push({ t, o, h, l, c, v });
+  }
+  if (out.length === 0) return null;
+  out.sort((a, b) => a.t - b.t);
+  const byDay = /* @__PURE__ */ new Map();
+  for (const k of out) byDay.set(k.t, k);
+  return [...byDay.values()];
+}
+async function fetchTokenInfo(mint) {
+  if (MOCK_MODE || !GECKO.enabled || !BASE58_RE.test(mint)) return null;
+  return parseTokenInfo(await fetchJson(`${GECKO.baseUrl}/networks/solana/tokens/${mint}/info`));
+}
+function parseTokenInfo(json) {
+  const attrs = pick(json, ["data.attributes"]);
+  if (!attrs || typeof attrs !== "object") return null;
+  const websites = pick(attrs, ["websites"]);
+  const handle2 = asString(pick(attrs, ["twitter_handle"]));
+  const tg = asString(pick(attrs, ["telegram_handle"]));
+  return {
+    holderCount: asNumber(pick(attrs, ["holders.count"])),
+    twitter: handle2 ? `https://x.com/${handle2.replace(/^@/, "")}` : null,
+    telegram: tg ? `https://t.me/${tg.replace(/^@/, "")}` : null,
+    website: Array.isArray(websites) ? asString(websites[0]) : null
+  };
+}
+async function fetchPool(poolAddress) {
+  if (MOCK_MODE || !GECKO.enabled || !BASE58_RE.test(poolAddress)) return null;
+  const json = await fetchJson(`${GECKO.baseUrl}/networks/solana/pools/${poolAddress}`);
+  const data = pick(json, ["data"]);
+  return data ? parsePools({ data: [data] })[0] ?? null : null;
+}
+async function fetchRadarPools() {
+  if (MOCK_MODE || !GECKO.enabled) return [];
+  const pools = [];
+  for (const path of GECKO.discoveryPaths) {
+    pools.push(...parsePools(await fetchJson(`${GECKO.baseUrl}${path}`)));
+  }
+  const byMint = /* @__PURE__ */ new Map();
+  for (const p of pools) {
+    const prev = byMint.get(p.mint);
+    if (!prev || (p.liquidityUsd ?? 0) > (prev.liquidityUsd ?? 0)) byMint.set(p.mint, p);
+  }
+  return [...byMint.values()];
+}
+var NOT_MEMES = /* @__PURE__ */ new Set([
+  "So11111111111111111111111111111111111111112",
+  // wSOL
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  // USDC
+  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+  // USDT
+  "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  // JUP
+  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+  // RAY
+  "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+  // JTO
+  "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+  // PYTH
+  "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+  // mSOL
+  "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+  // jitoSOL
+  "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"
+  // bSOL
+]);
+function parsePools(json) {
+  const data = pick(json, ["data"]);
+  if (!Array.isArray(data)) return [];
+  const out = [];
+  for (const p of data) {
+    const baseId = asString(pick(p, ["relationships.base_token.data.id"]));
+    const mint = baseId?.startsWith("solana_") ? baseId.slice("solana_".length) : null;
+    const pool = asString(pick(p, ["attributes.address"]));
+    if (!mint || !pool || !BASE58_RE.test(mint) || NOT_MEMES.has(mint)) continue;
+    const created = asString(pick(p, ["attributes.pool_created_at"]));
+    const createdMs = created ? Date.parse(created) : NaN;
+    out.push({
+      mint,
+      pool,
+      name: asString(pick(p, ["attributes.name"])),
+      createdMs: Number.isFinite(createdMs) ? createdMs : null,
+      liquidityUsd: asNumber(pick(p, ["attributes.reserve_in_usd"])),
+      // Prefer real market cap; FDV equals it for fixed-supply memes.
+      marketCapUsd: asNumber(pick(p, ["attributes.market_cap_usd", "attributes.fdv_usd"])),
+      volume24hUsd: asNumber(pick(p, ["attributes.volume_usd.h24"])),
+      buyers24h: asNumber(pick(p, ["attributes.transactions.h24.buyers"])),
+      sellers24h: asNumber(pick(p, ["attributes.transactions.h24.sellers"]))
+    });
+  }
+  return out;
+}
+
+// lib/liveState.ts
+function assessLiveState(market, t = LIVE_STATE) {
+  if (!market) return { state: "UNKNOWN", reasons: ["No market data."] };
+  const reasons = [];
+  const { priceChange1h: h1, priceChange6h: h6, priceChange24h: h24, liquidityEur: liq, marketCapEur: mcap } = market;
+  const haveMomentum = h1 !== null || h6 !== null || h24 !== null;
+  let dead = false;
+  if (liq !== null && liq < t.deadLiquidityUsd && (mcap === null || mcap > t.deadLiquidityUsd)) {
+    dead = true;
+    reasons.push(`Liquidity is only $${Math.round(liq)} \u2014 effectively pulled; you could not exit.`);
+  }
+  if (h24 !== null && h24 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h24))}% in 24h \u2014 this already collapsed.`);
+  }
+  if (h6 !== null && h6 <= t.deadDropPct) {
+    dead = true;
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 collapse in progress/complete.`);
+  }
+  if (dead) return { state: "DEAD", reasons };
+  if (h1 !== null && h1 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h1))}% in the last hour \u2014 actively dumping.`);
+  }
+  if (h6 !== null && h6 <= t.dumpingDropPct) {
+    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 sustained bleed.`);
+  }
+  const { buys1h: buys, sells1h: sells } = market;
+  if (buys !== null && sells !== null && buys + sells >= t.minTxnsForFlow && sells > buys * t.sellDominanceRatio) {
+    reasons.push(`Sells dominating (${sells} sells vs ${buys} buys in 1h) \u2014 holders exiting.`);
+  }
+  if (reasons.length > 0) return { state: "DUMPING", reasons };
+  if (!haveMomentum) return { state: "UNKNOWN", reasons: ["No price-momentum data yet (unlisted/too fresh)."] };
+  return { state: "HEALTHY", reasons: [] };
+}
+
+// lib/rugPotential.ts
+function assessRugPotential(a, risk) {
+  const hard = [];
+  const soft = [];
+  const unverified = [];
+  const mint = a.mint;
+  if (!mint) {
+    unverified.push("mint/freeze authority");
+  } else {
+    if (mint.mintAuthorityActive === true) hard.push("Supply can be inflated (mint authority active).");
+    if (mint.freezeAuthorityActive === true) hard.push("Your wallet can be frozen (freeze authority active).");
+    if (mint.permanentDelegateActive === true) hard.push("Dev can seize tokens (permanent delegate).");
+    if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
+    if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
+    if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
+    if (mint.transferFeeBps !== null && mint.transferFeeBps > LIMITS.transferFeeVeryHighBps) {
+      hard.push(`Every sell pays a ${(mint.transferFeeBps / 100).toFixed(1)}% transfer tax \u2014 exit is taxed away.`);
+    }
+    if (mint.isToken2022 === true && mint.feeAuthorityActive === true) {
+      soft.push("Fee authority is live \u2014 the transfer tax can be raised after you buy.");
+    }
+    if (mint.mintAuthorityActive === null) unverified.push("mint authority");
+    if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
+  }
+  const sim = a.market?.sellSimulation;
+  if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (lp === "deployer_held") hard.push("Deployer holds the LP \u2014 liquidity can be pulled in one transaction.");
+  else if (lp === "unlocked") soft.push("LP not burned/locked \u2014 liquidity can be pulled.");
+  else if (lp === "unknown") unverified.push("LP burn/lock status");
+  if (a.launch?.bondingCurveComplete === false) {
+    soft.push("Still on the bonding curve \u2014 insiders can dump at any moment.");
+  }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev >= LIMITS.devHoldsPct) soft.push(`Dev wallet holds ${dev.toFixed(1)}% \u2014 positioned to dump.`);
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > GEM_CRITERIA.maxLargestWalletPct) {
+    soft.push(`A single wallet holds ${whale.toFixed(1)}% \u2014 one seller from a crash.`);
+  }
+  if (whale === null) unverified.push("holder concentration");
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) {
+    hard.push("Creator is a serial launcher with mostly dead coins.");
+  }
+  let verdict;
+  if (hard.length > 0) verdict = "HIGH";
+  else if (soft.length >= 2) verdict = "HIGH";
+  else if (soft.length === 1) verdict = "POSSIBLE";
+  else if (unverified.length > 0) verdict = "UNVERIFIED";
+  else verdict = "LOW";
+  return { verdict, vectors: [...hard, ...soft], unverified };
+}
+
+// lib/longHold.ts
+var acc = (max) => ({ score: 0, max, good: [], bad: [], unknown: [] });
+function assessLongHold(a, risk, x, t = LONG_HOLD) {
+  const disqualifiers = [];
+  const mcap = a.market?.marketCapEur ?? null;
+  const liq = a.market?.liquidityEur ?? null;
+  const k = x.candles && x.candles.length > 0 ? x.candles : null;
+  const rug = assessRugPotential(a, risk);
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") disqualifiers.push(`Already rugged/dead \u2014 ${live.reasons[0] ?? "market collapsed."}`);
+  if (live.state === "DUMPING") disqualifiers.push(`Dumping right now \u2014 ${live.reasons[0] ?? "price falling hard."}`);
+  if (a.mint?.mintAuthorityActive === true) disqualifiers.push("Mint authority active \u2014 supply can be inflated forever.");
+  if (a.mint?.freezeAuthorityActive === true) disqualifiers.push("Freeze authority active \u2014 your wallet can be frozen.");
+  if (rug.verdict === "HIGH") disqualifiers.push(`Rug vector open: ${rug.vectors[0] ?? "see rug check."}`);
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (lp === "unlocked" || lp === "deployer_held") disqualifiers.push("Liquidity is not burned or locked \u2014 it can be pulled.");
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > t.maxLargestWalletPct) {
+    disqualifiers.push(`One wallet holds ${whale.toFixed(1)}% \u2014 a long hold means waiting on their exit.`);
+  }
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev > t.maxDevPct) disqualifiers.push(`Dev still holds ${dev.toFixed(1)}% of supply.`);
+  const top10 = a.holders?.top10Pct ?? null;
+  if (top10 !== null && top10 > t.maxTop10Pct) disqualifiers.push(`Top 10 wallets hold ${top10.toFixed(0)}% \u2014 too concentrated to survive.`);
+  const volLiq = a.market?.volume24hEur != null && liq ? a.market.volume24hEur / liq : null;
+  if (volLiq !== null && volLiq > t.washVolLiqRatio) {
+    disqualifiers.push(`24h volume is ${volLiq.toFixed(0)}\xD7 its liquidity \u2014 almost certainly wash-traded.`);
+  }
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) disqualifiers.push("Creator is a serial launcher of dead coins.");
+  const sv = acc(20);
+  const age = x.ageDays;
+  if (age === null) sv.unknown.push("coin age");
+  else {
+    const pts = age >= 90 ? 16 : age >= 30 ? 14 : age >= 14 ? 12 : age >= 7 ? 9 : age >= t.minAgeDays ? 6 : 0;
+    sv.score += pts;
+    if (age >= t.minAgeDays) sv.good.push(`Survived ${fmtDays(age)} \u2014 past the window where ~95% of launches die.`);
+    else sv.bad.push(`Only ${fmtDays(age)} old \u2014 inside the rug/abandon window.`);
+  }
+  if (k && age !== null && age >= t.minAgeDays) {
+    const span = Math.max(1, Math.round((k[k.length - 1].t - k[0].t) / 86400) + 1);
+    const active = k.filter((c) => c.v > 0).length;
+    const ratio = Math.min(1, active / span);
+    if (ratio >= 0.9) {
+      sv.score += 4;
+      sv.good.push("Traded every day \u2014 never went quiet.");
+    } else if (ratio < 0.7) sv.bad.push("Went quiet for stretches \u2014 interest is not continuous.");
+    else sv.score += 2;
+  }
+  const cm = acc(15);
+  if (x.socials.telegram) cm.score += 4;
+  if (x.socials.twitter) cm.score += 3;
+  if (x.socials.website) cm.score += 2;
+  const nSocial = Number(x.socials.telegram) + Number(x.socials.twitter) + Number(x.socials.website);
+  if (nSocial === 3) cm.good.push("X + Telegram + website \u2014 the pattern with a 17\xD7 higher survival rate.");
+  else if (nSocial === 0) cm.bad.push("No socials \u2014 coins without them almost never last.");
+  else cm.bad.push(`Missing ${[!x.socials.telegram && "Telegram", !x.socials.twitter && "X", !x.socials.website && "website"].filter(Boolean).join(", ")}.`);
+  if (x.holderCount === null) cm.unknown.push("holder count");
+  else if (x.holderCount >= 5e3) {
+    cm.score += 3;
+    cm.good.push(`${fmtInt(x.holderCount)} holders.`);
+  } else if (x.holderCount >= 1e3) {
+    cm.score += 1;
+    cm.good.push(`${fmtInt(x.holderCount)} holders \u2014 a growing community.`);
+  } else cm.bad.push(`Only ${fmtInt(x.holderCount)} holders.`);
+  const growth = holderGrowthPerDay(x.holderHistory);
+  if (growth === null) cm.unknown.push("holder growth (tracked over time \u2014 needs 1+ day of history)");
+  else if (growth >= 1) {
+    cm.score += 3;
+    cm.good.push(`Holders growing ~${growth.toFixed(1)}%/day.`);
+  } else if (growth >= 0) cm.score += 1;
+  else cm.bad.push(`Holders shrinking (${growth.toFixed(1)}%/day) \u2014 people are leaving.`);
+  const ds = acc(20);
+  if (top10 === null) ds.unknown.push("top-10 concentration");
+  else {
+    ds.score += top10 <= 15 ? 10 : top10 <= 25 ? 7 : top10 <= 35 ? 4 : 0;
+    (top10 <= 25 ? ds.good : ds.bad).push(`Top 10 real wallets hold ${top10.toFixed(0)}%.`);
+  }
+  if (whale === null) ds.unknown.push("largest wallet");
+  else {
+    ds.score += whale <= 2 ? 6 : whale <= 4 ? 4 : whale <= t.maxLargestWalletPct ? 2 : 0;
+    if (whale <= 2) ds.good.push(`No whale \u2014 largest wallet ${whale.toFixed(1)}%.`);
+  }
+  if (dev === null) ds.unknown.push("dev holdings");
+  else {
+    ds.score += dev <= 1 ? 4 : dev <= 3 ? 2 : 0;
+    if (dev <= 1) ds.good.push("Dev holds ~nothing \u2014 no team bag waiting to sell.");
+  }
+  const lq = acc(15);
+  if (lp === "burned") {
+    lq.score += 5;
+    lq.good.push("LP burned \u2014 liquidity can never be pulled.");
+  } else if (lp === "locked") {
+    lq.score += 3;
+    lq.bad.push("LP \u226590% locked or burned \u2014 if it is a time-lock, check when it expires.");
+  } else if (lp === "unknown") lq.unknown.push("LP burn/lock");
+  if (liq === null || mcap === null || mcap <= 0) lq.unknown.push("liquidity depth");
+  else {
+    const r = liq / mcap;
+    lq.score += r >= 0.1 ? 5 : r >= 0.05 ? 3 : r >= 0.03 ? 1 : 0;
+    lq.score += liq >= 25e4 ? 5 : liq >= 1e5 ? 3 : liq >= 5e4 ? 1 : 0;
+    if (r < 0.03) lq.bad.push(`Liquidity only ${(r * 100).toFixed(1)}% of cap \u2014 price is fragile.`);
+    else if (liq >= 1e5) lq.good.push(`Deep liquidity ($${fmtK(liq)}, ${(r * 100).toFixed(0)}% of cap).`);
+  }
+  const dm = acc(15);
+  if (volLiq === null) dm.unknown.push("volume vs liquidity");
+  else if (volLiq >= 0.1 && volLiq <= 1) {
+    dm.score += 5;
+    dm.good.push("Healthy trading volume for its liquidity.");
+  } else if (volLiq > 1 && volLiq <= 3) dm.score += 2;
+  else if (volLiq > t.suspiciousVolLiqRatio) dm.bad.push(`Volume ${volLiq.toFixed(1)}\xD7 liquidity \u2014 suspicious, possibly wash-traded.`);
+  else if (volLiq < 0.1) dm.bad.push("Barely trading \u2014 interest has faded.");
+  if (x.buyers24h === null) dm.unknown.push("unique buyers");
+  else {
+    dm.score += x.buyers24h >= 300 ? 4 : x.buyers24h >= 100 ? 2 : 0;
+    if (x.buyers24h >= 300) dm.good.push(`${fmtInt(x.buyers24h)} different wallets bought in 24h \u2014 real demand.`);
+    else if (x.buyers24h < 50) dm.bad.push(`Only ${x.buyers24h} unique buyers in 24h.`);
+    if (x.sellers24h !== null && x.sellers24h > 0) {
+      if (x.buyers24h >= x.sellers24h * 0.8) dm.score += 3;
+      else dm.bad.push(`More wallets selling (${x.sellers24h}) than buying (${x.buyers24h}).`);
+    }
+  }
+  const ch24 = a.market?.priceChange24h ?? null;
+  if (ch24 !== null && ch24 >= 100 && volLiq !== null && volLiq < 0.2) {
+    dm.score = Math.max(0, dm.score - 5);
+    dm.bad.push(`Up ${ch24.toFixed(0)}% on thin volume \u2014 the signature of artificial price inflation.`);
+  }
+  if (k && k.length >= 14) {
+    const recent = avg(k.slice(-7).map((c) => c.v));
+    const prior = avg(k.slice(-14, -7).map((c) => c.v));
+    if (prior > 0 && recent >= prior * 0.4) {
+      dm.score += 3;
+      if (recent >= prior) dm.good.push("Volume holding up week over week \u2014 not a one-off spike.");
+    } else if (prior > 0) dm.bad.push("Volume collapsed vs the week before \u2014 hype is fading.");
+  } else dm.unknown.push("volume persistence (needs 14 days of history)");
+  const rs = acc(15);
+  let deathSpiral = false;
+  if (!k || k.length < 7) rs.unknown.push("price history (needs 7+ days)");
+  else {
+    const p = pricePath(k);
+    if (k.length >= 14) {
+      const lowRecent = Math.min(...k.slice(-7).map((c) => c.l));
+      const lowPrior = Math.min(...k.slice(-14, -7).map((c) => c.l));
+      if (lowRecent > lowPrior) {
+        rs.score += 5;
+        rs.good.push("Making higher lows \u2014 buyers are stepping in earlier each dip.");
+      } else rs.bad.push("Still making lower lows.");
+      deathSpiral = p.closeVsAth < t.deathSpiralAthShare && lowRecent <= lowPrior;
+      const volRecent = stdevLogReturns(k.slice(-8));
+      const volPrior = stdevLogReturns(k.slice(-15, -7));
+      if (volRecent !== null && volPrior !== null && volRecent < volPrior) {
+        rs.score += 3;
+        rs.good.push("Volatility calming \u2014 the market is maturing.");
+      }
+    }
+    if (p.maxDrawdown >= 0.4 && p.recoveryFromLow >= 1.6) {
+      rs.score += 4;
+      rs.good.push(`Survived a ${(p.maxDrawdown * 100).toFixed(0)}% shakeout and bounced ${p.recoveryFromLow.toFixed(1)}\xD7 off the low \u2014 holders didn't give up.`);
+    } else if (p.maxDrawdown < 0.4 && k.length >= 14) {
+      rs.score += 4;
+      rs.good.push("No major crash in its history so far.");
+    } else if (p.maxDrawdown >= 0.6 && p.recoveryFromLow < 1.15) {
+      rs.bad.push(`Down ${(p.maxDrawdown * 100).toFixed(0)}% and still sitting at its lows.`);
+    }
+    if (p.closeVsAth >= 0.25) rs.score += 3;
+    else rs.bad.push(`${((1 - p.closeVsAth) * 100).toFixed(0)}% below its all-time high.`);
+  }
+  if (deathSpiral) disqualifiers.push("Death spiral \u2014 under 10% of its high and still making lower lows.");
+  const parts = [
+    ["survival", "Survival", sv],
+    ["community", "Community", cm],
+    ["distribution", "Fair distribution", ds],
+    ["liquidity", "Liquidity", lq],
+    ["demand", "Organic demand", dm],
+    ["resilience", "Price resilience", rs]
+  ];
+  const pillars = parts.map(([key, label, p]) => ({
+    key,
+    label,
+    score: Math.min(p.max, Math.max(0, p.score)),
+    max: p.max,
+    good: p.good,
+    bad: p.bad,
+    unknown: p.unknown
+  }));
+  const score = Math.round(pillars.reduce((s, p) => s + p.score, 0));
+  const unverified = pillars.flatMap((p) => p.unknown);
+  const coreVerified = a.mint?.mintAuthorityActive === false && a.mint?.freezeAuthorityActive === false && (lp === "burned" || lp === "locked") && top10 !== null && whale !== null && k !== null && k.length >= 7;
+  let tier;
+  if (risk.insufficientData) tier = "NO_DATA";
+  else if (disqualifiers.length > 0) tier = "NOT_A_HOLD";
+  else if (age !== null && age < t.minAgeDays) tier = "TOO_EARLY";
+  else if (mcap !== null && mcap > t.lateMcapUsd) tier = "LATE";
+  else if (score >= t.candidateScore && coreVerified) tier = "CANDIDATE";
+  else if (score >= t.watchScore) tier = "WATCH";
+  else tier = "WEAK";
+  const strengths = pillars.flatMap((p) => p.good);
+  if (mcap !== null && mcap < t.earlyMcapUsd && tier !== "NOT_A_HOLD") {
+    strengths.push(`Still early \u2014 $${fmtK(mcap)} market cap.`);
+  }
+  return {
+    tier,
+    score: tier === "NO_DATA" ? null : score,
+    pillars,
+    disqualifiers,
+    strengths,
+    concerns: pillars.flatMap((p) => p.bad),
+    unverified,
+    coreVerified,
+    ageDays: age,
+    historyDays: k ? k.length : 0
+  };
+}
+function pricePath(k) {
+  let peak = k[0].h;
+  let maxDd = 0;
+  let ddLow = k[0].l;
+  for (const c of k) {
+    if (c.h > peak) peak = c.h;
+    const dd = 1 - c.l / peak;
+    if (dd > maxDd) {
+      maxDd = dd;
+      ddLow = c.l;
+    }
+  }
+  const ath = Math.max(...k.map((c) => c.h));
+  const close = k[k.length - 1].c;
+  return { maxDrawdown: maxDd, recoveryFromLow: ddLow > 0 ? close / ddLow : 1, closeVsAth: ath > 0 ? close / ath : 0 };
+}
+function stdevLogReturns(k) {
+  if (k.length < 3) return null;
+  const r = [];
+  for (let i = 1; i < k.length; i++) if (k[i - 1].c > 0 && k[i].c > 0) r.push(Math.log(k[i].c / k[i - 1].c));
+  if (r.length < 2) return null;
+  const m = avg(r);
+  return Math.sqrt(avg(r.map((v) => (v - m) ** 2)));
+}
+function holderGrowthPerDay(h) {
+  if (h.length < 2) return null;
+  const first = h[0];
+  const last = h[h.length - 1];
+  const days = (last.at - first.at) / 864e5;
+  if (days < 0.8 || first.holderCount <= 0) return null;
+  return (last.holderCount / first.holderCount - 1) * 100 / days;
+}
+var avg = (xs) => xs.length ? xs.reduce((s, v) => s + v, 0) / xs.length : 0;
+var fmtInt = (n) => Math.round(n).toLocaleString("en-US");
+function fmtK(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
+  return n.toFixed(0);
+}
+function fmtDays(d) {
+  return d < 1 ? `${Math.round(d * 24)}h` : `${Math.floor(d)} day${Math.floor(d) === 1 ? "" : "s"}`;
+}
+
+// lib/lpStatus.ts
+var PUMP_MIGRATION_DEXES = /* @__PURE__ */ new Set(["pumpswap", "raydium"]);
+function resolveLpStatus(i) {
+  if (i.gmgn && i.gmgn !== "unknown") return i.gmgn;
+  if (i.pumpGraduated === true && i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return "burned";
+  return i.audit ?? "unknown";
+}
+function lpStatusFromLockedPct(pct) {
+  if (pct === null || !Number.isFinite(pct)) return null;
+  if (pct >= 90) return "locked";
+  if (pct <= 50) return "unlocked";
+  return null;
+}
 
 // mock/fixtures.ts
 var now = () => Date.now();
@@ -723,93 +1347,6 @@ function simpleHash(s) {
   return h;
 }
 
-// lib/http.ts
-function rateLimitFor(host) {
-  const bare = host.replace(/^www\./, "");
-  return RATE_LIMITS_MS[bare] ?? RATE_LIMITS_MS.default;
-}
-var hostState = /* @__PURE__ */ new Map();
-function hostOf(url) {
-  try {
-    return new URL(url).host;
-  } catch {
-    return "invalid";
-  }
-}
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function fetchJson(url, init) {
-  const host = hostOf(url);
-  let st = hostState.get(host);
-  if (!st) {
-    st = { nextAt: 0, chain: Promise.resolve() };
-    hostState.set(host, st);
-  }
-  const run = st.chain.then(async () => {
-    const wait = st.nextAt - Date.now();
-    if (wait > 0) await sleep(wait);
-    st.nextAt = Date.now() + rateLimitFor(host);
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { ...init, signal: ctrl.signal });
-      if (!res.ok) {
-        console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
-        return null;
-      }
-      return await res.json();
-    } catch (err) {
-      console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
-      return null;
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-  st.chain = run.catch(() => void 0);
-  return run;
-}
-async function rpcCall(rpcUrl, method, params) {
-  const urls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
-  const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
-  for (const url of urls) {
-    const json = await fetchJson(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body
-    });
-    if (json && typeof json === "object" && "result" in json) {
-      return json.result ?? null;
-    }
-  }
-  return null;
-}
-function pick(obj, paths) {
-  for (const path of paths) {
-    let cur = obj;
-    let ok = true;
-    for (const key of path.split(".")) {
-      if (cur !== null && typeof cur === "object" && key in cur) {
-        cur = cur[key];
-      } else {
-        ok = false;
-        break;
-      }
-    }
-    if (ok && cur !== void 0 && cur !== null) return cur;
-  }
-  return void 0;
-}
-function asNumber(v) {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
-  }
-  return null;
-}
-function asString(v) {
-  return typeof v === "string" && v.length > 0 ? v : null;
-}
-
 // lib/pumpfunClient.ts
 var TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 async function fetchPumpfunData(address) {
@@ -867,7 +1404,7 @@ async function fetchPumpfunData(address) {
     ].filter((s) => s !== null)
   };
 }
-var BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 async function fetchPumpfunNewCoins(limit, offset = 0) {
   if (MOCK_MODE || !PUMPFUN.enabled) return [];
   const path = PUMPFUN.listEndpoint.replace("{offset}", String(offset)).replace("{limit}", String(limit));
@@ -876,7 +1413,7 @@ async function fetchPumpfunNewCoins(limit, offset = 0) {
   const out = [];
   for (const c of arr) {
     const mint = asString(pick(c, ["mint", "address", "coin_mint"]));
-    if (!mint || !BASE58_RE.test(mint)) continue;
+    if (!mint || !BASE58_RE2.test(mint)) continue;
     out.push({
       mint,
       symbol: asString(pick(c, ["symbol"])),
@@ -975,7 +1512,7 @@ var pumpfunDeployerAdapter = {
 };
 
 // lib/dexscreenerClient.ts
-var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+var BASE58_RE3 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 async function fetchPairBaseTokens(pairAddresses) {
   const out = {};
   if (MOCK_MODE || !DEXSCREENER.enabled || pairAddresses.length === 0) return out;
@@ -987,7 +1524,7 @@ async function fetchPairBaseTokens(pairAddresses) {
     for (const p of pairs) {
       const pairAddr = asString(pick(p, ["pairAddress"]));
       const base = asString(pick(p, ["baseToken.address"]));
-      if (pairAddr && base && BASE58_RE2.test(base)) {
+      if (pairAddr && base && BASE58_RE3.test(base)) {
         out[pairAddr] = { address: base, symbol: asString(pick(p, ["baseToken.symbol"])) };
       }
     }
@@ -1008,7 +1545,9 @@ function toMarket(best) {
     sells1h: asNumber(pick(best, ["txns.h1.sells"])),
     symbol: asString(pick(best, ["baseToken.symbol"])),
     name: asString(pick(best, ["baseToken.name"])),
-    pairCreatedMs: asNumber(pick(best, ["pairCreatedAt"]))
+    pairCreatedMs: asNumber(pick(best, ["pairCreatedAt"])),
+    pairAddress: asString(pick(best, ["pairAddress"])),
+    dexId: asString(pick(best, ["dexId"]))
   };
 }
 function deepestByMint(pairs) {
@@ -1039,7 +1578,7 @@ async function primeDexscreenerTokens(mints) {
   const need = [
     ...new Set(
       mints.filter((m) => {
-        if (!BASE58_RE2.test(m)) return false;
+        if (!BASE58_RE3.test(m)) return false;
         const hit = marketCache.get(m);
         return !hit || now2 - hit.at > MARKET_TTL_MS;
       })
@@ -1066,7 +1605,7 @@ async function fetchDexscreenerToken(mint) {
   return r.status === "ok" ? r.market : null;
 }
 async function lookupDexscreenerToken(mint) {
-  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE2.test(mint)) return { status: "error" };
+  if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE3.test(mint)) return { status: "error" };
   const hit = marketCache.get(mint);
   if (hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: "ok", market: hit.m };
   const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
@@ -1091,47 +1630,12 @@ async function fetchDexscreenerNewSolana(limit) {
     const chain = asString(pick(item, ["chainId", "chain"]));
     if (chain !== "solana") continue;
     const addr = asString(pick(item, ["tokenAddress", "address"]));
-    if (!addr || !BASE58_RE2.test(addr) || seen.has(addr)) continue;
+    if (!addr || !BASE58_RE3.test(addr) || seen.has(addr)) continue;
     seen.add(addr);
     out.push(addr);
     if (out.length >= limit) break;
   }
   return out;
-}
-
-// lib/liveState.ts
-function assessLiveState(market, t = LIVE_STATE) {
-  if (!market) return { state: "UNKNOWN", reasons: ["No market data."] };
-  const reasons = [];
-  const { priceChange1h: h1, priceChange6h: h6, priceChange24h: h24, liquidityEur: liq, marketCapEur: mcap } = market;
-  const haveMomentum = h1 !== null || h6 !== null || h24 !== null;
-  let dead = false;
-  if (liq !== null && liq < t.deadLiquidityUsd && (mcap === null || mcap > t.deadLiquidityUsd)) {
-    dead = true;
-    reasons.push(`Liquidity is only $${Math.round(liq)} \u2014 effectively pulled; you could not exit.`);
-  }
-  if (h24 !== null && h24 <= t.deadDropPct) {
-    dead = true;
-    reasons.push(`Price down ${Math.abs(Math.round(h24))}% in 24h \u2014 this already collapsed.`);
-  }
-  if (h6 !== null && h6 <= t.deadDropPct) {
-    dead = true;
-    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 collapse in progress/complete.`);
-  }
-  if (dead) return { state: "DEAD", reasons };
-  if (h1 !== null && h1 <= t.dumpingDropPct) {
-    reasons.push(`Price down ${Math.abs(Math.round(h1))}% in the last hour \u2014 actively dumping.`);
-  }
-  if (h6 !== null && h6 <= t.dumpingDropPct) {
-    reasons.push(`Price down ${Math.abs(Math.round(h6))}% in 6h \u2014 sustained bleed.`);
-  }
-  const { buys1h: buys, sells1h: sells } = market;
-  if (buys !== null && sells !== null && buys + sells >= t.minTxnsForFlow && sells > buys * t.sellDominanceRatio) {
-    reasons.push(`Sells dominating (${sells} sells vs ${buys} buys in 1h) \u2014 holders exiting.`);
-  }
-  if (reasons.length > 0) return { state: "DUMPING", reasons };
-  if (!haveMomentum) return { state: "UNKNOWN", reasons: ["No price-momentum data yet (unlisted/too fresh)."] };
-  return { state: "HEALTHY", reasons: [] };
 }
 
 // lib/gemCriteria.ts
@@ -1496,7 +2000,7 @@ var EMPTY2 = {
 
 // lib/qualityScorer.ts
 var GRAD_CAP_EUR = 63e3;
-function fmtK(n) {
+function fmtK2(n) {
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
   return n.toFixed(0);
@@ -1564,7 +2068,7 @@ function scoreQuality(a, w = QUALITY_WEIGHTS, l = QUALITY_LIMITS) {
     const progress = Math.min(1, a.market.marketCapEur / GRAD_CAP_EUR);
     const pts = Math.round(w.curveTraction * progress);
     if (pts > 0) {
-      hit(pts, `Curve traction: $${fmtK(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
+      hit(pts, `Curve traction: $${fmtK2(a.market.marketCapEur)} cap (~${Math.round(progress * 100)}% to graduation).`);
     }
   }
   if (a.launch?.replyCount !== null && a.launch?.replyCount !== void 0 && a.launch.replyCount >= l.minReplies) {
@@ -1672,11 +2176,11 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
       if (market.liquidityEur < l.thinLiquidityEur && market.marketCapEur > l.thinLiqMcapEur) {
         hit(
           w.thinLiquidityVsMcap,
-          `Thin liquidity ($${fmtK2(market.liquidityEur)}) vs. cap ($${fmtK2(market.marketCapEur)}) \u2014 easy to manipulate.`
+          `Thin liquidity ($${fmtK3(market.liquidityEur)}) vs. cap ($${fmtK3(market.marketCapEur)}) \u2014 easy to manipulate.`
         );
       }
       if (market.marketCapEur < l.microMcapEur && lpSecured === false) {
-        hit(w.microMcapUnlockedLp, `Micro cap ($${fmtK2(market.marketCapEur)}) with unsecured LP \u2014 high rug exposure.`);
+        hit(w.microMcapUnlockedLp, `Micro cap ($${fmtK3(market.marketCapEur)}) with unsecured LP \u2014 high rug exposure.`);
       }
     } else {
       gap("Liquidity/market-cap figures incomplete.");
@@ -1826,62 +2330,10 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
 function clamp(n, lo, hi) {
   return Math.min(hi, Math.max(lo, n));
 }
-function fmtK2(n) {
+function fmtK3(n) {
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
   return n.toFixed(0);
-}
-
-// lib/rugPotential.ts
-function assessRugPotential(a, risk) {
-  const hard = [];
-  const soft = [];
-  const unverified = [];
-  const mint = a.mint;
-  if (!mint) {
-    unverified.push("mint/freeze authority");
-  } else {
-    if (mint.mintAuthorityActive === true) hard.push("Supply can be inflated (mint authority active).");
-    if (mint.freezeAuthorityActive === true) hard.push("Your wallet can be frozen (freeze authority active).");
-    if (mint.permanentDelegateActive === true) hard.push("Dev can seize tokens (permanent delegate).");
-    if (mint.nonTransferable === true) hard.push("Token is soulbound \u2014 you cannot sell.");
-    if (mint.defaultAccountFrozen === true) hard.push("New holder accounts start frozen.");
-    if (mint.transferHookActive === true) hard.push("Transfers run dev code that can block sells.");
-    if (mint.transferFeeBps !== null && mint.transferFeeBps > LIMITS.transferFeeVeryHighBps) {
-      hard.push(`Every sell pays a ${(mint.transferFeeBps / 100).toFixed(1)}% transfer tax \u2014 exit is taxed away.`);
-    }
-    if (mint.isToken2022 === true && mint.feeAuthorityActive === true) {
-      soft.push("Fee authority is live \u2014 the transfer tax can be raised after you buy.");
-    }
-    if (mint.mintAuthorityActive === null) unverified.push("mint authority");
-    if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
-  }
-  const sim = a.market?.sellSimulation;
-  if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
-  const lp = a.market?.lpStatus ?? "unknown";
-  if (lp === "deployer_held") hard.push("Deployer holds the LP \u2014 liquidity can be pulled in one transaction.");
-  else if (lp === "unlocked") soft.push("LP not burned/locked \u2014 liquidity can be pulled.");
-  else if (lp === "unknown") unverified.push("LP burn/lock status");
-  if (a.launch?.bondingCurveComplete === false) {
-    soft.push("Still on the bonding curve \u2014 insiders can dump at any moment.");
-  }
-  const dev = a.holders?.devHoldsPct ?? null;
-  if (dev !== null && dev >= LIMITS.devHoldsPct) soft.push(`Dev wallet holds ${dev.toFixed(1)}% \u2014 positioned to dump.`);
-  const whale = a.holders?.largestNonLpWalletPct ?? null;
-  if (whale !== null && whale > GEM_CRITERIA.maxLargestWalletPct) {
-    soft.push(`A single wallet holds ${whale.toFixed(1)}% \u2014 one seller from a crash.`);
-  }
-  if (whale === null) unverified.push("holder concentration");
-  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) {
-    hard.push("Creator is a serial launcher with mostly dead coins.");
-  }
-  let verdict;
-  if (hard.length > 0) verdict = "HIGH";
-  else if (soft.length >= 2) verdict = "HIGH";
-  else if (soft.length === 1) verdict = "POSSIBLE";
-  else if (unverified.length > 0) verdict = "UNVERIFIED";
-  else verdict = "LOW";
-  return { verdict, vectors: [...hard, ...soft], unverified };
 }
 
 // lib/settings.ts
@@ -2012,19 +2464,17 @@ var rugcheckAdapter = {
         if (typeof name === "string") externalFlags.push(`RugCheck: ${name}`);
       }
     }
-    let lpStatus = null;
-    const lockedPct = asNumber(pick(json, ["markets.0.lp.lpLockedPct", "lpLockedPct"]));
-    if (lockedPct !== null) lpStatus = lockedPct >= 90 ? "locked" : "unlocked";
+    const lpStatus = lpStatusFromLockedPct(asNumber(pick(json, ["lpLockedPct", "markets.0.lp.lpLockedPct"])));
     return { status: "ok", lpStatus, externalFlags };
   }
 };
 
 // lib/holderMath.ts
 var SYSTEM_PROGRAM = "11111111111111111111111111111111";
-function classifyHolder(acc, burnAddresses, knownPoolOwners) {
-  if (acc.owner !== null && burnAddresses.has(acc.owner)) return "burn";
-  if (acc.owner !== null && knownPoolOwners.has(acc.owner)) return "program";
-  if (acc.ownerProgram !== null && acc.ownerProgram !== SYSTEM_PROGRAM) return "program";
+function classifyHolder(acc2, burnAddresses, knownPoolOwners) {
+  if (acc2.owner !== null && burnAddresses.has(acc2.owner)) return "burn";
+  if (acc2.owner !== null && knownPoolOwners.has(acc2.owner)) return "program";
+  if (acc2.ownerProgram !== null && acc2.ownerProgram !== SYSTEM_PROGRAM) return "program";
   return "wallet";
 }
 function computeConcentration(accounts, supply, burnAddresses, knownPoolOwners = /* @__PURE__ */ new Set()) {
@@ -2237,7 +2687,7 @@ async function fetchOwnerPrograms(owners) {
 
 // background/service-worker.ts
 var RECENT_KEY = "ck:recent";
-var BASE58_RE3 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+var BASE58_RE4 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var cache = /* @__PURE__ */ new Map();
 var inFlight = /* @__PURE__ */ new Map();
 function refreshMarket(entry) {
@@ -2280,7 +2730,7 @@ async function handle(msg) {
     case "GET_LIVE_FEED":
       return getLiveFeed();
     case "RESOLVE_PAIRS": {
-      const valid = msg.pairAddresses.filter((p) => BASE58_RE3.test(p)).slice(0, 90);
+      const valid = msg.pairAddresses.filter((p) => BASE58_RE4.test(p)).slice(0, 90);
       return { ok: true, tokens: await fetchPairBaseTokens(valid) };
     }
     case "WATCH_TOKEN":
@@ -2309,6 +2759,19 @@ async function handle(msg) {
     }
     case "GET_ACCURACY":
       return { ok: true, accuracy: computeAccuracy(await loadLedger()) };
+    case "GET_RADAR":
+      return getRadar(false);
+    case "RUN_RADAR":
+      return getRadar(true);
+    case "GET_LONGHOLD": {
+      if (!BASE58_RE4.test(msg.address)) return { ok: false, error: "Not a valid Solana address." };
+      const res = await assessLongHoldFor(msg.address);
+      return res ? { ok: true, result: res.result, symbol: res.symbol } : { ok: false, error: "Long-hold check unavailable." };
+    }
+    case "GET_LH_ACCURACY": {
+      const entries = await loadLhLedger();
+      return { ok: true, rows: computeLongHoldAccuracy(entries, LONG_HOLD.ledgerCheckDays), tracked: entries.length };
+    }
     default:
       return { ok: false, error: `Unknown message type: ${msg.type}` };
   }
@@ -2442,13 +2905,13 @@ function maybeNotifyLowRisk(row) {
   });
 }
 chrome.notifications?.onClicked.addListener((id) => {
-  if (!id.startsWith("ck-") || id.startsWith("ck-watch-")) return;
+  if (!id.startsWith("ck-") || id.startsWith("ck-watch-") || id.startsWith("ck-lh-")) return;
   const address = id.slice(3);
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
 });
 async function analyzeToken(address, force, rawGmgn, lite = false) {
-  if (!BASE58_RE3.test(address)) {
+  if (!BASE58_RE4.test(address)) {
     return { ok: false, error: "Not a valid Solana address." };
   }
   const cached = cache.get(address);
@@ -2468,7 +2931,9 @@ async function doAnalyze(address, rawGmgn, lite = false) {
     const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
       fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete),
-      rugcheckAdapter.fetchAudit(address),
+      // RugCheck = LP lock status off gmgn.ai. Full scans only: one more
+      // rate-limited call per coin would stall the lite feed sweep.
+      lite ? Promise.resolve({ status: "disabled", lpStatus: null, externalFlags: [] }) : rugcheckAdapter.fetchAudit(address),
       // Always fetched: served from the sweep's batch cache for lite scans, so
       // rug/dump detection runs on EVERY coin, not just the ones you open.
       fetchDexscreenerToken(address)
@@ -2543,7 +3008,12 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
     smartMoneyPct: solana.holders?.smartMoneyPct ?? null,
     devHoldsPct: solana.holders?.devHoldsPct ?? null
   } : null;
-  const lpStatus = gmgn.lpStatus && gmgn.lpStatus !== "unknown" ? gmgn.lpStatus : auditLpStatus ?? gmgn.lpStatus ?? "unknown";
+  const lpStatus = resolveLpStatus({
+    gmgn: gmgn.lpStatus,
+    pumpGraduated: pumpfun.status === "ok" ? pumpfun.bondingCurveComplete : null,
+    deepestDexId: dexMarket?.dexId ?? null,
+    audit: auditLpStatus
+  });
   const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : sellQuote !== null ? { ok: true, slippagePct: sellQuote.priceImpactPct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
   const hasMarket = dexMarket !== null || gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== "unknown";
   const market = hasMarket ? {
@@ -2663,7 +3133,7 @@ function snapshotOf(entry) {
   };
 }
 async function watchToken(address, symbol) {
-  if (!BASE58_RE3.test(address)) return { ok: false, error: "Not a valid Solana address." };
+  if (!BASE58_RE4.test(address)) return { ok: false, error: "Not a valid Solana address." };
   const list = await loadWatchlist();
   if (list.some((w) => w.address === address)) return { ok: true, watchlist: list };
   if (list.length >= WATCHLIST.maxCoins) {
@@ -2745,11 +3215,17 @@ async function sweepWatchlist() {
 }
 function ensureWatchAlarm() {
   chrome.alarms.create("ck-watch", { periodInMinutes: WATCHLIST.pollMinutes });
+  if (LONG_HOLD.enabled && !MOCK_MODE) {
+    chrome.alarms.create("ck-radar", { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
+  }
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "ck-watch") {
     void sweepWatchlist();
     void recheckLedger();
+    void recheckLhLedger();
+  } else if (alarm.name === "ck-radar") {
+    void runRadarSweep();
   }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
@@ -2839,6 +3315,242 @@ function marketFromDex(dex) {
     buys1h: dex.buys1h,
     sells1h: dex.sells1h
   };
+}
+var RADAR_KEY = "ck:radar";
+var LH_HIST_KEY = "ck:lh-hist";
+var LH_LEDGER_KEY = "ck:lh-ledger";
+var lhCache = /* @__PURE__ */ new Map();
+var LH_CACHE_MS = 30 * 6e4;
+var candleCache = /* @__PURE__ */ new Map();
+var radarSweep = null;
+async function loadRadar() {
+  const d = await chrome.storage.local.get(RADAR_KEY);
+  const v = d[RADAR_KEY];
+  return { rows: v?.rows ?? [], sweptAt: v?.sweptAt ?? null, checked: v?.checked ?? 0, notified: v?.notified ?? [] };
+}
+async function getRadar(force) {
+  if (!LONG_HOLD.enabled) return { ok: false, error: "Long-hold radar disabled in config." };
+  if (MOCK_MODE) return { ok: false, error: "Long-hold radar needs live mode (MOCK_MODE=false)." };
+  const store = await loadRadar();
+  const stale = !store.sweptAt || Date.now() - store.sweptAt > LONG_HOLD.radarEveryMinutes * 6e4;
+  if ((force || stale) && !radarSweep) void runRadarSweep();
+  return { ok: true, rows: store.rows, sweptAt: store.sweptAt, sweeping: radarSweep !== null, checked: store.checked };
+}
+function runRadarSweep() {
+  if (radarSweep) return radarSweep;
+  radarSweep = doRadarSweep().catch((err) => console.warn("[CRYPTO-KING] radar sweep failed:", err)).finally(() => {
+    radarSweep = null;
+  });
+  return radarSweep;
+}
+async function doRadarSweep() {
+  if (!LONG_HOLD.enabled || MOCK_MODE) return;
+  const pools = await fetchRadarPools();
+  const store = await loadRadar();
+  const recent = new Map(store.rows.map((r) => [r.address, r.checkedAt]));
+  const now2 = Date.now();
+  const candidates = pools.filter((p) => {
+    const ageDays = p.createdMs ? (now2 - p.createdMs) / 864e5 : null;
+    if (ageDays === null || ageDays < LONG_HOLD.minAgeDays || ageDays > LONG_HOLD.radarMaxAgeDays) return false;
+    if ((p.liquidityUsd ?? 0) < LONG_HOLD.radarMinLiquidityUsd) return false;
+    const mc = p.marketCapUsd ?? 0;
+    if (mc < LONG_HOLD.radarMinMcapUsd || mc > LONG_HOLD.lateMcapUsd) return false;
+    if (p.volume24hUsd !== null && p.liquidityUsd && p.volume24hUsd / p.liquidityUsd > LONG_HOLD.washVolLiqRatio) return false;
+    const last = recent.get(p.mint);
+    return !last || now2 - last > LONG_HOLD.reassessHours * 36e5;
+  }).sort((a, b) => (b.buyers24h ?? 0) - (a.buyers24h ?? 0)).slice(0, LONG_HOLD.radarDeepChecksPerSweep);
+  const fresh = [];
+  for (const p of candidates) {
+    const res = await assessLongHoldFor(p.mint, p);
+    if (!res) continue;
+    fresh.push(radarRowOf(p.mint, res.symbol ?? p.name, res.result, res.mcap, res.liq));
+  }
+  const toNotify = [];
+  await withLock(RADAR_KEY, async () => {
+    const cur = await loadRadar();
+    const byMint = new Map(cur.rows.map((r) => [r.address, r]));
+    for (const r of fresh) byMint.set(r.address, r);
+    const rows = [...byMint.values()].filter((r) => now2 - r.checkedAt < 48 * 36e5).sort((a, b) => tierRank(a.tier) - tierRank(b.tier) || (b.score ?? -1) - (a.score ?? -1)).slice(0, LONG_HOLD.radarMaxRows);
+    const notified2 = new Set(cur.notified);
+    for (const r of fresh) {
+      if (r.tier === "CANDIDATE" && !notified2.has(r.address)) {
+        notified2.add(r.address);
+        toNotify.push(r);
+      }
+    }
+    await chrome.storage.local.set({
+      [RADAR_KEY]: {
+        rows,
+        sweptAt: now2,
+        checked: cur.checked + fresh.length,
+        notified: [...notified2].slice(-500)
+      }
+    });
+  });
+  for (const r of toNotify) {
+    const sym = r.symbol ?? `${r.address.slice(0, 4)}\u2026${r.address.slice(-4)}`;
+    chrome.notifications.create(`ck-lh-${r.address}`, {
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title: `\u{1F3D4} Long-hold candidate: ${sym} \u2014 Staying Power ${r.score ?? "?"}%`,
+      message: `${r.headline ?? "Passed the long-hold screen."} Has the traits survivors had \u2014 not a buy signal; size it to lose. Click to open.`
+    });
+  }
+}
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith("ck-lh-")) return;
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${id.slice("ck-lh-".length)}` });
+  chrome.notifications.clear(id);
+});
+var TIER_ORDER = ["CANDIDATE", "WATCH", "LATE", "TOO_EARLY", "WEAK", "NOT_A_HOLD", "NO_DATA"];
+var tierRank = (t) => TIER_ORDER.indexOf(t);
+function radarRowOf(address, symbol, r, mcap, liq) {
+  return {
+    address,
+    symbol,
+    name: null,
+    tier: r.tier,
+    score: r.score,
+    ageDays: r.ageDays,
+    marketCapUsd: mcap,
+    liquidityUsd: liq,
+    headline: r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? null,
+    checkedAt: Date.now()
+  };
+}
+var lhInFlight = /* @__PURE__ */ new Map();
+function assessLongHoldFor(address, hint) {
+  const pending = lhInFlight.get(address);
+  if (pending) return pending;
+  const job = doAssessLongHold(address, hint).finally(() => lhInFlight.delete(address));
+  lhInFlight.set(address, job);
+  return job;
+}
+var infoCache = /* @__PURE__ */ new Map();
+async function cachedTokenInfo(mint) {
+  const hit = infoCache.get(mint);
+  if (hit && Date.now() - hit.at < LH_CACHE_MS) return hit.v;
+  const v = await fetchTokenInfo(mint);
+  if (v !== null) {
+    if (infoCache.size > 300) infoCache.clear();
+    infoCache.set(mint, { v, at: Date.now() });
+  }
+  return v;
+}
+async function doAssessLongHold(address, hint) {
+  const hit = lhCache.get(address);
+  if (hit && Date.now() - hit.at < LH_CACHE_MS && !hint) {
+    return { result: hit.result, symbol: hit.symbol, mcap: null, liq: null };
+  }
+  const res = await analyzeToken(address, false);
+  if (!res.ok) return null;
+  const { analysis, risk } = res;
+  const dex = await fetchDexscreenerToken(address);
+  const pool = hint?.pool ?? dex?.pairAddress ?? null;
+  const [candles, poolStats, info] = await Promise.all([
+    pool ? cachedCandles(pool) : Promise.resolve(null),
+    hint ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
+    cachedTokenInfo(address)
+  ]);
+  const holderCount = analysis.holders?.holderCount ?? info?.holderCount ?? null;
+  const holderHistory = await recordHolderSnapshot(address, holderCount);
+  const ages = [
+    analysis.identity.ageMinutes !== null ? analysis.identity.ageMinutes / 1440 : null,
+    dex?.pairCreatedMs ? (Date.now() - dex.pairCreatedMs) / 864e5 : null,
+    hint?.createdMs ? (Date.now() - hint.createdMs) / 864e5 : null,
+    candles && candles.length ? (Date.now() / 1e3 - candles[0].t) / 86400 : null
+  ].filter((v) => v !== null && Number.isFinite(v) && v >= 0);
+  const so = analysis.socials;
+  const result = assessLongHold(analysis, risk, {
+    ageDays: ages.length ? Math.max(...ages) : null,
+    candles,
+    buyers24h: poolStats?.buyers24h ?? null,
+    sellers24h: poolStats?.sellers24h ?? null,
+    holderCount,
+    holderHistory,
+    socials: {
+      twitter: Boolean(so?.twitter || info?.twitter),
+      telegram: Boolean(so?.telegram || info?.telegram),
+      website: Boolean(so?.website || info?.website)
+    }
+  });
+  const symbol = analysis.identity.symbol;
+  lhCache.set(address, { result, symbol, at: Date.now() });
+  if (lhCache.size > 300) lhCache.clear();
+  const mcap = analysis.market?.marketCapEur ?? null;
+  await recordLhPrediction(address, symbol, result, mcap);
+  return { result, symbol, mcap, liq: analysis.market?.liquidityEur ?? null };
+}
+async function cachedCandles(pool) {
+  const hit = candleCache.get(pool);
+  if (hit && Date.now() - hit.at < LONG_HOLD.reassessHours * 36e5) return hit.k;
+  const k = await fetchDailyCandles(pool);
+  if (k !== null) {
+    if (candleCache.size > 300) candleCache.clear();
+    candleCache.set(pool, { k, at: Date.now() });
+  }
+  return k;
+}
+async function recordHolderSnapshot(mint, holderCount) {
+  return withLock(LH_HIST_KEY, async () => {
+    const d = await chrome.storage.local.get(LH_HIST_KEY);
+    const all = d[LH_HIST_KEY] ?? {};
+    const h = all[mint] ?? [];
+    const last = h[h.length - 1];
+    if (holderCount !== null && holderCount > 0 && (!last || Date.now() - last.at > 6 * 36e5)) {
+      h.push({ at: Date.now(), holderCount });
+      all[mint] = h.slice(-30);
+      const keys = Object.keys(all);
+      if (keys.length > 400) {
+        keys.sort((a, b) => (all[a].at(-1)?.at ?? 0) - (all[b].at(-1)?.at ?? 0)).slice(0, keys.length - 400).forEach((k) => delete all[k]);
+      }
+      await chrome.storage.local.set({ [LH_HIST_KEY]: all });
+    }
+    return all[mint] ?? h;
+  });
+}
+async function loadLhLedger() {
+  const d = await chrome.storage.local.get(LH_LEDGER_KEY);
+  return Array.isArray(d[LH_LEDGER_KEY]) ? d[LH_LEDGER_KEY] : [];
+}
+async function recordLhPrediction(address, symbol, r, mcap) {
+  if (!["CANDIDATE", "WATCH", "WEAK", "NOT_A_HOLD"].includes(r.tier) || mcap === null || mcap <= 0) return;
+  await withLock(LH_LEDGER_KEY, async () => {
+    const ledger = await loadLhLedger();
+    if (ledger.some((e) => e.address === address)) return;
+    ledger.unshift({ address, symbol, at: Date.now(), tier: r.tier, score: r.score, baselineMcap: mcap, outcomes: {} });
+    await chrome.storage.local.set({ [LH_LEDGER_KEY]: ledger.slice(0, 600) });
+  });
+}
+async function recheckLhLedger() {
+  if (!LONG_HOLD.enabled || MOCK_MODE) return;
+  const ledger = await loadLhLedger();
+  const due = [];
+  for (const e of ledger) {
+    for (const day of LONG_HOLD.ledgerCheckDays) {
+      if (!e.outcomes[String(day)] && Date.now() - e.at >= day * 864e5) due.push({ e, day });
+    }
+  }
+  if (due.length === 0) return;
+  const results = [];
+  for (const { e, day } of due.slice(0, 5)) {
+    const r = await lookupDexscreenerToken(e.address);
+    if (r.status === "error") continue;
+    const isDead = r.market === null || assessLiveState(marketFromDex(r.market)).state === "DEAD";
+    const mcap = r.market?.marketCapUsd ?? null;
+    results.push({ address: e.address, day, outcome: classifyOutcome(e.baselineMcap, mcap, isDead), mcap });
+  }
+  if (results.length === 0) return;
+  await withLock(LH_LEDGER_KEY, async () => {
+    const cur = await loadLhLedger();
+    for (const r of results) {
+      const e = cur.find((x) => x.address === r.address);
+      if (e && !e.outcomes[String(r.day)]) {
+        e.outcomes[String(r.day)] = { outcome: r.outcome, mcap: r.mcap, checkedAt: Date.now() };
+      }
+    }
+    await chrome.storage.local.set({ [LH_LEDGER_KEY]: cur });
+  });
 }
 async function loadRecent() {
   const data = await chrome.storage.local.get(RECENT_KEY);

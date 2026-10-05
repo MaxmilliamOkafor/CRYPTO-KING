@@ -24,6 +24,7 @@
 import { DISCLAIMER, EXIT_REALITY, INLINE_BADGES, LIVE_FEED, MOCK_MODE } from '../config.ts';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeBlurb, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
+import { LONG_HOLD_TIER_META } from '../lib/longHold.ts';
 import {
   matchFirst,
   MINT_HREF_RES,
@@ -39,6 +40,8 @@ import type {
   AnalyzeResponse,
   FeedRow,
   LiveFeedResponse,
+  LongHoldResponse,
+  RadarResponse,
   QualityResult,
   ResolvePairsResponse,
   RiskResult,
@@ -298,9 +301,10 @@ const STYLES = `
   .watch-btn:hover { border-color: #ffc83c; }
   .watch-btn:disabled { opacity: .7; cursor: default; }
   .panel { border-top: 1px solid #2c303a; margin-top: 10px; padding-top: 10px; max-height: 48vh; overflow-y: auto; }
-  .panel h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
+  .panel h4, .lh-box h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
   .panel h4:first-child { margin-top: 0; }
-  .panel li { list-style: none; padding: 2px 0; display: flex; gap: 6px; }
+  .panel li, .lh-box li { list-style: none; padding: 2px 0; display: flex; gap: 6px; font-size: 11px; }
+  .lh-box ul { padding: 0; }
   .pts { font-weight: 700; min-width: 30px; text-align: right; }
   .pts.bad { color: #ff8589; } .pts.good { color: #6fd08c; }
   .gap { color: #8a91a0; font-style: italic; }
@@ -352,6 +356,18 @@ const STYLES = `
   .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .lh-tier { font-size: 9.5px; font-weight: 800; letter-spacing: .03em; padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
+  .lh-box { margin-top: 10px; padding: 9px 10px; border: 1px solid #3a3320; border-radius: 9px; background: #17150f; }
+  .lh-box.muted { border-color: #2c303a; background: transparent; color: #8a91a0; font-size: 11px; }
+  .lh-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .lh-score { font-size: 18px; font-weight: 800; }
+  .lh-lead { font-size: 11.5px; margin: 5px 0 2px; color: #d8dbe2; }
+  .lh-box details summary { cursor: pointer; font-size: 11px; color: #7aa2ff; margin-top: 4px; }
+  .lh-pillar { margin-top: 8px; }
+  .lh-row { display: flex; justify-content: space-between; font-size: 11px; font-weight: 700; }
+  .lh-bar { height: 4px; background: #2c303a; border-radius: 3px; overflow: hidden; margin: 3px 0; }
+  .lh-bar > div { height: 100%; }
+  .lh-pillar ul { margin: 2px 0 0; }
   .scan-empty { color: #8a91a0; font-size: 11.5px; font-style: italic; padding: 4px; }
   /* live feed */
   .live-section { margin-bottom: 4px; }
@@ -467,6 +483,16 @@ function renderHome(): void {
       <div class="livelist"></div>
     </div>
 
+    <div class="scan-section radar-section">
+      <div class="scan-head">
+        <span class="t">🏔 Long-hold radar — coins that survived the rug window</span>
+        <button class="rescan radar-run" title="Deep-check the next batch now">↻ Scan</button>
+      </div>
+      <div class="grade-legend"><b>Staying Power %</b> — higher = more of the traits long-term survivors (PEPE, BONK, WIF) had early: survived 3+ days, fair distribution, burned LP, real unique buyers, higher lows after a crash. ~95% of coins still die; this improves odds, never guarantees them.</div>
+      <div class="radar-status">Loading radar…</div>
+      <div class="radar-box"></div>
+    </div>
+
     <div class="scan-section">
       <div class="scan-head"><span class="t">Scan a specific coin (Solana only)</span></div>
       <div class="scan-row">
@@ -562,6 +588,9 @@ function renderHome(): void {
   updateLiveList();
   refreshWatchlistBox();
   startLiveFeed();
+  body.querySelector('.radar-run')?.addEventListener('click', () => refreshRadarBox(true));
+  refreshRadarBox(false);
+  startRadarPoll();
 
   updateScanList();
   void scanPage(); // auto-scan the coins visible on this page
@@ -972,6 +1001,108 @@ function updateLiveList(): void {
 }
 
 /** Watched coins list on the home panel: current grade, liq drift, unwatch. */
+/* ── 🏔 Long-hold radar (home) + long-hold check (token card) ──────────── */
+
+let radarTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Re-read the radar list every minute while the home view is open (the
+ *  background sweeps on its own schedule; this just shows new results). */
+function startRadarPoll(): void {
+  if (radarTimer) return;
+  radarTimer = setInterval(() => {
+    if (view === 'home' && !collapsed) refreshRadarBox(false);
+  }, 60_000);
+}
+
+function refreshRadarBox(force: boolean): void {
+  const box = shadow?.querySelector<HTMLDivElement>('.radar-box');
+  const status = shadow?.querySelector<HTMLDivElement>('.radar-status');
+  if (!box || !status) return;
+  if (force) status.textContent = 'Deep-checking the next batch (takes ~30s — free API is rate-limited)…';
+  chrome.runtime.sendMessage({ type: force ? 'RUN_RADAR' : 'GET_RADAR' }, (res: RadarResponse | undefined) => {
+    if (chrome.runtime.lastError || !box.isConnected) return;
+    if (!res || !res.ok) {
+      status.textContent = res && !res.ok ? res.error : 'Radar unavailable.';
+      return;
+    }
+    const cands = res.rows.filter((r) => r.tier === 'CANDIDATE').length;
+    const ago = res.sweptAt ? ageShort((Date.now() - res.sweptAt) / 60_000) : null;
+    status.textContent =
+      (res.sweeping ? '⏳ sweeping now… · ' : '') +
+      `${res.rows.length} coins assessed · 🏔 ${cands} candidate${cands === 1 ? '' : 's'}` +
+      (ago ? ` · updated ${ago} ago` : ' · first sweep running');
+    if (res.rows.length === 0) {
+      box.innerHTML = `<div class="scan-empty">${res.sweeping ? 'First sweep in progress — results appear within a minute or two.' : 'No coins assessed yet — hit ↻ Scan.'}</div>`;
+      return;
+    }
+    box.innerHTML = res.rows
+      .map((r) => {
+        const tm = LONG_HOLD_TIER_META[r.tier];
+        const gc = gradeColors(r.score);
+        const meta = [r.ageDays !== null ? `${Math.floor(r.ageDays)}d old` : null, r.marketCapUsd !== null ? eurShort(r.marketCapUsd) : null]
+          .filter(Boolean)
+          .join(' · ');
+        return `
+          <div class="scan-item${r.tier === 'CANDIDATE' ? ' gem' : ''}" data-addr="${esc(r.address)}">
+            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${r.score === null ? '—' : `${r.score}%`}</span>
+            <span class="si-main">
+              <span class="si-sym">${esc(r.symbol ?? short(r.address))}<span class="lh-tier" style="background:${tm.color};color:${tm.textColor}">${esc(tm.label)}</span></span>
+              <span class="si-reason">${esc(meta)}${meta && r.headline ? ' · ' : ''}${esc(r.headline ?? '')}</span>
+            </span>
+            <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">⧉</button>
+          </div>`;
+      })
+      .join('');
+    wireRowHandlers(box);
+  });
+}
+
+/** Long-hold verdict inside the token card (loads after the main grade). */
+function renderLongHold(el: HTMLDivElement | null, address: string): void {
+  if (!el) return;
+  el.innerHTML = '<div class="lh-box muted">🏔 Long-hold check: loading price history…</div>';
+  chrome.runtime.sendMessage({ type: 'GET_LONGHOLD', address }, (res: LongHoldResponse | undefined) => {
+    if (chrome.runtime.lastError || !el.isConnected || currentAddress !== address) return;
+    if (!res || !res.ok) {
+      el.innerHTML = `<div class="lh-box muted">🏔 Long-hold check unavailable${res && !res.ok ? ` — ${esc(res.error)}` : ''}.</div>`;
+      return;
+    }
+    const r = res.result;
+    const tm = LONG_HOLD_TIER_META[r.tier];
+    const lead =
+      r.tier === 'TOO_EARLY'
+        ? `Only ${r.ageDays !== null ? `${Math.max(0, r.ageDays).toFixed(1)} days` : 'hours'} old — about 80% of launches die within 48h. Check back after day 3.`
+        : (r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? '');
+    const pillars = r.pillars
+      .map((p) => {
+        const pct = Math.round((p.score / p.max) * 100);
+        const notes = [
+          ...p.good.map((g) => `<li><span class="pts good">✓</span><span>${esc(g)}</span></li>`),
+          ...p.bad.map((b) => `<li><span class="pts bad">✗</span><span>${esc(b)}</span></li>`),
+          ...p.unknown.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`),
+        ].join('');
+        return `<div class="lh-pillar"><div class="lh-row"><span>${esc(p.label)}</span><span>${p.score}/${p.max}</span></div>
+          <div class="lh-bar"><div style="width:${pct}%;background:${gradeColors(pct).color}"></div></div><ul>${notes}</ul></div>`;
+      })
+      .join('');
+    const dq = r.disqualifiers.length
+      ? `<h4>⛔ Disqualified</h4><ul>${r.disqualifiers.map((d) => `<li><span class="pts bad">✗</span><span>${esc(d)}</span></li>`).join('')}</ul>`
+      : '';
+    el.innerHTML = `
+      <div class="lh-box">
+        <div class="lh-head">
+          <span class="lh-tier" style="background:${tm.color};color:${tm.textColor}">${esc(tm.label)}</span>
+          <span class="lh-score">${r.score === null ? '—' : `${r.score}%`}</span>
+          <span class="muted" style="font-size:10.5px">Staying Power · ${r.historyDays}d of price history</span>
+        </div>
+        <div class="lh-lead">${esc(lead)}</div>
+        <details><summary>Why — 6 pillars</summary>${dq}${pillars}
+          <div class="disclaimer">Built from what separated survivors from the ~95% that die. Even CANDIDATE coins often fail — size every position to lose it.</div>
+        </details>
+      </div>`;
+  });
+}
+
 function refreshWatchlistBox(): void {
   const box = shadow?.querySelector<HTMLDivElement>('.watchlist-box');
   if (!box) return;
@@ -1349,6 +1480,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
       <span class="muted" style="font-size:11px">${esc(gradeBlurb(kg.grade))}</span>
     </div>
     <div class="x-monitor"></div>
+    <div class="longhold"></div>
     <div class="panel" hidden></div>
     <div class="row" style="margin-top:10px">
       <button class="back-btn">← Scan another token</button>
@@ -1359,6 +1491,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   const copyBtn = body.querySelector<HTMLButtonElement>('.copy');
   copyBtn?.addEventListener('click', () => copyToClipboard(analysis.identity.address, copyBtn));
   renderXMonitor(body.querySelector<HTMLDivElement>('.x-monitor'), analysis);
+  renderLongHold(body.querySelector<HTMLDivElement>('.longhold'), analysis.identity.address);
   const watchBtn = body.querySelector<HTMLButtonElement>('.watch-btn');
   watchBtn?.addEventListener('click', () => {
     watchBtn.disabled = true;

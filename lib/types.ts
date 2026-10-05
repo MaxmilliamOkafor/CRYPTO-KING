@@ -12,6 +12,8 @@
  */
 
 /** Risk signal buckets. NOTE: CONSIDER/NEUTRAL mean "lower observed risk", never "buy". */
+import type { Outcome } from './outcomeLedger.ts';
+
 export type Signal = 'AVOID' | 'HIGH_RISK' | 'WATCH' | 'CONSIDER' | 'NEUTRAL';
 
 export type LpStatus =
@@ -276,6 +278,87 @@ export interface JournalEntry {
 }
 
 /** Messages between content script / popup / dashboard and the background worker. */
+/* ── 🏔 Long-hold radar ──────────────────────────────────────────────── */
+
+export type LongHoldTier = 'CANDIDATE' | 'WATCH' | 'WEAK' | 'TOO_EARLY' | 'LATE' | 'NOT_A_HOLD' | 'NO_DATA';
+
+export interface LongHoldPillar {
+  key: 'survival' | 'community' | 'distribution' | 'liquidity' | 'demand' | 'resilience';
+  label: string;
+  score: number;
+  max: number;
+  good: string[];
+  bad: string[];
+  /** Inputs that couldn't be verified (scored 0). */
+  unknown: string[];
+}
+
+/** "Staying Power" — could this be held for weeks/months? (lib/longHold.ts) */
+export interface LongHoldResult {
+  tier: LongHoldTier;
+  /** 0–100, higher = better. null when there is no data at all. */
+  score: number | null;
+  pillars: LongHoldPillar[];
+  /** Any one → NOT_A_HOLD, regardless of score. */
+  disqualifiers: string[];
+  strengths: string[];
+  concerns: string[];
+  unverified: string[];
+  /** Mint/freeze revoked, LP secured, distribution + 7d history all PROVEN. */
+  coreVerified: boolean;
+  ageDays: number | null;
+  historyDays: number;
+}
+
+/** One row of the long-hold radar list. */
+export interface RadarRow {
+  address: string;
+  symbol: string | null;
+  name: string | null;
+  tier: LongHoldTier;
+  score: number | null;
+  ageDays: number | null;
+  marketCapUsd: number | null;
+  liquidityUsd: number | null;
+  /** Best strength, or the reason it fails — one line for the list. */
+  headline: string | null;
+  checkedAt: number;
+}
+
+export type RadarResponse =
+  | { ok: true; rows: RadarRow[]; sweptAt: number | null; sweeping: boolean; checked: number }
+  | { ok: false; error: string };
+
+export type LongHoldResponse =
+  | { ok: true; result: LongHoldResult; symbol: string | null }
+  | { ok: false; error: string };
+
+/** Long-hold report card: did "candidates" actually hold up at 7d / 30d? */
+export interface LongHoldLedgerEntry {
+  address: string;
+  symbol: string | null;
+  at: number;
+  tier: LongHoldTier;
+  score: number | null;
+  baselineMcap: number;
+  /** Outcomes keyed by check day ("7", "30"). */
+  outcomes: Record<string, { outcome: Outcome; mcap: number | null; checkedAt: number }>;
+}
+
+export interface LongHoldAccuracyRow {
+  tier: LongHoldTier;
+  day: number;
+  checked: number;
+  survived: number;
+  winners: number;
+  /** Median market-cap multiple at that check (1 = flat). */
+  medianMultiple: number | null;
+}
+
+export type LongHoldAccuracyResponse =
+  | { ok: true; rows: LongHoldAccuracyRow[]; tracked: number }
+  | { ok: false; error: string };
+
 export type BgRequest =
   | {
       type: 'ANALYZE_TOKEN';
@@ -300,7 +383,14 @@ export type BgRequest =
   | { type: 'GET_SETTINGS' }
   | { type: 'SET_SETTINGS'; heliusKey?: string | null; xBearerToken?: string | null }
   | { type: 'CHECK_X'; symbol: string | null; address: string }
-  | { type: 'GET_ACCURACY' };
+  | { type: 'GET_ACCURACY' }
+  /** Long-hold radar list (sweeps in the background if stale). */
+  | { type: 'GET_RADAR' }
+  /** Force a radar sweep now. */
+  | { type: 'RUN_RADAR' }
+  /** Staying-power assessment for one coin (runs a full scan + history). */
+  | { type: 'GET_LONGHOLD'; address: string }
+  | { type: 'GET_LH_ACCURACY' };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; quality: QualityResult; mock: boolean }

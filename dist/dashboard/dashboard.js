@@ -52,6 +52,17 @@ function gradeColors(grade) {
   return { color: "#e5484d", textColor: "#ffffff" };
 }
 
+// lib/longHold.ts
+var LONG_HOLD_TIER_META = {
+  CANDIDATE: { label: "\u{1F3D4} LONG-HOLD CANDIDATE", color: "#d4a017", textColor: "#1b1b18" },
+  WATCH: { label: "\u{1F440} WATCH", color: "#46a758", textColor: "#ffffff" },
+  WEAK: { label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
+  TOO_EARLY: { label: "\u23F3 TOO EARLY", color: "#3a3f4c", textColor: "#e6e8ee" },
+  LATE: { label: "\u{1F4C8} ALREADY BIG", color: "#5b4bb7", textColor: "#ffffff" },
+  NOT_A_HOLD: { label: "\u26D4 NOT A HOLD", color: "#e5484d", textColor: "#ffffff" },
+  NO_DATA: { label: "NO DATA", color: "#3a3f4c", textColor: "#e6e8ee" }
+};
+
 // dashboard/dashboard.ts
 var JOURNAL_KEY = "ck:journal";
 var $ = (id) => document.getElementById(id);
@@ -74,7 +85,33 @@ document.addEventListener("DOMContentLoaded", () => {
   $("journal-form").addEventListener("submit", onJournalSubmit);
   void loadAll();
   loadAccuracy();
+  loadLongHoldAccuracy();
 });
+function loadLongHoldAccuracy() {
+  chrome.runtime.sendMessage({ type: "GET_LH_ACCURACY" }, (res) => {
+    const body = $("lh-body");
+    const note = $("lh-note");
+    if (!res || !res.ok) {
+      note.textContent = "Long-hold report card unavailable.";
+      return;
+    }
+    body.innerHTML = "";
+    for (const r of res.rows) {
+      const tr = document.createElement("tr");
+      const rate = document.createElement("td");
+      const pct = r.checked ? Math.round(r.survived / r.checked * 100) : null;
+      rate.className = pct === null ? "" : pct >= 50 ? "pnl-pos" : "pnl-neg";
+      rate.textContent = pct === null ? "\u2014" : `${pct}%`;
+      const mult = document.createElement("td");
+      mult.textContent = r.medianMultiple === null ? "\u2014" : `${r.medianMultiple.toFixed(2)}\xD7`;
+      if (r.medianMultiple !== null) mult.className = r.medianMultiple >= 1 ? "pnl-pos" : "pnl-neg";
+      tr.append(td(LONG_HOLD_TIER_META[r.tier].label), td(`${r.day}d`), td(String(r.checked)), td(String(r.survived)), td(String(r.winners)), rate, mult);
+      body.appendChild(tr);
+    }
+    const checked = res.rows.reduce((s, r) => s + r.checked, 0);
+    note.textContent = checked === 0 ? `${res.tracked} verdicts recorded \u2014 the first 7-day results arrive a week after the radar starts. Leave the browser running with the extension on.` : `${res.tracked} verdicts tracked \xB7 ${checked} checks completed.`;
+  });
+}
 function loadAccuracy() {
   chrome.runtime.sendMessage({ type: "GET_ACCURACY" }, (res) => {
     const body = $("accuracy-body");

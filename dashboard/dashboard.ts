@@ -11,7 +11,8 @@
 
 import { DISCLAIMER, MOCK_MODE } from '../config.ts';
 import { gradeColors as gradeColorsDash, gradeLabel as gradeLabelDash } from '../lib/kingGrade.ts';
-import type { AccuracyResponse, JournalEntry, RecentResponse, RecentToken } from '../lib/types.ts';
+import { LONG_HOLD_TIER_META } from '../lib/longHold.ts';
+import type { AccuracyResponse, JournalEntry, LongHoldAccuracyResponse, RecentResponse, RecentToken } from '../lib/types.ts';
 
 const JOURNAL_KEY = 'ck:journal';
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -38,7 +39,38 @@ document.addEventListener('DOMContentLoaded', () => {
 
   void loadAll();
   loadAccuracy();
+  loadLongHoldAccuracy();
 });
+
+/** The long-hold radar grading itself at 7 and 30 days. */
+function loadLongHoldAccuracy(): void {
+  chrome.runtime.sendMessage({ type: 'GET_LH_ACCURACY' }, (res: LongHoldAccuracyResponse | undefined) => {
+    const body = $('lh-body');
+    const note = $('lh-note');
+    if (!res || !res.ok) {
+      note.textContent = 'Long-hold report card unavailable.';
+      return;
+    }
+    body.innerHTML = '';
+    for (const r of res.rows) {
+      const tr = document.createElement('tr');
+      const rate = document.createElement('td');
+      const pct = r.checked ? Math.round((r.survived / r.checked) * 100) : null;
+      rate.className = pct === null ? '' : pct >= 50 ? 'pnl-pos' : 'pnl-neg';
+      rate.textContent = pct === null ? '—' : `${pct}%`;
+      const mult = document.createElement('td');
+      mult.textContent = r.medianMultiple === null ? '—' : `${r.medianMultiple.toFixed(2)}×`;
+      if (r.medianMultiple !== null) mult.className = r.medianMultiple >= 1 ? 'pnl-pos' : 'pnl-neg';
+      tr.append(td(LONG_HOLD_TIER_META[r.tier].label), td(`${r.day}d`), td(String(r.checked)), td(String(r.survived)), td(String(r.winners)), rate, mult);
+      body.appendChild(tr);
+    }
+    const checked = res.rows.reduce((s, r) => s + r.checked, 0);
+    note.textContent =
+      checked === 0
+        ? `${res.tracked} verdicts recorded — the first 7-day results arrive a week after the radar starts. Leave the browser running with the extension on.`
+        : `${res.tracked} verdicts tracked · ${checked} checks completed.`;
+  });
+}
 
 /** The scanner grading itself: were its predictions right? */
 function loadAccuracy(): void {

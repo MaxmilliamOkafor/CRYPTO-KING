@@ -14,9 +14,12 @@ import { computeKingGrade, gradeBlurb, gradeLabel } from '../lib/kingGrade.ts';
 import { matchFirst, MINT_HREF_RES, PAIR_HREF_RES, pairLinksAreSolana } from '../lib/linkTargets.ts';
 import { computeConcentration, effectiveTransferFeeBps, SYSTEM_PROGRAM, uiAmountOf } from '../lib/holderMath.ts';
 import { parseSellQuote, rawAmountFor } from '../lib/jupiterClient.ts';
+import { assessLongHold, holderGrowthPerDay, pricePath, type LongHoldInputs } from '../lib/longHold.ts';
+import { parseCandles, parsePools, parseTokenInfo, type Candle } from '../lib/geckoClient.ts';
+import { lpStatusFromLockedPct, resolveLpStatus } from '../lib/lpStatus.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
-import { classifyOutcome, computeAccuracy } from '../lib/outcomeLedger.ts';
+import { classifyOutcome, computeAccuracy, computeLongHoldAccuracy } from '../lib/outcomeLedger.ts';
 import { matchNarratives } from '../lib/narratives.ts';
 import { assessRugPotential } from '../lib/rugPotential.ts';
 import { scoreQuality } from '../lib/qualityScorer.ts';
@@ -764,6 +767,195 @@ test('AUDIT: Jupiter sell quote — fraction → percent, no route → unknown (
   assert.equal(rawAmountFor(100, 0, 6), null);
   // 18 decimals must not overflow into exponent notation.
   assert.match(rawAmountFor(1, 1, 18)!, /^1000000000000000000$/);
+});
+
+/* ── 🏔 Long-hold radar ("staying power") ─────────────────────────────── */
+
+const DAY = 86_400;
+function mkCandles(closes: number[], vol = 120_000): Candle[] {
+  return closes.map((c, i) => ({ t: 1_700_000_000 + i * DAY, o: i ? closes[i - 1] : c, h: c * 1.05, l: c * 0.95, c, v: vol }));
+}
+// Pumped 5×, crashed 67%, then recovered with steady higher lows — the shape
+// every long-term survivor has (BONK fell 96% and came back).
+const SURVIVOR = mkCandles([
+  1, 1.5, 2.2, 3, 4, 5, 4.8, 4, 3, 2.2, 1.8, 1.9, 2.1, 2.3, 2.4,
+  2.6, 2.8, 3.0, 3.1, 3.3, 3.4, 3.5, 3.7, 3.8, 3.9, 4.0, 4.1, 4.2, 4.3, 4.4,
+]);
+const goodInputs = (over: Partial<LongHoldInputs> = {}): LongHoldInputs => ({
+  ageDays: 30,
+  candles: SURVIVOR,
+  buyers24h: 600,
+  sellers24h: 400,
+  holderCount: 18_200,
+  holderHistory: [
+    { at: 0, holderCount: 10_000 },
+    { at: 2 * 86_400_000, holderCount: 10_500 },
+  ],
+  socials: { twitter: true, telegram: true, website: true },
+  ...over,
+});
+const lh = (a: TokenAnalysis, x: LongHoldInputs) => assessLongHold(a, scoreToken(a), x);
+const survivorCoin = (): TokenAnalysis => {
+  const t = structuredClone(FIXTURE_NEUTRAL);
+  t.holders = { ...t.holders!, devHoldsPct: 0.4, largestNonLpWalletPct: 1.8, top10Pct: 18 };
+  t.market = { ...t.market!, volume24hEur: 180_000 }; // 0.7× liquidity — healthy
+  return t;
+};
+
+test('LONG-HOLD: a battle-tested survivor with fair distribution is a CANDIDATE', () => {
+  const r = lh(survivorCoin(), goodInputs());
+  assert.equal(r.tier, 'CANDIDATE', `score ${r.score}, dq ${r.disqualifiers.join(' | ')}`);
+  assert.ok(r.score! >= 70);
+  assert.equal(r.coreVerified, true);
+  assert.ok(r.strengths.some((x) => /shakeout/.test(x)), 'credits surviving the crash');
+  assert.ok(r.strengths.some((x) => /higher lows/.test(x)));
+  assert.ok(r.strengths.some((x) => /17×/.test(x)), 'credits full social presence');
+  const total = r.pillars.reduce((s, p) => s + p.max, 0);
+  assert.equal(total, 100, 'pillars must sum to 100');
+});
+
+test('LONG-HOLD: under 3 days old is TOO EARLY — ~80% of launches die in 48h', () => {
+  const r = lh(survivorCoin(), goodInputs({ ageDays: 1.5 }));
+  assert.equal(r.tier, 'TOO_EARLY');
+});
+
+test('LONG-HOLD: wash trading (volume 30× liquidity) disqualifies, whatever the score', () => {
+  const t = survivorCoin();
+  t.market = { ...t.market!, volume24hEur: t.market!.liquidityEur! * 30 };
+  const r = lh(t, goodInputs());
+  assert.equal(r.tier, 'NOT_A_HOLD');
+  assert.ok(r.disqualifiers.some((d) => /wash-traded/.test(d)));
+});
+
+test('LONG-HOLD: a death spiral (90%+ down, still lower lows) is not a hold', () => {
+  const closes = Array.from({ length: 30 }, (_, i) => 10 * 0.9 ** i); // steady bleed to ~4% of ATH
+  const r = lh(survivorCoin(), goodInputs({ candles: mkCandles(closes) }));
+  assert.equal(r.tier, 'NOT_A_HOLD');
+  assert.ok(r.disqualifiers.some((d) => /Death spiral/.test(d)));
+});
+
+test('LONG-HOLD: a whale, a dev bag or live mint authority each disqualify', () => {
+  const whale = survivorCoin();
+  whale.holders = { ...whale.holders!, largestNonLpWalletPct: 8 };
+  assert.equal(lh(whale, goodInputs()).tier, 'NOT_A_HOLD');
+  const dev = survivorCoin();
+  dev.holders = { ...dev.holders!, devHoldsPct: 9 };
+  assert.equal(lh(dev, goodInputs()).tier, 'NOT_A_HOLD');
+  const mint = survivorCoin();
+  mint.mint = { ...mint.mint!, mintAuthorityActive: true };
+  assert.equal(lh(mint, goodInputs()).tier, 'NOT_A_HOLD');
+});
+
+test('LONG-HOLD: artificial pump (+300% on thin volume) is called out and scored down', () => {
+  const pumped = survivorCoin();
+  pumped.market = { ...pumped.market!, priceChange24h: 300, volume24hEur: pumped.market!.liquidityEur! * 0.05 };
+  const r = lh(pumped, goodInputs());
+  assert.ok(r.concerns.some((c) => /artificial price inflation/.test(c)));
+  const clean = lh(survivorCoin(), goodInputs());
+  const dm = (x: typeof r) => x.pillars.find((p) => p.key === 'demand')!.score;
+  assert.ok(dm(r) < dm(clean));
+});
+
+test('LONG-HOLD: missing data can never produce a CANDIDATE', () => {
+  const t = survivorCoin();
+  t.holders = null;
+  const r = lh(t, goodInputs({ candles: null, holderCount: null, buyers24h: null, sellers24h: null, holderHistory: [] }));
+  assert.notEqual(r.tier, 'CANDIDATE');
+  assert.equal(r.coreVerified, false);
+  assert.ok(r.unverified.length >= 5);
+});
+
+test('LONG-HOLD: a $500M coin is ALREADY BIG, not early', () => {
+  const big = survivorCoin();
+  big.market = { ...big.market!, marketCapEur: 500_000_000, liquidityEur: 20_000_000, volume24hEur: 10_000_000 };
+  assert.equal(lh(big, goodInputs()).tier, 'LATE');
+});
+
+test('LONG-HOLD maths: drawdown/recovery, holder growth', () => {
+  const p = pricePath(SURVIVOR);
+  near(Math.round(p.maxDrawdown * 100) / 100, 0.67);
+  assert.ok(p.recoveryFromLow > 2.5 && p.recoveryFromLow < 2.6);
+  near(holderGrowthPerDay([{ at: 0, holderCount: 1000 }, { at: 2 * 86_400_000, holderCount: 1100 }])!, 5);
+  assert.equal(holderGrowthPerDay([{ at: 0, holderCount: 1000 }]), null); // one point is not a trend
+  assert.equal(holderGrowthPerDay([{ at: 0, holderCount: 1000 }, { at: 3_600_000, holderCount: 2000 }]), null); // < ~1 day
+});
+
+test('GeckoTerminal parsers: candles sorted oldest-first, bad rows dropped, tokens & pools mapped', () => {
+  const k = parseCandles({
+    data: { attributes: { ohlcv_list: [[300, 1, 2, 1, 2, 10], [100, 1, 1, 1, 1, 5], [200, 0, 0, 0, 0, 0], ['x']] } },
+  })!;
+  assert.deepEqual(k.map((c) => c.t), [100, 300]);
+  assert.equal(parseCandles({ data: {} }), null);
+
+  const mint = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
+  const pools = parsePools({
+    data: [
+      {
+        attributes: {
+          address: '8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj',
+          name: 'BONK / SOL',
+          pool_created_at: '2023-01-01T00:00:00Z',
+          reserve_in_usd: '5000000',
+          market_cap_usd: null,
+          fdv_usd: '1500000000',
+          volume_usd: { h24: '2000000' },
+          transactions: { h24: { buys: 900, sells: 800, buyers: 450, sellers: 380 } },
+        },
+        relationships: { base_token: { data: { id: `solana_${mint}` } } },
+      },
+      { attributes: { address: 'x' }, relationships: { base_token: { data: { id: 'solana_So11111111111111111111111111111111111111112' } } } },
+    ],
+  });
+  assert.equal(pools.length, 1, 'wSOL is never a meme candidate');
+  assert.equal(pools[0].mint, mint);
+  assert.equal(pools[0].marketCapUsd, 1_500_000_000, 'falls back to FDV when market cap is null');
+  assert.equal(pools[0].buyers24h, 450);
+
+  const info = parseTokenInfo({ data: { attributes: { holders: { count: 47911 }, twitter_handle: '@bonk_inu', telegram_handle: null, websites: ['https://bonkcoin.com'] } } })!;
+  assert.equal(info.holderCount, 47911);
+  assert.equal(info.twitter, 'https://x.com/bonk_inu');
+  assert.equal(info.telegram, null);
+});
+
+test('LONG-HOLD report card: survival, winners and median multiple per verdict and horizon', () => {
+  const e = (tier: 'CANDIDATE' | 'WEAK', mcap7: number | null, o7: 'WINNER' | 'SURVIVED' | 'RUGGED' | 'FADED') => ({
+    address: Math.random().toString(),
+    symbol: null,
+    at: 0,
+    tier,
+    score: 70,
+    baselineMcap: 1_000_000,
+    outcomes: { '7': { outcome: o7, mcap: mcap7, checkedAt: 1 } },
+  });
+  const rows = computeLongHoldAccuracy(
+    [e('CANDIDATE', 3_000_000, 'WINNER'), e('CANDIDATE', 1_000_000, 'SURVIVED'), e('CANDIDATE', null, 'RUGGED'), e('WEAK', 100_000, 'RUGGED')],
+    [7, 30],
+  );
+  const c7 = rows.find((r) => r.tier === 'CANDIDATE' && r.day === 7)!;
+  assert.equal(c7.checked, 3);
+  assert.equal(c7.survived, 2);
+  assert.equal(c7.winners, 1);
+  assert.equal(c7.medianMultiple, 1); // [0 (rugged), 1, 3] → 1
+  assert.equal(rows.find((r) => r.tier === 'CANDIDATE' && r.day === 30)!.checked, 0); // not due yet
+  assert.equal(rows.find((r) => r.tier === 'WEAK' && r.day === 7)!.survived, 0);
+});
+
+test('LP status off gmgn.ai: graduated pump.fun coins are protocol-burned; RugCheck fills the rest', () => {
+  const base = { gmgn: null, pumpGraduated: null, deepestDexId: null, audit: null };
+  // The gap: everywhere but gmgn.ai this was ALWAYS unknown (grade capped at 50%, no long-hold candidates).
+  assert.equal(resolveLpStatus(base), 'unknown');
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: 'pumpswap' }), 'burned');
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: 'raydium' }), 'burned');
+  // Graduated, but the deepest pool is a separate dev pool elsewhere → no assumption.
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: 'meteora' }), 'unknown');
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: false, deepestDexId: 'pumpswap' }), 'unknown');
+  assert.equal(resolveLpStatus({ ...base, audit: 'locked' }), 'locked');
+  // GMGN, when present, is the most specific source and wins.
+  assert.equal(resolveLpStatus({ ...base, gmgn: 'deployer_held', pumpGraduated: true, deepestDexId: 'pumpswap' }), 'deployer_held');
+  assert.equal(lpStatusFromLockedPct(99.5), 'locked');
+  assert.equal(lpStatusFromLockedPct(10), 'unlocked');
+  assert.equal(lpStatusFromLockedPct(70), null, 'ambiguous readings never become a hard "unlocked" verdict');
+  assert.equal(lpStatusFromLockedPct(null), null);
 });
 
 console.log(`\n${passed} tests passed.`);

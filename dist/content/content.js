@@ -93,7 +93,9 @@ var RATE_LIMITS_MS = {
   /** DexScreener publishes 300 req/min for its token/pair endpoints (=200ms);
    *  250ms stays under it. It drives the rug/dump checks, so it must not crawl
    *  at the 1.1s default. */
-  "api.dexscreener.com": 250
+  "api.dexscreener.com": 250,
+  /** GeckoTerminal's public limit is 30 calls/min → 2s; 2.1s keeps a margin. */
+  "api.geckoterminal.com": 2100
 };
 var FETCH_TIMEOUT_MS = 1e4;
 var CACHE_TTL_MS = 5 * 6e4;
@@ -397,64 +399,6 @@ function gradeColors(grade) {
   return { color: "#e5484d", textColor: "#ffffff" };
 }
 
-// lib/linkTargets.ts
-var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
-var MINT_HREF_RES = [
-  new RegExp(`/sol/token/(${BASE58})`),
-  // gmgn.ai
-  new RegExp(`/coin/(${BASE58})`),
-  // pump.fun
-  new RegExp(`solscan\\.io/token/(${BASE58})`),
-  new RegExp(`birdeye\\.so/token/(${BASE58})`)
-];
-var PAIR_HREF_RES = [
-  new RegExp(`/pair-explorer/(${BASE58})`),
-  // dextools, all chains
-  new RegExp(`dexscreener\\.com/solana/(${BASE58})`)
-];
-function matchFirst(res, href) {
-  for (const re of res) {
-    const m = href.match(re);
-    if (m) return m[1];
-  }
-  return null;
-}
-function pairLinksAreSolana(hostname, pathname) {
-  if (!hostname.endsWith("dextools.io")) return true;
-  return /(^|\/)solana(\/|$)/.test(pathname);
-}
-
-// lib/exitReality.ts
-function assessExitReality(market, mint, t = EXIT_REALITY) {
-  const liquidity = market?.liquidityEur ?? null;
-  const feePct = mint?.transferFeeBps != null ? mint.transferFeeBps / 100 : mint?.isToken2022 === false ? 0 : null;
-  if (liquidity === null || liquidity <= 0) {
-    return {
-      maxGentleUsd: null,
-      maxToleratedUsd: null,
-      refPositionImpactPct: null,
-      transferFeePct: feePct,
-      note: "Liquidity unknown \u2014 exit cost cannot be estimated. Assume you may not get out cleanly."
-    };
-  }
-  const reserve = liquidity / 2;
-  const maxFor = (impact) => reserve * impact / (1 - impact);
-  const maxGentleUsd = maxFor(t.gentleImpactPct / 100);
-  const maxToleratedUsd = maxFor(t.toleratedImpactPct / 100);
-  const ref = t.referencePositionUsd;
-  const rawImpact = ref / (ref + reserve) * 100;
-  const refPositionImpactPct = rawImpact + (feePct ?? 0);
-  let note;
-  if (maxGentleUsd < t.dangerouslyThinUsd) {
-    note = `Dangerously thin: even a $${Math.round(maxGentleUsd)} exit moves the price. You likely cannot sell a real position without collapsing it.`;
-  } else if (refPositionImpactPct > t.toleratedImpactPct) {
-    note = `A $${ref} position would cost ~${refPositionImpactPct.toFixed(1)}% to exit. Size down to ~$${Math.round(maxToleratedUsd)} or less.`;
-  } else {
-    note = `A $${ref} position exits at ~${refPositionImpactPct.toFixed(1)}% cost. Rough ceiling before it hurts: ~$${Math.round(maxToleratedUsd)}.`;
-  }
-  return { maxGentleUsd, maxToleratedUsd, refPositionImpactPct, transferFeePct: feePct, note };
-}
-
 // lib/rugPotential.ts
 function assessRugPotential(a, risk) {
   const hard = [];
@@ -512,6 +456,75 @@ var RUG_VERDICT_META = {
   LOW: { color: "#2e5a3c", textColor: "#c9f0d4", label: "RUG VECTORS: none found (\u2260 safe)" },
   UNVERIFIED: { color: "#3a3f4c", textColor: "#e6e8ee", label: "RUG CHECK: not fully verified yet" }
 };
+
+// lib/longHold.ts
+var LONG_HOLD_TIER_META = {
+  CANDIDATE: { label: "\u{1F3D4} LONG-HOLD CANDIDATE", color: "#d4a017", textColor: "#1b1b18" },
+  WATCH: { label: "\u{1F440} WATCH", color: "#46a758", textColor: "#ffffff" },
+  WEAK: { label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
+  TOO_EARLY: { label: "\u23F3 TOO EARLY", color: "#3a3f4c", textColor: "#e6e8ee" },
+  LATE: { label: "\u{1F4C8} ALREADY BIG", color: "#5b4bb7", textColor: "#ffffff" },
+  NOT_A_HOLD: { label: "\u26D4 NOT A HOLD", color: "#e5484d", textColor: "#ffffff" },
+  NO_DATA: { label: "NO DATA", color: "#3a3f4c", textColor: "#e6e8ee" }
+};
+
+// lib/linkTargets.ts
+var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
+var MINT_HREF_RES = [
+  new RegExp(`/sol/token/(${BASE58})`),
+  // gmgn.ai
+  new RegExp(`/coin/(${BASE58})`),
+  // pump.fun
+  new RegExp(`solscan\\.io/token/(${BASE58})`),
+  new RegExp(`birdeye\\.so/token/(${BASE58})`)
+];
+var PAIR_HREF_RES = [
+  new RegExp(`/pair-explorer/(${BASE58})`),
+  // dextools, all chains
+  new RegExp(`dexscreener\\.com/solana/(${BASE58})`)
+];
+function matchFirst(res, href) {
+  for (const re of res) {
+    const m = href.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+function pairLinksAreSolana(hostname, pathname) {
+  if (!hostname.endsWith("dextools.io")) return true;
+  return /(^|\/)solana(\/|$)/.test(pathname);
+}
+
+// lib/exitReality.ts
+function assessExitReality(market, mint, t = EXIT_REALITY) {
+  const liquidity = market?.liquidityEur ?? null;
+  const feePct = mint?.transferFeeBps != null ? mint.transferFeeBps / 100 : mint?.isToken2022 === false ? 0 : null;
+  if (liquidity === null || liquidity <= 0) {
+    return {
+      maxGentleUsd: null,
+      maxToleratedUsd: null,
+      refPositionImpactPct: null,
+      transferFeePct: feePct,
+      note: "Liquidity unknown \u2014 exit cost cannot be estimated. Assume you may not get out cleanly."
+    };
+  }
+  const reserve = liquidity / 2;
+  const maxFor = (impact) => reserve * impact / (1 - impact);
+  const maxGentleUsd = maxFor(t.gentleImpactPct / 100);
+  const maxToleratedUsd = maxFor(t.toleratedImpactPct / 100);
+  const ref = t.referencePositionUsd;
+  const rawImpact = ref / (ref + reserve) * 100;
+  const refPositionImpactPct = rawImpact + (feePct ?? 0);
+  let note;
+  if (maxGentleUsd < t.dangerouslyThinUsd) {
+    note = `Dangerously thin: even a $${Math.round(maxGentleUsd)} exit moves the price. You likely cannot sell a real position without collapsing it.`;
+  } else if (refPositionImpactPct > t.toleratedImpactPct) {
+    note = `A $${ref} position would cost ~${refPositionImpactPct.toFixed(1)}% to exit. Size down to ~$${Math.round(maxToleratedUsd)} or less.`;
+  } else {
+    note = `A $${ref} position exits at ~${refPositionImpactPct.toFixed(1)}% cost. Rough ceiling before it hurts: ~$${Math.round(maxToleratedUsd)}.`;
+  }
+  return { maxGentleUsd, maxToleratedUsd, refPositionImpactPct, transferFeePct: feePct, note };
+}
 
 // lib/http.ts
 function rateLimitFor(host2) {
@@ -995,9 +1008,10 @@ var STYLES = `
   .watch-btn:hover { border-color: #ffc83c; }
   .watch-btn:disabled { opacity: .7; cursor: default; }
   .panel { border-top: 1px solid #2c303a; margin-top: 10px; padding-top: 10px; max-height: 48vh; overflow-y: auto; }
-  .panel h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
+  .panel h4, .lh-box h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #9aa1af; margin: 8px 0 4px; }
   .panel h4:first-child { margin-top: 0; }
-  .panel li { list-style: none; padding: 2px 0; display: flex; gap: 6px; }
+  .panel li, .lh-box li { list-style: none; padding: 2px 0; display: flex; gap: 6px; font-size: 11px; }
+  .lh-box ul { padding: 0; }
   .pts { font-weight: 700; min-width: 30px; text-align: right; }
   .pts.bad { color: #ff8589; } .pts.good { color: #6fd08c; }
   .gap { color: #8a91a0; font-style: italic; }
@@ -1049,6 +1063,18 @@ var STYLES = `
   .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .lh-tier { font-size: 9.5px; font-weight: 800; letter-spacing: .03em; padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
+  .lh-box { margin-top: 10px; padding: 9px 10px; border: 1px solid #3a3320; border-radius: 9px; background: #17150f; }
+  .lh-box.muted { border-color: #2c303a; background: transparent; color: #8a91a0; font-size: 11px; }
+  .lh-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .lh-score { font-size: 18px; font-weight: 800; }
+  .lh-lead { font-size: 11.5px; margin: 5px 0 2px; color: #d8dbe2; }
+  .lh-box details summary { cursor: pointer; font-size: 11px; color: #7aa2ff; margin-top: 4px; }
+  .lh-pillar { margin-top: 8px; }
+  .lh-row { display: flex; justify-content: space-between; font-size: 11px; font-weight: 700; }
+  .lh-bar { height: 4px; background: #2c303a; border-radius: 3px; overflow: hidden; margin: 3px 0; }
+  .lh-bar > div { height: 100%; }
+  .lh-pillar ul { margin: 2px 0 0; }
   .scan-empty { color: #8a91a0; font-size: 11.5px; font-style: italic; padding: 4px; }
   /* live feed */
   .live-section { margin-bottom: 4px; }
@@ -1154,6 +1180,16 @@ function renderHome() {
       <div class="livelist"></div>
     </div>
 
+    <div class="scan-section radar-section">
+      <div class="scan-head">
+        <span class="t">\u{1F3D4} Long-hold radar \u2014 coins that survived the rug window</span>
+        <button class="rescan radar-run" title="Deep-check the next batch now">\u21BB Scan</button>
+      </div>
+      <div class="grade-legend"><b>Staying Power %</b> \u2014 higher = more of the traits long-term survivors (PEPE, BONK, WIF) had early: survived 3+ days, fair distribution, burned LP, real unique buyers, higher lows after a crash. ~95% of coins still die; this improves odds, never guarantees them.</div>
+      <div class="radar-status">Loading radar\u2026</div>
+      <div class="radar-box"></div>
+    </div>
+
     <div class="scan-section">
       <div class="scan-head"><span class="t">Scan a specific coin (Solana only)</span></div>
       <div class="scan-row">
@@ -1247,6 +1283,9 @@ function renderHome() {
   updateLiveList();
   refreshWatchlistBox();
   startLiveFeed();
+  body.querySelector(".radar-run")?.addEventListener("click", () => refreshRadarBox(true));
+  refreshRadarBox(false);
+  startRadarPoll();
   updateScanList();
   void scanPage();
 }
@@ -1524,6 +1563,85 @@ function updateLiveList() {
         </div>`;
   }).join("");
   wireRowHandlers(list);
+}
+var radarTimer = null;
+function startRadarPoll() {
+  if (radarTimer) return;
+  radarTimer = setInterval(() => {
+    if (view === "home" && !collapsed) refreshRadarBox(false);
+  }, 6e4);
+}
+function refreshRadarBox(force) {
+  const box = shadow?.querySelector(".radar-box");
+  const status = shadow?.querySelector(".radar-status");
+  if (!box || !status) return;
+  if (force) status.textContent = "Deep-checking the next batch (takes ~30s \u2014 free API is rate-limited)\u2026";
+  chrome.runtime.sendMessage({ type: force ? "RUN_RADAR" : "GET_RADAR" }, (res) => {
+    if (chrome.runtime.lastError || !box.isConnected) return;
+    if (!res || !res.ok) {
+      status.textContent = res && !res.ok ? res.error : "Radar unavailable.";
+      return;
+    }
+    const cands = res.rows.filter((r) => r.tier === "CANDIDATE").length;
+    const ago = res.sweptAt ? ageShort((Date.now() - res.sweptAt) / 6e4) : null;
+    status.textContent = (res.sweeping ? "\u23F3 sweeping now\u2026 \xB7 " : "") + `${res.rows.length} coins assessed \xB7 \u{1F3D4} ${cands} candidate${cands === 1 ? "" : "s"}` + (ago ? ` \xB7 updated ${ago} ago` : " \xB7 first sweep running");
+    if (res.rows.length === 0) {
+      box.innerHTML = `<div class="scan-empty">${res.sweeping ? "First sweep in progress \u2014 results appear within a minute or two." : "No coins assessed yet \u2014 hit \u21BB Scan."}</div>`;
+      return;
+    }
+    box.innerHTML = res.rows.map((r) => {
+      const tm = LONG_HOLD_TIER_META[r.tier];
+      const gc = gradeColors(r.score);
+      const meta = [r.ageDays !== null ? `${Math.floor(r.ageDays)}d old` : null, r.marketCapUsd !== null ? eurShort(r.marketCapUsd) : null].filter(Boolean).join(" \xB7 ");
+      return `
+          <div class="scan-item${r.tier === "CANDIDATE" ? " gem" : ""}" data-addr="${esc(r.address)}">
+            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${r.score === null ? "\u2014" : `${r.score}%`}</span>
+            <span class="si-main">
+              <span class="si-sym">${esc(r.symbol ?? short(r.address))}<span class="lh-tier" style="background:${tm.color};color:${tm.textColor}">${esc(tm.label)}</span></span>
+              <span class="si-reason">${esc(meta)}${meta && r.headline ? " \xB7 " : ""}${esc(r.headline ?? "")}</span>
+            </span>
+            <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
+          </div>`;
+    }).join("");
+    wireRowHandlers(box);
+  });
+}
+function renderLongHold(el, address) {
+  if (!el) return;
+  el.innerHTML = '<div class="lh-box muted">\u{1F3D4} Long-hold check: loading price history\u2026</div>';
+  chrome.runtime.sendMessage({ type: "GET_LONGHOLD", address }, (res) => {
+    if (chrome.runtime.lastError || !el.isConnected || currentAddress !== address) return;
+    if (!res || !res.ok) {
+      el.innerHTML = `<div class="lh-box muted">\u{1F3D4} Long-hold check unavailable${res && !res.ok ? ` \u2014 ${esc(res.error)}` : ""}.</div>`;
+      return;
+    }
+    const r = res.result;
+    const tm = LONG_HOLD_TIER_META[r.tier];
+    const lead = r.tier === "TOO_EARLY" ? `Only ${r.ageDays !== null ? `${Math.max(0, r.ageDays).toFixed(1)} days` : "hours"} old \u2014 about 80% of launches die within 48h. Check back after day 3.` : r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? "";
+    const pillars = r.pillars.map((p) => {
+      const pct = Math.round(p.score / p.max * 100);
+      const notes = [
+        ...p.good.map((g) => `<li><span class="pts good">\u2713</span><span>${esc(g)}</span></li>`),
+        ...p.bad.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`),
+        ...p.unknown.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`)
+      ].join("");
+      return `<div class="lh-pillar"><div class="lh-row"><span>${esc(p.label)}</span><span>${p.score}/${p.max}</span></div>
+          <div class="lh-bar"><div style="width:${pct}%;background:${gradeColors(pct).color}"></div></div><ul>${notes}</ul></div>`;
+    }).join("");
+    const dq = r.disqualifiers.length ? `<h4>\u26D4 Disqualified</h4><ul>${r.disqualifiers.map((d) => `<li><span class="pts bad">\u2717</span><span>${esc(d)}</span></li>`).join("")}</ul>` : "";
+    el.innerHTML = `
+      <div class="lh-box">
+        <div class="lh-head">
+          <span class="lh-tier" style="background:${tm.color};color:${tm.textColor}">${esc(tm.label)}</span>
+          <span class="lh-score">${r.score === null ? "\u2014" : `${r.score}%`}</span>
+          <span class="muted" style="font-size:10.5px">Staying Power \xB7 ${r.historyDays}d of price history</span>
+        </div>
+        <div class="lh-lead">${esc(lead)}</div>
+        <details><summary>Why \u2014 6 pillars</summary>${dq}${pillars}
+          <div class="disclaimer">Built from what separated survivors from the ~95% that die. Even CANDIDATE coins often fail \u2014 size every position to lose it.</div>
+        </details>
+      </div>`;
+  });
 }
 function refreshWatchlistBox() {
   const box = shadow?.querySelector(".watchlist-box");
@@ -1817,6 +1935,7 @@ function render(analysis, risk, quality, mock) {
       <span class="muted" style="font-size:11px">${esc(gradeBlurb(kg.grade))}</span>
     </div>
     <div class="x-monitor"></div>
+    <div class="longhold"></div>
     <div class="panel" hidden></div>
     <div class="row" style="margin-top:10px">
       <button class="back-btn">\u2190 Scan another token</button>
@@ -1826,6 +1945,7 @@ function render(analysis, risk, quality, mock) {
   const copyBtn = body.querySelector(".copy");
   copyBtn?.addEventListener("click", () => copyToClipboard(analysis.identity.address, copyBtn));
   renderXMonitor(body.querySelector(".x-monitor"), analysis);
+  renderLongHold(body.querySelector(".longhold"), analysis.identity.address);
   const watchBtn = body.querySelector(".watch-btn");
   watchBtn?.addEventListener("click", () => {
     watchBtn.disabled = true;

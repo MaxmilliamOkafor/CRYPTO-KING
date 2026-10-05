@@ -97,10 +97,15 @@ var GECKO = {
   baseUrl: "https://api.geckoterminal.com/api/v2",
   /** Daily candles to request per coin (max useful window for the pillars). */
   historyDays: 90,
-  /** Discovery lists for the long-hold radar (trending + most-traded Solana pools). */
+  /** Discovery lists for the radar. Short trending windows on purpose: the
+   *  24h-only list and the "most traded" list are dominated by coins that
+   *  already ran ($100M+, months old) — not what an early holder needs. */
   discoveryPaths: [
-    "/networks/solana/trending_pools?page=1",
-    "/networks/solana/pools?page=1&sort=h24_tx_count_desc"
+    "/networks/solana/trending_pools?duration=1h&page=1",
+    "/networks/solana/trending_pools?duration=6h&page=1",
+    "/networks/solana/trending_pools?duration=6h&page=2",
+    "/networks/solana/trending_pools?duration=24h&page=1",
+    "/networks/solana/trending_pools?duration=24h&page=2"
   ]
 };
 var EARLY_GEM = {
@@ -119,7 +124,7 @@ var EARLY_GEM = {
   /** Max coins followed at once (oldest dropped ones fall off first). */
   maxTracked: 40,
   /** Re-check cadence by stage (minutes). */
-  recheckMinutes: { SEED: 10, SPROUT: 30, ROOTED: 120, DROPPED: 360 },
+  recheckMinutes: { SEED: 5, SPROUT: 20, ROOTED: 60, DROPPED: 360 },
   /** Coins re-checked per tick (keeps the shared RPC budget sane). */
   checksPerTick: 6,
   /** Disqualifiers at launch. */
@@ -161,15 +166,26 @@ var LONG_HOLD = {
   suspiciousVolLiqRatio: 5,
   /** Close below this share of the all-time high WITH lower lows = death spiral. */
   deathSpiralAthShare: 0.1,
-  /** Radar sweep: how often, and how many new candidates to deep-check per sweep. */
-  radarEveryMinutes: 30,
+  /** Radar sweep: how often, and how many candidates get a full deep check
+   *  (full scan + price history + holders) per sweep. Everything else gets a
+   *  cheap quick screen (DexScreener, 30 coins per request). */
+  radarEveryMinutes: 1,
+  // CONSTANT: a tick every minute, panel open or not
   radarDeepChecksPerSweep: 4,
-  /** Radar candidate filters (applied before any deep check). */
-  radarMinLiquidityUsd: 4e4,
-  radarMinMcapUsd: 15e4,
-  radarMaxAgeDays: 365,
-  /** Keep this many assessed coins in the radar list. */
-  radarMaxRows: 40,
+  // ×60/h = 240 deep checks/hour within free API limits
+  /** Radar = YOUNG survivors at LOW caps: old/big coins already did their run.
+   *  1 day = past the first-48h kill zone's worst; coins < 3 days are judged
+   *  by early conviction, 3+ days by the long-hold screen. */
+  radarMinAgeDays: 1,
+  radarMaxAgeDays: 21,
+  radarMinLiquidityUsd: 25e3,
+  radarMinMcapUsd: 1e5,
+  radarMaxMcapUsd: 5e6,
+  /** Keep this many coins in the radar list (deep-checked + quick-screened). */
+  radarMaxRows: 80,
+  /** Launches the live feed has seen are remembered (newest N) and revisited
+   *  once they're old enough — the best source of young survivors. */
+  seenLaunchesMax: 4e3,
   /** Re-assess a radar coin after this long. */
   reassessHours: 6,
   /** Outcome checks for the long-hold report card. */
@@ -185,6 +201,9 @@ var DEXSCREENER = {
   enabled: true,
   /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
   latestProfilesUrl: "https://api.dexscreener.com/token-profiles/latest/v1",
+  /** Paid boosts (latest + most boosted). A team paying for promotion is still
+   *  active — a radar SOURCE only, never a score input (boosts can be bought). */
+  boostsUrls: ["https://api.dexscreener.com/token-boosts/latest/v1", "https://api.dexscreener.com/token-boosts/top/v1"],
   /** Pair lookup — up to ~30 comma-joined pair addresses per call. */
   pairsUrl: "https://api.dexscreener.com/latest/dex/pairs/solana/{pairs}"
 };
@@ -764,6 +783,14 @@ async function fetchRadarPools() {
   }
   return [...byMint.values()];
 }
+async function fetchNewPools(pages = 2) {
+  if (MOCK_MODE || !GECKO.enabled) return [];
+  const out = [];
+  for (let page = 1; page <= pages; page++) {
+    out.push(...parsePools(await fetchJson(`${GECKO.baseUrl}/networks/solana/new_pools?page=${page}`)));
+  }
+  return out;
+}
 var NOT_MEMES = /* @__PURE__ */ new Set([
   "So11111111111111111111111111111111111111112",
   // wSOL
@@ -1084,6 +1111,60 @@ function fmtAge(h) {
   return h < 1 ? `${Math.round(h * 60)} min` : h < 48 ? `${h.toFixed(1)}h` : `${Math.floor(h / 24)} days`;
 }
 
+// lib/radarScreen.ts
+function quickScreen(m, ageDays, t = LONG_HOLD) {
+  const liq = m.liquidityUsd;
+  const mcap = m.marketCapUsd;
+  const fail = (reason, dead = false) => ({ pass: false, dead, reason, rank: 0, headline: reason });
+  const live = assessLiveState({
+    priceEur: m.priceUsd,
+    marketCapEur: mcap,
+    liquidityEur: liq,
+    volume24hEur: m.volume24hUsd,
+    lpStatus: "unknown",
+    sellSimulation: null,
+    priceChange1h: m.priceChange1h,
+    priceChange6h: m.priceChange6h,
+    priceChange24h: m.priceChange24h,
+    buys1h: m.buys1h,
+    sells1h: m.sells1h
+  });
+  if (liq === null || liq < 5e3 || live.state === "DEAD") return fail("Dead \u2014 liquidity gone or price collapsed.", true);
+  if (ageDays === null) return fail("Age unknown.");
+  if (ageDays < t.radarMinAgeDays) return fail("Under a day old \u2014 the gem tracker covers launches.");
+  if (ageDays > t.radarMaxAgeDays) return fail(`${Math.floor(ageDays)} days old \u2014 past the early window.`);
+  if (mcap === null || mcap < t.radarMinMcapUsd) return fail("Market cap too small to trade safely.");
+  if (mcap > t.radarMaxMcapUsd) return fail("Already big \u2014 the early run is done.");
+  if (liq < t.radarMinLiquidityUsd) return fail("Liquidity too thin.");
+  if (liq / mcap < 0.03) return fail("Liquidity under 3% of cap \u2014 fragile.");
+  const vol = m.volume24hUsd;
+  if (vol !== null && vol / liq > t.washVolLiqRatio) return fail("Volume over 10\xD7 liquidity \u2014 wash trading.");
+  if (live.state === "DUMPING") return fail(`Dumping \u2014 ${live.reasons[0] ?? "falling hard."}`);
+  if (m.priceChange24h !== null && m.priceChange24h <= -50) return fail("Down 50%+ in 24h.");
+  const buys = m.buys1h ?? 0;
+  const sells = m.sells1h ?? 0;
+  const tx = buys + sells;
+  let rank = Math.min(30, Math.log10(1 + tx) * 12);
+  const buyShare = tx > 0 ? buys / tx : 0;
+  rank += buyShare >= 0.6 ? 20 : buyShare >= 0.5 ? 12 : buyShare >= 0.4 ? 5 : 0;
+  const depth = liq / mcap;
+  rank += depth >= 0.15 ? 20 : depth >= 0.1 ? 15 : depth >= 0.05 ? 8 : 0;
+  const h6 = m.priceChange6h ?? 0;
+  const h24 = m.priceChange24h ?? 0;
+  rank += h6 > 0 && h24 > 0 ? 15 : h24 > 0 ? 8 : 0;
+  rank += ageDays <= 7 ? 15 : ageDays <= 14 ? 10 : 5;
+  const headline = `${fmtAge2(ageDays)} \xB7 ${usd(mcap)} cap \xB7 ${usd(liq)} liq` + (tx > 0 ? ` \xB7 ${buys}/${sells} buys/sells 1h` : "") + (m.priceChange24h !== null ? ` \xB7 ${m.priceChange24h >= 0 ? "+" : ""}${m.priceChange24h.toFixed(0)}% 24h` : "");
+  return { pass: true, dead: false, reason: null, rank: Math.round(rank), headline };
+}
+function usd(v) {
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}k`;
+  return `$${v.toFixed(0)}`;
+}
+function fmtAge2(d) {
+  return d < 2 ? `${Math.round(d * 24)}h old` : `${Math.floor(d)}d old`;
+}
+
 // lib/rugPotential.ts
 function assessRugPotential(a, risk) {
   const hard = [];
@@ -1393,13 +1474,18 @@ function fmtDays(d) {
 
 // lib/lpStatus.ts
 var PUMP_MIGRATION_DEXES = /* @__PURE__ */ new Set(["pumpswap", "raydium"]);
+var CURVE_DEXES = /* @__PURE__ */ new Set(["pumpfun", "moonshot", "launchlab"]);
+function onLaunchCurve(pumpGraduated, deepestDexId) {
+  if (pumpGraduated !== null) return !pumpGraduated;
+  return deepestDexId !== null && CURVE_DEXES.has(deepestDexId);
+}
 function resolveLpStatus(i) {
+  if (onLaunchCurve(i.pumpGraduated, i.deepestDexId)) return "unknown";
   if (i.gmgn && i.gmgn !== "unknown") return i.gmgn;
   if (i.pumpGraduated === true) {
     if (i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return "burned";
     if (i.deepestDexId === null) return i.audit === "unlocked" ? "unknown" : i.audit ?? "unknown";
   }
-  if (i.pumpGraduated === false) return "unknown";
   return i.audit ?? "unknown";
 }
 function lpStatusFromLockedPct(pct) {
@@ -1936,6 +2022,20 @@ async function fetchDexscreenerNewSolana(limit) {
   }
   return out;
 }
+async function fetchDexscreenerBoostedSolana() {
+  if (MOCK_MODE || !DEXSCREENER.enabled) return [];
+  const out = /* @__PURE__ */ new Set();
+  for (const url of DEXSCREENER.boostsUrls) {
+    const json = await fetchJson(url);
+    const arr = Array.isArray(json) ? json : [];
+    for (const item of arr) {
+      if (asString(pick(item, ["chainId"])) !== "solana") continue;
+      const addr = asString(pick(item, ["tokenAddress"]));
+      if (addr && BASE58_RE3.test(addr)) out.add(addr);
+    }
+  }
+  return [...out];
+}
 
 // lib/gemCriteria.ts
 function gemBackgroundCheck(a, risk, quality) {
@@ -2063,7 +2163,7 @@ function computeKingGrade(a, risk, quality) {
   let ceiling = 100;
   const applyCap = (limit, why) => {
     if (limit < ceiling) ceiling = limit;
-    if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
+    if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
   const live = assessLiveState(a.market);
@@ -2080,15 +2180,14 @@ function computeKingGrade(a, risk, quality) {
   if (!gemBackgroundCheck(a, risk, quality).gem) {
     applyCap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
   }
-  let gradeF;
-  if (raw <= ceiling) {
-    gradeF = raw;
-  } else {
-    const band = Math.min(22, ceiling);
-    gradeF = ceiling - band + band * ((raw - ceiling) / (100 - ceiling));
-  }
-  const grade = Math.round(Math.min(ceiling, Math.max(0, gradeF)));
+  const grade = Math.round(Math.max(0, capCurve(raw, ceiling)));
   return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
+}
+function capCurve(raw, ceiling) {
+  if (ceiling >= 100) return raw;
+  const knee = ceiling * 0.7;
+  if (raw <= knee) return raw;
+  return knee + (ceiling - knee) * ((Math.min(raw, 100) - knee) / (100 - knee));
 }
 function gradeLabel(grade) {
   if (grade === null) return "NO DATA";
@@ -3186,6 +3285,7 @@ async function doLiveFeedSweep() {
       narratives: entry.analysis.narratives,
       twitter: entry.analysis.socials?.twitter ?? null,
       tracked: trackedMints.has(c.mint),
+      early: earlyForFeed(entry),
       insufficientData: entry.risk.insufficientData,
       unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()
@@ -3351,8 +3451,8 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
     deployerLinkedSelling: null,
     abnormalEarlyVolume: null
   } : null);
-  const symbol = gmgn.symbol ?? pumpfun.symbol;
-  const name = gmgn.name ?? pumpfun.name;
+  const symbol = gmgn.symbol ?? pumpfun.symbol ?? dexMarket?.symbol ?? null;
+  const name = gmgn.name ?? pumpfun.name ?? dexMarket?.name ?? null;
   return {
     identity: {
       address,
@@ -3372,6 +3472,10 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
     smartMoney: gmgn.smartMoney,
     // Only attest launch-platform facts from a live pump.fun response — the
     // mock path stays null so the fixture walkthrough arithmetic holds exactly.
+    // pump.fun's own data when we have it; otherwise, if DexScreener shows the
+    // coin trading ON a launchpad curve, still record that it's on the curve —
+    // so the curve rules (grade ceiling, dev-dump window) apply even when the
+    // pump.fun lookup failed, instead of the coin passing as an ordinary token.
     launch: pumpfun.status === "ok" ? {
       platform: "pumpfun",
       bondingCurveComplete: pumpfun.bondingCurveComplete,
@@ -3380,7 +3484,7 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
       curveProgressPct: pumpfun.curveProgressPct,
       athRatio: pumpfun.athRatio,
       kingOfTheHill: pumpfun.kingOfTheHill
-    } : null,
+    } : dexMarket?.dexId && onLaunchCurve(null, dexMarket.dexId) ? { platform: dexMarket.dexId === "pumpfun" ? "pumpfun" : null, bondingCurveComplete: false, bannedOnPlatform: null, replyCount: null } : null,
     sources,
     fetchedAt: Date.now()
   };
@@ -3537,7 +3641,7 @@ function ensureWatchAlarm() {
     chrome.alarms.create("ck-radar", { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
   }
   if (EARLY_GEM.enabled && !MOCK_MODE) {
-    chrome.alarms.create("ck-gems", { periodInMinutes: Math.min(...Object.values(EARLY_GEM.recheckMinutes)) });
+    chrome.alarms.create("ck-gems", { periodInMinutes: 1 });
   }
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -3549,7 +3653,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void runRadarSweep();
   } else if (alarm.name === "ck-gems") {
     void runGemTick();
-    if (Date.now() - lastFeedSweepAt > 5 * 6e4) void getLiveFeed();
+    if (Date.now() - lastFeedSweepAt > 55e3) void getLiveFeed();
   }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
@@ -3647,18 +3751,21 @@ var LH_LEDGER_KEY = "ck:lh-ledger";
 var LH_CACHE_MS = 30 * 6e4;
 var candleCache = /* @__PURE__ */ new Map();
 var radarSweep = null;
+var radarTicks = 0;
 async function loadRadar() {
   const d = await chrome.storage.local.get(RADAR_KEY);
   const v = d[RADAR_KEY];
-  return { rows: v?.rows ?? [], sweptAt: v?.sweptAt ?? null, checked: v?.checked ?? 0, notified: v?.notified ?? [] };
+  const rows = (v?.rows ?? []).filter((r) => r.kind !== void 0);
+  return { rows, sweptAt: v?.sweptAt ?? null, checked: v?.checked ?? 0, notified: v?.notified ?? [] };
 }
 async function getRadar(force) {
-  if (!LONG_HOLD.enabled) return { ok: false, error: "Long-hold radar disabled in config." };
-  if (MOCK_MODE) return { ok: false, error: "Long-hold radar needs live mode (MOCK_MODE=false)." };
+  if (!LONG_HOLD.enabled) return { ok: false, error: "Radar disabled in config." };
+  if (MOCK_MODE) return { ok: false, error: "Radar needs live mode (MOCK_MODE=false)." };
   const store = await loadRadar();
-  const stale = !store.sweptAt || Date.now() - store.sweptAt > LONG_HOLD.radarEveryMinutes * 6e4;
+  const stale = !store.sweptAt || Date.now() - store.sweptAt > LONG_HOLD.radarEveryMinutes * 9e4;
   if ((force || stale) && !radarSweep) void runRadarSweep();
-  return { ok: true, rows: store.rows, sweptAt: store.sweptAt, sweeping: radarSweep !== null, checked: store.checked };
+  const seen = await loadSeen();
+  return { ok: true, rows: store.rows, sweptAt: store.sweptAt, sweeping: radarSweep !== null, watching: seen.size, checked: store.checked };
 }
 function runRadarSweep() {
   if (radarSweep) return radarSweep;
@@ -3667,81 +3774,196 @@ function runRadarSweep() {
   });
   return radarSweep;
 }
+var SEEN_KEY = "ck:seen";
+var seenMem = null;
+var seenLoading = null;
+function loadSeen() {
+  if (seenMem) return Promise.resolve(seenMem);
+  seenLoading ??= chrome.storage.local.get(SEEN_KEY).then((d) => {
+    seenMem ??= new Map(Object.entries(d[SEEN_KEY] ?? {}));
+    return seenMem;
+  });
+  return seenLoading;
+}
+async function saveSeen() {
+  if (!seenMem) return;
+  if (seenMem.size > LONG_HOLD.seenLaunchesMax) {
+    const drop = [...seenMem.entries()].sort((a, b) => (b[1].t ?? 0) - (a[1].t ?? 0)).slice(LONG_HOLD.seenLaunchesMax);
+    for (const [m] of drop) seenMem.delete(m);
+  }
+  await chrome.storage.local.set({ [SEEN_KEY]: Object.fromEntries(seenMem) });
+}
+function rememberLaunch(seen, mint, createdMs, symbol) {
+  const prev = seen.get(mint);
+  if (prev) {
+    if (prev.t === null && createdMs !== null) prev.t = createdMs;
+    return;
+  }
+  seen.set(mint, { t: createdMs, s: symbol, q: 0 });
+}
 async function doRadarSweep() {
   if (!LONG_HOLD.enabled || MOCK_MODE) return;
-  const pools = await fetchRadarPools();
-  const store = await loadRadar();
-  const recent = new Map(store.rows.map((r) => [r.address, r.checkedAt]));
+  const tick = radarTicks++;
   const now2 = Date.now();
-  const candidates = pools.filter((p) => {
-    const ageDays = p.createdMs ? (now2 - p.createdMs) / 864e5 : null;
-    if (ageDays === null || ageDays < LONG_HOLD.minAgeDays || ageDays > LONG_HOLD.radarMaxAgeDays) return false;
-    if ((p.liquidityUsd ?? 0) < LONG_HOLD.radarMinLiquidityUsd) return false;
-    const mc = p.marketCapUsd ?? 0;
-    if (mc < LONG_HOLD.radarMinMcapUsd || mc > LONG_HOLD.lateMcapUsd) return false;
-    if (p.volume24hUsd !== null && p.liquidityUsd && p.volume24hUsd / p.liquidityUsd > LONG_HOLD.washVolLiqRatio) return false;
-    const last = recent.get(p.mint);
-    return !last || now2 - last > LONG_HOLD.reassessHours * 36e5;
-  }).sort((a, b) => (b.buyers24h ?? 0) - (a.buyers24h ?? 0)).slice(0, LONG_HOLD.radarDeepChecksPerSweep);
-  const fresh = [];
-  for (const p of candidates) {
-    const res = await assessLongHoldFor(p.mint, p);
-    if (!res) continue;
-    fresh.push(radarRowOf(p.mint, res.symbol ?? p.name, res.result, res.mcap, res.liq));
+  const seen = await loadSeen();
+  for (const p of await fetchNewPools(2)) {
+    if ((p.liquidityUsd ?? 0) >= 15e3) rememberLaunch(seen, p.mint, p.createdMs, p.name);
+  }
+  const hints = /* @__PURE__ */ new Map();
+  if (tick % 3 === 0) {
+    for (const p of await fetchRadarPools()) {
+      hints.set(p.mint, p);
+      rememberLaunch(seen, p.mint, p.createdMs, p.name);
+    }
+    for (const m of [...await fetchDexscreenerBoostedSolana(), ...await fetchDexscreenerNewSolana(60)]) {
+      rememberLaunch(seen, m, null, null);
+    }
+  }
+  const store = await loadRadar();
+  const inWindow = (t) => t === null || (now2 - t) / 864e5 <= LONG_HOLD.radarMaxAgeDays + 1;
+  const rotation = [...seen.entries()].filter(([, v]) => inWindow(v.t) && (v.t === null || now2 - v.t >= (LONG_HOLD.radarMinAgeDays - 0.1) * 864e5)).sort((a, b) => a[1].q - b[1].q).slice(0, 300).map(([m]) => m);
+  const batch = [.../* @__PURE__ */ new Set([...store.rows.map((r) => r.address), ...rotation])];
+  await primeDexscreenerTokens(batch);
+  const quick = /* @__PURE__ */ new Map();
+  for (const mint of batch) {
+    const m = peekDexscreenerToken(mint);
+    if (m === void 0) continue;
+    const entry = seen.get(mint);
+    if (entry) entry.q = now2;
+    if (m === null) {
+      if (entry && entry.t !== null && now2 - entry.t > 2 * 864e5) seen.delete(mint);
+      continue;
+    }
+    const created = m.pairCreatedMs ?? entry?.t ?? null;
+    const ageDays = created !== null ? (now2 - created) / 864e5 : null;
+    if (entry && entry.t === null && created !== null) entry.t = created;
+    const qs = quickScreen(m, ageDays);
+    if (qs.dead || ageDays !== null && ageDays > LONG_HOLD.radarMaxAgeDays) seen.delete(mint);
+    if (qs.pass && ageDays !== null) quick.set(mint, { rank: qs.rank, headline: qs.headline, ageDays, m });
+  }
+  await saveSeen();
+  const prevRows = new Map(store.rows.map((r) => [r.address, r]));
+  const deepDue = [...quick.entries()].filter(([mint]) => {
+    const prev = prevRows.get(mint);
+    return !prev?.deepAt || now2 - prev.deepAt > LONG_HOLD.reassessHours * 36e5;
+  }).sort((a, b) => b[1].rank - a[1].rank).slice(0, LONG_HOLD.radarDeepChecksPerSweep);
+  const deep = /* @__PURE__ */ new Map();
+  const autoTrack = [];
+  for (const [mint, q] of deepDue) {
+    const hint = hints.get(mint) ?? {
+      mint,
+      pool: q.m.pairAddress ?? "",
+      name: q.m.symbol,
+      createdMs: now2 - q.ageDays * 864e5,
+      liquidityUsd: q.m.liquidityUsd,
+      marketCapUsd: q.m.marketCapUsd,
+      volume24hUsd: q.m.volume24hUsd,
+      buyers24h: null,
+      sellers24h: null
+    };
+    const out = await assessLongHoldFor(mint, hint.pool ? hint : void 0);
+    if (!out) continue;
+    const row = deepRowOf(mint, out, q.rank, q.ageDays);
+    deep.set(mint, row);
+    if (row.verdict === "CANDIDATE" || row.verdict === "STRONG") autoTrack.push({ mint, out });
   }
   const toNotify = [];
   await withLock(RADAR_KEY, async () => {
     const cur = await loadRadar();
-    const byMint = new Map(cur.rows.map((r) => [r.address, r]));
-    for (const r of fresh) byMint.set(r.address, r);
-    const rows = [...byMint.values()].filter((r) => now2 - r.checkedAt < 48 * 36e5).sort((a, b) => tierRank(a.tier) - tierRank(b.tier) || (b.score ?? -1) - (a.score ?? -1)).slice(0, LONG_HOLD.radarMaxRows);
+    const old = new Map(cur.rows.map((r) => [r.address, r]));
+    const rows = [];
+    for (const [mint, q] of quick) {
+      const d = deep.get(mint);
+      const prev = old.get(mint);
+      if (d) rows.push(d);
+      else if (prev && prev.kind === "deep") {
+        rows.push({ ...prev, rank: q.rank, ageDays: q.ageDays, marketCapUsd: q.m.marketCapUsd, liquidityUsd: q.m.liquidityUsd, checkedAt: now2 });
+      } else {
+        rows.push(quickRowOf(mint, q.m, q.rank, q.headline, q.ageDays));
+      }
+    }
+    for (const r of cur.rows) if (!quick.has(r.address) && !batch.includes(r.address) && now2 - r.checkedAt < 20 * 6e4) rows.push(r);
+    rows.sort(radarOrder);
     const notified2 = new Set(cur.notified);
-    for (const r of fresh) {
-      if (r.tier === "CANDIDATE" && !notified2.has(r.address)) {
+    for (const r of deep.values()) {
+      if ((r.verdict === "CANDIDATE" || r.verdict === "STRONG") && !notified2.has(r.address)) {
         notified2.add(r.address);
         toNotify.push(r);
       }
     }
     await chrome.storage.local.set({
       [RADAR_KEY]: {
-        rows,
+        rows: rows.slice(0, LONG_HOLD.radarMaxRows),
         sweptAt: now2,
-        checked: cur.checked + fresh.length,
-        notified: [...notified2].slice(-500)
+        checked: cur.checked + deep.size,
+        notified: [...notified2].slice(-1e3)
       }
     });
   });
+  for (const { mint, out } of autoTrack) await enlistGem(mint, out, "auto");
   for (const r of toNotify) {
     const sym = r.symbol ?? `${r.address.slice(0, 4)}\u2026${r.address.slice(-4)}`;
+    const what = r.verdict === "CANDIDATE" ? "Long-hold candidate" : "Strong young coin";
     chrome.notifications.create(`ck-lh-${r.address}`, {
       type: "basic",
       iconUrl: "icons/icon128.png",
-      title: `\u{1F3D4} Long-hold candidate: ${sym} \u2014 Staying Power ${r.score ?? "?"}%`,
-      message: `${r.headline ?? "Passed the long-hold screen."} Has the traits survivors had \u2014 not a buy signal; size it to lose. Click to open.`
+      title: `\u{1F3D4} ${what}: ${sym} \u2014 ${r.score ?? "?"}% at ${r.marketCapUsd !== null ? usdK(r.marketCapUsd) : "?"}`,
+      message: `${r.headline ?? "Passed every check."} Now tracked for you. Not a buy signal \u2014 size it to lose. Click to open.`
     });
   }
+}
+function radarOrder(a, b) {
+  const tierOf = (r) => r.kind === "deep" && r.passed ? r.verdict === "CANDIDATE" || r.verdict === "STRONG" ? 0 : 1 : r.kind === "quick" ? 2 : 3;
+  return tierOf(a) - tierOf(b) || (b.score ?? b.rank) - (a.score ?? a.rank);
+}
+function quickRowOf(mint, m, rank, headline, ageDays) {
+  return {
+    address: mint,
+    symbol: m.symbol,
+    name: m.name,
+    kind: "quick",
+    stage: stageForAge(ageDays * 24),
+    verdict: null,
+    score: null,
+    rank,
+    passed: true,
+    ageDays,
+    marketCapUsd: m.marketCapUsd,
+    liquidityUsd: m.liquidityUsd,
+    headline,
+    checkedAt: Date.now(),
+    deepAt: null
+  };
+}
+function deepRowOf(mint, out, rank, ageDays) {
+  const e = out.early;
+  const rooted = e.stage === "ROOTED";
+  const verdict = rooted ? out.result.tier : e.verdict;
+  const passed = rooted ? out.result.tier === "CANDIDATE" || out.result.tier === "WATCH" : e.verdict === "STRONG" || e.verdict === "PROMISING";
+  const src = rooted ? out.result : e;
+  return {
+    address: mint,
+    symbol: out.symbol,
+    name: out.analysis.identity.name,
+    kind: "deep",
+    stage: e.stage,
+    verdict,
+    score: rooted ? out.result.score : e.score,
+    rank,
+    passed,
+    ageDays,
+    marketCapUsd: out.mcap,
+    liquidityUsd: out.liq,
+    headline: passed ? src.strengths[0] ?? null : src.disqualifiers[0] ?? src.concerns[0] ?? null,
+    checkedAt: Date.now(),
+    deepAt: Date.now()
+  };
 }
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith("ck-lh-")) return;
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${id.slice("ck-lh-".length)}` });
   chrome.notifications.clear(id);
 });
-var TIER_ORDER = ["CANDIDATE", "WATCH", "LATE", "TOO_EARLY", "WEAK", "NOT_A_HOLD", "NO_DATA"];
-var tierRank = (t) => TIER_ORDER.indexOf(t);
-function radarRowOf(address, symbol, r, mcap, liq) {
-  return {
-    address,
-    symbol,
-    name: null,
-    tier: r.tier,
-    score: r.score,
-    ageDays: r.ageDays,
-    marketCapUsd: mcap,
-    liquidityUsd: liq,
-    headline: r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? null,
-    checkedAt: Date.now()
-  };
-}
 var lhInFlight = /* @__PURE__ */ new Map();
 var lhOutCache = /* @__PURE__ */ new Map();
 function assessLongHoldFor(address, hint, fresh = false) {
@@ -3772,7 +3994,8 @@ async function doAssessLongHold(address, hint, fresh = false) {
   const pool = hint?.pool ?? dex?.pairAddress ?? null;
   const [candles, poolStats, info] = await Promise.all([
     pool ? cachedCandles(pool) : Promise.resolve(null),
-    hint ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
+    // Unique buyers/sellers: from the discovery hint if it has them, else the pool.
+    hint && hint.buyers24h !== null ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
     // Holder counts drive "+N holders/hour" for tracked seeds — refresh faster then.
     cachedTokenInfo(address, fresh ? 15 * 6e4 : LH_CACHE_MS)
   ]);
@@ -3904,6 +4127,22 @@ async function getGems() {
     (a, b) => Number(a.status === "DROPPED") - Number(b.status === "DROPPED") || (b.lastMcap ?? 0) / b.spottedMcap - (a.lastMcap ?? 0) / a.spottedMcap
   );
   return { ok: true, gems: sorted, portfolio: computeGemPortfolio(gems, EARLY_GEM.reportHorizonsDays) };
+}
+function earlyForFeed(entry) {
+  const a = entry.analysis;
+  const e = assessEarlyGem(a, entry.risk, {
+    ageHours: a.identity.ageMinutes !== null ? a.identity.ageMinutes / 60 : null,
+    buyers24h: null,
+    sellers24h: null,
+    holderCount: a.holders?.holderCount ?? null,
+    history: [],
+    socials: { twitter: Boolean(a.socials?.twitter), telegram: Boolean(a.socials?.telegram), website: Boolean(a.socials?.website) }
+  });
+  return {
+    score: e.score,
+    verdict: e.verdict,
+    headline: e.disqualifiers[0] ?? e.strengths[0] ?? e.concerns[0] ?? null
+  };
 }
 var spotQueue = [];
 var spotConsidered = /* @__PURE__ */ new Map();

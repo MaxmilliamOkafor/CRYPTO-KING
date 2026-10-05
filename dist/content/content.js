@@ -80,6 +80,43 @@ var LIVE_FEED = {
    */
   safeMinGrade: 40
 };
+var EARLY_GEM = {
+  enabled: true,
+  /** Only coins at or below this market cap are spotted — "early" means early. */
+  maxSpotMcapUsd: 3e5,
+  /** Lite (feed) score needed before spending a full background check. */
+  prelimMinScore: 40,
+  /** Full-scan score needed to be added to the tracker. */
+  spotMinScore: 55,
+  /** Verdict cut-offs. */
+  strongScore: 65,
+  promisingScore: 45,
+  /** Full checks of new launches per feed sweep (run in the background). */
+  fullChecksPerSweep: 2,
+  /** Max coins followed at once (oldest dropped ones fall off first). */
+  maxTracked: 40,
+  /** Re-check cadence by stage (minutes). */
+  recheckMinutes: { SEED: 5, SPROUT: 20, ROOTED: 60, DROPPED: 360 },
+  /** Coins re-checked per tick (keeps the shared RPC budget sane). */
+  checksPerTick: 6,
+  /** Disqualifiers at launch. */
+  maxDevPct: 5,
+  maxLargestWalletPct: 8,
+  maxTop10Pct: 30,
+  /** Current cap below this share of its all-time high = the pump-and-dump
+   *  already happened. */
+  minAthRatio: 0.3,
+  /** Holder growth benchmarks (new holders per hour) from early-winner data. */
+  strongHoldersPerHour: 50,
+  okHoldersPerHour: 15,
+  /** Multiples since first sight that trigger a milestone alert. */
+  multipleMilestones: [2, 5, 10, 25, 100],
+  /** "If you'd bought every pick at first sight" horizons (days). */
+  reportHorizonsDays: [1, 7, 30],
+  /** Keep following DROPPED coins (price only) this long, so the report
+   *  includes the losers too — otherwise it would be survivorship bias. */
+  followDroppedDays: 31
+};
 var INLINE_BADGES = {
   enabled: true,
   /** Max distinct mints badged per page (protects the RPC budget). */
@@ -356,7 +393,7 @@ function computeKingGrade(a, risk, quality) {
   let ceiling = 100;
   const applyCap = (limit, why) => {
     if (limit < ceiling) ceiling = limit;
-    if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
+    if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
   const live = assessLiveState(a.market);
@@ -373,15 +410,14 @@ function computeKingGrade(a, risk, quality) {
   if (!gemBackgroundCheck(a, risk, quality).gem) {
     applyCap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
   }
-  let gradeF;
-  if (raw <= ceiling) {
-    gradeF = raw;
-  } else {
-    const band = Math.min(22, ceiling);
-    gradeF = ceiling - band + band * ((raw - ceiling) / (100 - ceiling));
-  }
-  const grade = Math.round(Math.min(ceiling, Math.max(0, gradeF)));
+  const grade = Math.round(Math.max(0, capCurve(raw, ceiling)));
   return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
+}
+function capCurve(raw, ceiling) {
+  if (ceiling >= 100) return raw;
+  const knee = ceiling * 0.7;
+  if (raw <= knee) return raw;
+  return knee + (ceiling - knee) * ((Math.min(raw, 100) - knee) / (100 - knee));
 }
 function gradeLabel(grade) {
   if (grade === null) return "NO DATA";
@@ -400,6 +436,203 @@ function gradeColors(grade) {
 }
 
 // lib/earlyGem.ts
+var acc = (max) => ({ score: 0, max, good: [], bad: [], unknown: [] });
+function stageForAge(ageHours) {
+  if (ageHours === null || ageHours < 24) return "SEED";
+  return ageHours < 72 ? "SPROUT" : "ROOTED";
+}
+function assessEarlyGem(a, risk, x, t = EARLY_GEM) {
+  const dq = [];
+  let softOnly = true;
+  const hard = (msg) => {
+    dq.push(msg);
+    softOnly = false;
+  };
+  const m = a.mint;
+  const L = a.launch;
+  const onCurve = L?.bondingCurveComplete === false;
+  const mcap = a.market?.marketCapEur ?? null;
+  const liq = a.market?.liquidityEur ?? null;
+  if (m?.mintAuthorityActive === true) hard("Mint authority active \u2014 supply can be inflated.");
+  if (m?.freezeAuthorityActive === true) hard("Freeze authority active \u2014 wallets can be frozen.");
+  if (m?.permanentDelegateActive || m?.nonTransferable || m?.defaultAccountFrozen || m?.transferHookActive) {
+    hard("Token-2022 trap extension present.");
+  }
+  if (a.market?.sellSimulation?.ok === false) hard("Simulated sell fails \u2014 honeypot.");
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (!onCurve && (lp === "unlocked" || lp === "deployer_held")) hard("Liquidity can be pulled (LP not burned/locked).");
+  if (L?.bannedOnPlatform === true) hard("Banned on its own launchpad.");
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) hard("Creator is a serial launcher of dead coins.");
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev > t.maxDevPct) hard(`Dev holds ${dev.toFixed(1)}% \u2014 they'd be selling into your hold.`);
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > t.maxLargestWalletPct) hard(`One wallet already holds ${whale.toFixed(1)}%.`);
+  const top10 = a.holders?.top10Pct ?? null;
+  if (top10 !== null && top10 > t.maxTop10Pct) hard(`Top 10 wallets hold ${top10.toFixed(0)}% \u2014 snipers/insiders own it.`);
+  const athR = L?.athRatio ?? null;
+  if (athR !== null && athR < t.minAthRatio) {
+    hard(`Already ${Math.round((1 - athR) * 100)}% below its peak \u2014 the pump-and-dump happened.`);
+  }
+  const volLiq = a.market?.volume24hEur != null && liq ? a.market.volume24hEur / liq : null;
+  if (volLiq !== null && volLiq > 10) hard(`Volume ${volLiq.toFixed(0)}\xD7 liquidity \u2014 wash trading.`);
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") hard(`Already rugged/dead \u2014 ${live.reasons[0] ?? "market collapsed."}`);
+  if (live.state === "DUMPING") dq.push(`Dumping right now \u2014 ${live.reasons[0] ?? "falling hard."}`);
+  const cm = acc(30);
+  const so = x.socials;
+  if (so.telegram) cm.score += 10;
+  if (so.twitter) cm.score += 8;
+  if (so.website) cm.score += 5;
+  const n = Number(so.telegram) + Number(so.twitter) + Number(so.website);
+  if (n === 3) cm.good.push("Telegram + X + website \u2014 launches like this graduate ~17\xD7 more often.");
+  else if (so.telegram) cm.good.push("Has a Telegram \u2014 the strongest single launch signal (8.9\xD7).");
+  if (n < 3) cm.bad.push(`Missing ${[!so.telegram && "Telegram", !so.twitter && "X", !so.website && "website"].filter(Boolean).join(", ")}.`);
+  const replies = L?.replyCount ?? null;
+  if (replies === null) cm.unknown.push("launchpad replies");
+  else if (replies >= 50) {
+    cm.score += 4;
+    cm.good.push(`${replies} replies on pump.fun \u2014 people are talking.`);
+  } else if (replies >= 15) cm.score += 2;
+  if (x.holderCount !== null) {
+    if (x.holderCount >= 500) {
+      cm.score += 3;
+      cm.good.push(`${x.holderCount.toLocaleString("en-US")} holders already.`);
+    } else if (x.holderCount >= 200) cm.score += 1;
+  }
+  const fl = acc(30);
+  if (top10 === null) fl.unknown.push("top-10 concentration");
+  else {
+    fl.score += top10 <= 10 ? 12 : top10 <= 15 ? 8 : top10 <= 20 ? 4 : 0;
+    (top10 <= 15 ? fl.good : fl.bad).push(`Top 10 wallets hold ${top10.toFixed(1)}% (curve/pool excluded).`);
+  }
+  if (whale === null) fl.unknown.push("largest wallet");
+  else fl.score += whale <= 2 ? 8 : whale <= 3 ? 6 : whale <= 5 ? 3 : 0;
+  if (dev === null) fl.unknown.push("dev holdings");
+  else {
+    fl.score += dev <= 1 ? 6 : dev <= 3 ? 4 : dev <= 5 ? 2 : 0;
+    if (dev <= 1) fl.good.push("Dev holds ~nothing \u2014 no team bag over your head.");
+  }
+  const d = a.deployer;
+  if (d?.priorLaunches != null && d.graduatedLaunches != null && d.priorLaunches >= 2 && d.graduatedLaunches / d.priorLaunches >= 0.5) {
+    fl.score += 4;
+    fl.good.push(`Creator has a track record \u2014 ${d.graduatedLaunches}/${d.priorLaunches} past coins graduated.`);
+  } else if (d?.priorLaunches == null) fl.unknown.push("creator history");
+  const mo = acc(25);
+  const prog = L?.curveProgressPct ?? null;
+  if (L?.bondingCurveComplete === true) {
+    mo.score += 10;
+    mo.good.push("Graduated off the bonding curve \u2014 real buyers carried it.");
+  } else if (prog === null || x.ageHours === null) mo.unknown.push("curve progress");
+  else {
+    const perHour = prog / Math.max(x.ageHours, 0.25);
+    mo.score += perHour >= 25 ? 10 : perHour >= 10 ? 6 : perHour >= 3 ? 3 : 0;
+    if (perHour >= 10) mo.good.push(`Filling its curve fast \u2014 ${prog.toFixed(0)}% in ${fmtAge(x.ageHours)}.`);
+    else if (perHour < 3) mo.bad.push(`Stalling \u2014 only ${prog.toFixed(0)}% of the curve after ${fmtAge(x.ageHours)}.`);
+  }
+  if (x.buyers24h !== null) {
+    mo.score += x.buyers24h >= 300 ? 8 : x.buyers24h >= 100 ? 5 : x.buyers24h >= 40 ? 2 : 0;
+    if (x.buyers24h >= 100) mo.good.push(`${x.buyers24h} different wallets buying \u2014 broad demand.`);
+  } else if (L?.kingOfTheHill === true) {
+    mo.score += 6;
+    mo.good.push("Reached king of the hill on pump.fun.");
+  } else mo.unknown.push("buyer breadth");
+  const buys = x.buyers24h ?? a.market?.buys1h ?? null;
+  const sells = x.sellers24h ?? a.market?.sells1h ?? null;
+  if (buys !== null && sells !== null && buys + sells > 0) {
+    if (buys >= sells) mo.score += 4;
+    else mo.bad.push(`More selling than buying (${sells} vs ${buys}).`);
+  }
+  if (athR !== null) {
+    if (athR >= 0.6) mo.score += 3;
+    else if (athR >= 0.4) mo.score += 1;
+    if (athR < 0.6) mo.bad.push(`${Math.round((1 - athR) * 100)}% below its peak.`);
+  }
+  const ch1h = a.market?.priceChange1h ?? null;
+  if (ch1h !== null && ch1h >= 300 && volLiq !== null && volLiq < 0.2) {
+    mo.score = Math.max(0, mo.score - 6);
+    mo.bad.push(`+${ch1h.toFixed(0)}% in an hour on thin volume \u2014 artificial pump pattern.`);
+  }
+  const cv = acc(15);
+  const hph = holdersPerHour(x.history, x.holderCount);
+  if (hph === null) cv.unknown.push("holder growth (builds up while tracked)");
+  else if (hph >= t.strongHoldersPerHour) {
+    cv.score += 6;
+    cv.good.push(`+${Math.round(hph)} holders/hour \u2014 the pace early winners show.`);
+  } else if (hph >= t.okHoldersPerHour) cv.score += 3;
+  else if (hph < 0) cv.bad.push("Holders are leaving.");
+  const held = heldThroughDip(x.history);
+  if (held === null) cv.unknown.push("reaction to its first dip");
+  else if (held) {
+    cv.score += 5;
+    cv.good.push("Community held through a 25%+ dip \u2014 holders didn't panic.");
+  } else cv.bad.push("Holders sold out on the first dip.");
+  const first = x.history.find((h) => h.mcap !== null);
+  if (first?.mcap && mcap !== null) {
+    if (mcap >= first.mcap) cv.score += 4;
+  } else cv.unknown.push("trend since first sight");
+  const parts = [
+    ["community", "Community signals", cm],
+    ["fairLaunch", "Fair launch", fl],
+    ["momentum", "Organic momentum", mo],
+    ["conviction", "Holder conviction", cv]
+  ];
+  const pillars = parts.map(([key, label, p]) => ({
+    key,
+    label,
+    score: Math.min(p.max, Math.max(0, p.score)),
+    max: p.max,
+    good: p.good,
+    bad: p.bad,
+    unknown: p.unknown
+  }));
+  const score = pillars.reduce((s, p) => s + p.score, 0);
+  const coreVerified = m?.mintAuthorityActive === false && m?.freezeAuthorityActive === false && top10 !== null && whale !== null;
+  let verdict;
+  if (risk.insufficientData) verdict = "NO_DATA";
+  else if (dq.length > 0) verdict = "REJECT";
+  else if (score >= t.strongScore && coreVerified) verdict = "STRONG";
+  else if (score >= t.promisingScore) verdict = "PROMISING";
+  else verdict = "WEAK";
+  return {
+    stage: stageForAge(x.ageHours),
+    verdict,
+    score: verdict === "NO_DATA" ? null : score,
+    pillars,
+    disqualifiers: dq,
+    hardBreak: dq.length > 0 && !softOnly,
+    strengths: pillars.flatMap((p) => p.good),
+    concerns: pillars.flatMap((p) => p.bad),
+    unverified: pillars.flatMap((p) => p.unknown),
+    ageHours: x.ageHours,
+    curveProgressPct: prog
+  };
+}
+function holdersPerHour(h, current) {
+  const pts = h.filter((s) => s.holders !== null).map((s) => ({ at: s.at, n: s.holders }));
+  if (current !== null) pts.push({ at: Date.now(), n: current });
+  if (pts.length < 2) return null;
+  const a = pts[0];
+  const b = pts[pts.length - 1];
+  const hours = (b.at - a.at) / 36e5;
+  if (hours < 1) return null;
+  return (b.n - a.n) / hours;
+}
+function heldThroughDip(h) {
+  let peakMcap = 0;
+  let peakHolders = null;
+  for (const s of h) {
+    if (s.mcap === null) continue;
+    if (s.mcap > peakMcap) {
+      peakMcap = s.mcap;
+      peakHolders = s.holders;
+      continue;
+    }
+    if (s.mcap <= peakMcap * 0.75 && peakHolders !== null && s.holders !== null) {
+      return s.holders >= peakHolders * 0.97;
+    }
+  }
+  return null;
+}
 var GEM_STAGE_META = {
   SEED: { label: "\u{1F331} SEED", color: "#2f6f3e", textColor: "#dff5e3" },
   SPROUT: { label: "\u{1F33F} SPROUT", color: "#3f8f4f", textColor: "#ffffff" },
@@ -413,6 +646,9 @@ var EARLY_VERDICT_META = {
   REJECT: { label: "\u26D4 REJECT", color: "#e5484d", textColor: "#ffffff" },
   NO_DATA: { label: "NO DATA", color: "#3a3f4c", textColor: "#e6e8ee" }
 };
+function fmtAge(h) {
+  return h < 1 ? `${Math.round(h * 60)} min` : h < 48 ? `${h.toFixed(1)}h` : `${Math.floor(h / 24)} days`;
+}
 
 // lib/rugPotential.ts
 function assessRugPotential(a, risk) {
@@ -1186,9 +1422,9 @@ function renderHome() {
         <span class="live-dot"></span>
         <span class="t">Live Solana launches \u2014 auto-scanning</span>
       </div>
-      <div class="grade-legend">All scores are <b>King Grade %</b> \u2014 <b>higher = safer/better</b> (100% = passed every audit). 80%+ = gem grade \xB7 &lt;40% = avoid. Never a buy signal.</div>
+      <div class="grade-legend"><b>Higher = better on every score.</b> \u{1F331} = <b>launch score</b> for coins not fully scanned yet (socials, fair launch, curve speed \u2014 what's knowable in minute one). \u{1F451} = <b>King Grade</b> after the full audit (click a coin). Never a buy signal.</div>
       <div class="live-controls">
-        <label class="safe-toggle"><input type="checkbox" class="safe-only" /> hide high-risk</label>
+        <label class="safe-toggle"><input type="checkbox" class="safe-only" /> best only</label>
         <label class="safe-toggle"><input type="checkbox" class="low-cap" /> low caps only</label>
         <label class="safe-toggle"><input type="checkbox" class="fresh-only" /> fresh &lt;1h</label>
         <label class="safe-toggle"><input type="checkbox" class="grad-only" /> graduated</label>
@@ -1207,10 +1443,10 @@ function renderHome() {
 
     <div class="scan-section radar-section">
       <div class="scan-head">
-        <span class="t">\u{1F3D4} Long-hold radar \u2014 coins that survived the rug window</span>
-        <button class="rescan radar-run" title="Deep-check the next batch now">\u21BB Scan</button>
+        <span class="t">\u{1F3D4} Young-gem radar \u2014 1\u201321 days old, under $5M, best first</span>
+        <button class="rescan radar-run" title="Run a scan tick now">\u21BB Scan now</button>
       </div>
-      <div class="grade-legend"><b>Staying Power %</b> \u2014 higher = more of the traits long-term survivors (PEPE, BONK, WIF) had early: survived 3+ days, fair distribution, burned LP, real unique buyers, higher lows after a crash. ~95% of coins still die; this improves odds, never guarantees them.</div>
+      <div class="grade-legend">Scans <b>continuously</b> (every minute, even with this panel closed): every new pool on Solana is captured, revisited once it survives a day, quick-screened, and the best are deep-checked. Only coins that <b>pass</b> are shown. % = early conviction (&lt;3 days) or staying power (3+ days) \u2014 higher = better. ~95% of coins still die; this improves odds, never guarantees them.</div>
       <div class="radar-status">Loading radar\u2026</div>
       <div class="radar-box"></div>
     </div>
@@ -1476,7 +1712,7 @@ function updateScanList() {
 var liveRows = [];
 var liveTimer = null;
 var livePolling = false;
-var liveSafeOnly = false;
+var liveSafeOnly = true;
 var liveLowCapOnly = false;
 var liveFreshOnly = false;
 var liveGraduatedOnly = false;
@@ -1507,10 +1743,10 @@ async function pollLiveFeed() {
     liveRows = res.feed;
     if (!collapsed) {
       updateLiveList();
-      const worst = liveRows.filter((r) => !r.insufficientData && !passesSafeFilter(r)).length;
+      const passing = liveRows.filter((r) => !r.insufficientData && passesSafeFilter(r)).length;
       const gems = liveRows.filter(isGem).length;
       setLiveStatus(
-        `\u{1F534} live \xB7 ${liveRows.length} fresh coins \xB7 \u26A0 ${worst} high-risk \xB7 \u{1F48E} ${gems} candidates` + (res.source === "mock" ? " \xB7 MOCK" : "")
+        `\u{1F534} live \xB7 ${liveRows.length} scanned \xB7 \u2705 ${passing} pass${liveSafeOnly ? " (showing only these)" : ""} \xB7 \u{1F48E} ${gems} gems` + (res.source === "mock" ? " \xB7 MOCK" : "")
       );
     }
     refreshGemAlerts();
@@ -1541,7 +1777,20 @@ function setLiveStatus(text) {
   if (el) el.textContent = text;
 }
 function passesSafeFilter(r) {
-  return r.grade !== null && r.grade >= LIVE_FEED.safeMinGrade && r.rugVerdict !== "HIGH" && r.liveState !== "DEAD" && r.liveState !== "DUMPING";
+  if (r.liveState === "DEAD" || r.liveState === "DUMPING") return false;
+  if (r.unverified) return r.early !== null && r.early.verdict !== "REJECT" && (r.early.score ?? 0) >= EARLY_GEM.promisingScore;
+  return r.grade !== null && r.grade >= LIVE_FEED.safeMinGrade && r.rugVerdict !== "HIGH";
+}
+function rowScore(r) {
+  if (r.unverified && r.early) {
+    const v = r.early.verdict;
+    const m = EARLY_VERDICT_META[v];
+    const word = v === "STRONG" ? "STRONG" : v === "PROMISING" ? "PROMISING" : v === "REJECT" ? "REJECT" : v === "WEAK" ? "WEAK" : "NO DATA";
+    const value = v === "REJECT" ? 0 : r.early.score;
+    return { value, kind: "early", label: r.early.score === null ? "\u{1F331} \u2014" : `\u{1F331} ${r.early.score}% ${word}`, color: m.color, text: m.textColor };
+  }
+  const gc = gradeColors(r.grade);
+  return { value: r.grade, kind: "grade", label: r.grade === null ? "NO DATA" : `\u{1F451} ${r.grade}% ${gradeLabel(r.grade)}`, color: gc.color, text: gc.textColor };
 }
 function updateLiveList() {
   const list = shadow?.querySelector(".livelist");
@@ -1554,20 +1803,20 @@ function updateLiveList() {
   if (liveFreshOnly) rows = rows.filter((r) => r.ageMinutes !== null && r.ageMinutes < 60);
   if (liveGraduatedOnly) rows = rows.filter((r) => r.graduated === true);
   if (liveSortBest) {
-    rows.sort((a, b) => (b.grade ?? -1) - (a.grade ?? -1));
+    rows.sort((a, b) => (rowScore(b).value ?? -1) - (rowScore(a).value ?? -1));
   }
   rows.sort((a, b) => stateRank(a.liveState) - stateRank(b.liveState));
   if (rows.length === 0) {
-    list.innerHTML = `<div class="scan-empty">${liveSafeOnly || liveLowCapOnly ? "No fresh launches match the filters right now." : "Waiting for the first live results\u2026"}</div>`;
+    list.innerHTML = `<div class="scan-empty">${liveSafeOnly || liveLowCapOnly ? 'Nothing passes right now \u2014 most launches don\u2019t. New coins are scanned every few seconds; untick "best only" to see everything.' : "Waiting for the first live results\u2026"}</div>`;
     return;
   }
   list.innerHTML = rows.map((r) => {
-    const gc = gradeColors(r.grade);
-    const label = r.grade === null ? "NO DATA" : `${r.grade}% ${gradeLabel(r.grade)}`;
-    const bg = gc.color;
-    const fg = gc.textColor;
+    const sc = rowScore(r);
+    const label = sc.label;
+    const bg = sc.color;
+    const fg = sc.text;
     const sym = r.symbol ?? short(r.address);
-    const reason = r.insufficientData ? "Not enough data yet" : r.topReason ?? (r.unverified ? "Early checks clean \u2014 holders/LP not verified yet (click for full scan)" : "No risk factors triggered \u2014 still not a buy signal");
+    const reason = r.insufficientData ? "Not enough data yet" : sc.kind === "early" ? r.early?.headline ?? "Launch score from first-minute signals \u2014 click for the full scan" : r.topReason ?? "No risk factors triggered \u2014 still not a buy signal";
     const gem = isGem(r);
     const stateTag = r.liveState === "DEAD" ? '<span class="rug-tag high">\u{1F480} ALREADY RUGGED</span>' : r.liveState === "DUMPING" ? '<span class="rug-tag poss">\u{1F4C9} DUMPING</span>' : "";
     const rugTag = stateTag || (r.rugVerdict === "HIGH" ? '<span class="rug-tag high">\u{1F6A9} RUG RISK</span>' : r.rugVerdict === "POSSIBLE" ? '<span class="rug-tag poss">\u{1F6A9} possible</span>' : "");
@@ -1598,41 +1847,60 @@ function startRadarPoll() {
       refreshRadarBox(false);
       refreshGemsBox();
     }
-  }, 6e4);
+  }, 15e3);
 }
+var radarShowRejected = false;
 function refreshRadarBox(force) {
   const box = shadow?.querySelector(".radar-box");
   const status = shadow?.querySelector(".radar-status");
   if (!box || !status) return;
-  if (force) status.textContent = "Deep-checking the next batch (takes ~30s \u2014 free API is rate-limited)\u2026";
   chrome.runtime.sendMessage({ type: force ? "RUN_RADAR" : "GET_RADAR" }, (res) => {
     if (chrome.runtime.lastError || !box.isConnected) return;
     if (!res || !res.ok) {
       status.textContent = res && !res.ok ? res.error : "Radar unavailable.";
       return;
     }
-    const cands = res.rows.filter((r) => r.tier === "CANDIDATE").length;
-    const ago = res.sweptAt ? ageShort((Date.now() - res.sweptAt) / 6e4) : null;
-    status.textContent = (res.sweeping ? "\u23F3 sweeping now\u2026 \xB7 " : "") + `${res.rows.length} coins assessed \xB7 \u{1F3D4} ${cands} candidate${cands === 1 ? "" : "s"}` + (ago ? ` \xB7 updated ${ago} ago` : " \xB7 first sweep running");
-    if (res.rows.length === 0) {
-      box.innerHTML = `<div class="scan-empty">${res.sweeping ? "First sweep in progress \u2014 results appear within a minute or two." : "No coins assessed yet \u2014 hit \u21BB Scan."}</div>`;
-      return;
-    }
-    box.innerHTML = res.rows.map((r) => {
-      const tm = LONG_HOLD_TIER_META[r.tier];
-      const gc = gradeColors(r.score);
-      const meta = [r.ageDays !== null ? `${Math.floor(r.ageDays)}d old` : null, r.marketCapUsd !== null ? eurShort(r.marketCapUsd) : null].filter(Boolean).join(" \xB7 ");
-      return `
-          <div class="scan-item${r.tier === "CANDIDATE" ? " gem" : ""}" data-addr="${esc(r.address)}">
-            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${r.score === null ? "\u2014" : `${r.score}%`}</span>
+    const best = res.rows.filter((r) => r.kind === "deep" && r.passed && (r.verdict === "CANDIDATE" || r.verdict === "STRONG")).length;
+    const deepPassed = res.rows.filter((r) => r.kind === "deep" && r.passed).length;
+    const rejected = res.rows.filter((r) => r.kind === "deep" && !r.passed);
+    const ago = res.sweptAt ? Math.max(0, Math.round((Date.now() - res.sweptAt) / 1e3)) : null;
+    status.innerHTML = `${res.sweeping ? '<span class="live-dot"></span> scanning \xB7 ' : ""}\u{1F440} ${res.watching.toLocaleString("en-US")} young coins watched \xB7 \u2705 ${deepPassed} passed the deep check \xB7 \u{1F3C6} ${best} best` + (ago !== null ? ` \xB7 ${ago < 90 ? `${ago}s` : `${Math.round(ago / 60)}m`} ago` : " \xB7 first scan running");
+    const shown = res.rows.filter((r) => radarShowRejected || r.passed);
+    const toggle = rejected.length ? `<button class="rescan radar-rej">${radarShowRejected ? "hide" : "show"} ${rejected.length} rejected</button>` : "";
+    if (shown.length === 0) {
+      box.innerHTML = `<div class="scan-empty">${res.rows.length === 0 ? "First scan in progress \u2014 young coins (1\u201321 days, under $5M) appear here within a few minutes and keep updating every minute." : "Nothing passes right now \u2014 most young coins don\u2019t. Scanning continues every minute."}</div>${toggle}`;
+    } else {
+      box.innerHTML = shown.map((r) => {
+        const meta = [r.ageDays !== null ? r.ageDays < 2 ? `${Math.round(r.ageDays * 24)}h old` : `${Math.floor(r.ageDays)}d old` : null, r.marketCapUsd !== null ? eurShort(r.marketCapUsd) : null].filter(Boolean).join(" \xB7 ");
+        let badge;
+        let tag;
+        if (r.kind === "quick") {
+          badge = `<span class="mini-badge" style="background:#2c3340;color:#cfd6e4" title="Quick-screen rank \u2014 deep check queued">Q${r.rank}</span>`;
+          tag = '<span class="lh-tier" style="background:#2c3340;color:#9fb0c8">\u23F3 deep check queued</span>';
+        } else {
+          const gc = gradeColors(r.score);
+          const v = r.verdict;
+          const m = v in LONG_HOLD_TIER_META ? LONG_HOLD_TIER_META[v] : EARLY_VERDICT_META[v];
+          badge = `<span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${r.score === null ? "\u2014" : `${r.score}%`}</span>`;
+          tag = m ? `<span class="lh-tier" style="background:${m.color};color:${m.textColor}">${esc(m.label)}</span>` : "";
+        }
+        const top = r.kind === "deep" && r.passed && (r.verdict === "CANDIDATE" || r.verdict === "STRONG");
+        return `
+          <div class="scan-item${top ? " gem" : ""}" data-addr="${esc(r.address)}">
+            ${badge}
             <span class="si-main">
-              <span class="si-sym">${esc(r.symbol ?? short(r.address))}<span class="lh-tier" style="background:${tm.color};color:${tm.textColor}">${esc(tm.label)}</span></span>
-              <span class="si-reason">${esc(meta)}${meta && r.headline ? " \xB7 " : ""}${esc(r.headline ?? "")}</span>
+              <span class="si-sym">${esc(r.symbol ?? short(r.address))}${tag}</span>
+              <span class="si-reason">${esc(r.kind === "quick" ? r.headline ?? meta : `${meta}${meta && r.headline ? " \xB7 " : ""}${r.headline ?? ""}`)}</span>
             </span>
             <button class="copy" data-copy="${esc(r.address)}" title="Copy token address">\u29C9</button>
           </div>`;
-    }).join("");
+      }).join("") + toggle;
+    }
     wireRowHandlers(box);
+    box.querySelector(".radar-rej")?.addEventListener("click", () => {
+      radarShowRejected = !radarShowRejected;
+      refreshRadarBox(false);
+    });
   });
 }
 function refreshGemsBox() {
@@ -1950,8 +2218,9 @@ function pumpInlineQueue() {
           grade: computeKingGrade(res.analysis, res.risk, res.quality).grade,
           rugVerdict: assessRugPotential(res.analysis, res.risk).verdict,
           insufficient: res.risk.insufficientData,
-          unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === "unknown"
-        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, grade: null, rugVerdict: "UNVERIFIED", insufficient: true, unverified: true }
+          unverified: res.analysis.holders === null || res.analysis.market?.lpStatus === "unknown",
+          early: launchScore(res.analysis, res.risk)
+        } : { score: 0, signal: "NEUTRAL", topReason: null, quality: null, grade: null, rugVerdict: "UNVERIFIED", insufficient: true, unverified: true, early: null }
       );
       paintBadges(mint);
     }).finally(() => {
@@ -1964,12 +2233,14 @@ function paintBadges(mint) {
   const result = inlineResults.get(mint);
   const els = badgeEls.get(mint);
   if (!result || result === "pending" || !els) return;
-  const gc = gradeColors(result.grade);
   const rugFlag = result.rugVerdict === "HIGH" ? "\u{1F6A9}" : "";
-  const label = result.insufficient ? "\u{1F451} ?" : `${rugFlag}\u{1F451} ${result.grade}%${result.unverified ? "*" : ""}`;
-  const bg = result.insufficient ? "#3a3f4c" : gc.color;
-  const fg = result.insufficient ? "#e6e8ee" : gc.textColor;
-  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : `CRYPTO-KING: ${result.rugVerdict === "HIGH" ? "\u{1F6A9} RUG POTENTIAL HIGH \xB7 " : result.rugVerdict === "POSSIBLE" ? "\u{1F6A9} rug possible \xB7 " : ""}King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 safety ${100 - result.score}/100${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 top risk: ${result.topReason}` : ""} \xB7 click for full breakdown`;
+  const useEarly = result.unverified && result.early !== null && !result.insufficient;
+  const em = useEarly ? EARLY_VERDICT_META[result.early.verdict] : null;
+  const gc = gradeColors(result.grade);
+  const label = result.insufficient ? "\u{1F451} ?" : useEarly ? `${rugFlag}\u{1F331} ${result.early.verdict === "REJECT" ? "\u2717" : `${result.early.score ?? "?"}%`}` : `${rugFlag}\u{1F451} ${result.grade}%`;
+  const bg = result.insufficient ? "#3a3f4c" : em ? em.color : gc.color;
+  const fg = result.insufficient ? "#e6e8ee" : em ? em.textColor : gc.textColor;
+  const tip = result.insufficient ? "CRYPTO-KING: not enough data \u2014 click for details" : useEarly ? `CRYPTO-KING \u{1F331} launch score ${result.early.score ?? "?"}% (${EARLY_VERDICT_META[result.early.verdict].label}) \u2014 ${result.early.headline ?? "first-minute signals"}. Holders/LP not fully verified yet \u2014 click for the full audit.` : `CRYPTO-KING: ${result.rugVerdict === "HIGH" ? "\u{1F6A9} RUG POTENTIAL HIGH \xB7 " : result.rugVerdict === "POSSIBLE" ? "\u{1F6A9} rug possible \xB7 " : ""}King Grade ${result.grade}% (${gradeLabel(result.grade)}) \xB7 safety ${100 - result.score}/100${result.quality !== null ? ` \xB7 quality ${result.quality}/100` : ""}${result.unverified ? " \u2014 holders/LP not verified yet, grade capped" : ""}${result.topReason ? ` \u2014 top risk: ${result.topReason}` : ""} \xB7 click for full breakdown`;
   for (const el of els) {
     if (!el.isConnected) {
       els.delete(el);
@@ -1980,6 +2251,17 @@ function paintBadges(mint) {
     el.style.color = fg;
     el.title = tip;
   }
+}
+function launchScore(a, risk) {
+  const e = assessEarlyGem(a, risk, {
+    ageHours: a.identity.ageMinutes !== null ? a.identity.ageMinutes / 60 : null,
+    buyers24h: null,
+    sellers24h: null,
+    holderCount: a.holders?.holderCount ?? null,
+    history: [],
+    socials: { twitter: Boolean(a.socials?.twitter), telegram: Boolean(a.socials?.telegram), website: Boolean(a.socials?.website) }
+  });
+  return { score: e.score, verdict: e.verdict, headline: e.disqualifiers[0] ?? e.strengths[0] ?? e.concerns[0] ?? null };
 }
 function extractAddress(raw) {
   const s = raw.trim();

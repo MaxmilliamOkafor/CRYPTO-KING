@@ -9,8 +9,8 @@
 
 import assert from 'node:assert/strict';
 import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
-import { GRADE_META, LIVE_FEED } from '../config.ts';
-import { computeKingGrade, gradeBlurb, gradeLabel } from '../lib/kingGrade.ts';
+import { GRADE_META, KING_GRADE, LIVE_FEED } from '../config.ts';
+import { capCurve, computeKingGrade, gradeBlurb, gradeLabel } from '../lib/kingGrade.ts';
 import { matchFirst, MINT_HREF_RES, PAIR_HREF_RES, pairLinksAreSolana } from '../lib/linkTargets.ts';
 import { computeConcentration, effectiveTransferFeeBps, SYSTEM_PROGRAM, uiAmountOf } from '../lib/holderMath.ts';
 import { parseSellQuote, rawAmountFor } from '../lib/jupiterClient.ts';
@@ -19,6 +19,8 @@ import { parseCandles, parsePools, parseTokenInfo, type Candle } from '../lib/ge
 import { lpStatusFromLockedPct, resolveLpStatus } from '../lib/lpStatus.ts';
 import { assessEarlyGem, computeGemPortfolio, heldThroughDip, holdersPerHour, stageForAge, type EarlyInputs } from '../lib/earlyGem.ts';
 import { athRatio, curveProgress } from '../lib/pumpfunClient.ts';
+import { quickScreen } from '../lib/radarScreen.ts';
+import type { DexTokenMarket } from '../lib/dexscreenerClient.ts';
 import type { GemSnapshot, TrackedGem } from '../lib/types.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
@@ -961,8 +963,13 @@ test('LP status off gmgn.ai: graduated pump.fun coins are protocol-burned; RugCh
   // …but a graduated coin whose deepest pool is a separate dev pool IS judged by the auditor.
   assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: 'meteora', audit: 'unlocked' }), 'unlocked');
   assert.equal(resolveLpStatus({ ...base, audit: 'locked' }), 'locked');
-  // GMGN, when present, is the most specific source and wins.
-  assert.equal(resolveLpStatus({ ...base, gmgn: 'deployer_held', pumpGraduated: true, deepestDexId: 'pumpswap' }), 'deployer_held');
+  // GMGN, when present, is the most specific source and wins…
+  assert.equal(resolveLpStatus({ ...base, gmgn: 'deployer_held', pumpGraduated: true, deepestDexId: 'meteora' }), 'deployer_held');
+  // …EXCEPT on a bonding curve, where no LP exists (screenshot: 2-min-old FEEBITS/REPUBLIC
+  // were flagged "LP not burned/locked — liquidity can be pulled" from GMGN's data).
+  assert.equal(resolveLpStatus({ ...base, gmgn: 'unlocked', pumpGraduated: false }), 'unknown');
+  // pump.fun lookup failed, but DexScreener shows it trading on the curve → still no LP.
+  assert.equal(resolveLpStatus({ ...base, gmgn: 'unlocked', deepestDexId: 'pumpfun' }), 'unknown');
   assert.equal(lpStatusFromLockedPct(99.5), 'locked');
   assert.equal(lpStatusFromLockedPct(10), 'unlocked');
   assert.equal(lpStatusFromLockedPct(70), null, 'ambiguous readings never become a hard "unlocked" verdict');
@@ -1083,6 +1090,77 @@ test('EARLY report: "bought every gem at first sight" counts the losers too', ()
   assert.equal(d7.bestSymbol, 'MOON');
   assert.equal(d7.alive, 2);
   assert.equal(rows.find((r) => r.horizonDays === 30)!.eligible, 0);
+});
+
+/* ── 🏔 Radar quick screen: young + low cap, ranked best-first ──────────── */
+
+const mkt = (over: Partial<DexTokenMarket> = {}): DexTokenMarket => ({
+  priceUsd: 0.001, marketCapUsd: 900_000, liquidityUsd: 120_000, volume24hUsd: 300_000,
+  priceChange5m: 1, priceChange1h: 3, priceChange6h: 12, priceChange24h: 25,
+  buys1h: 240, sells1h: 140, symbol: 'YNG', name: 'Young', pairCreatedMs: null, pairAddress: 'p', dexId: 'pumpswap',
+  ...over,
+});
+
+test('RADAR: the coins in the complaint — old/big coins that already ran — are filtered out', () => {
+  // STONK: 54 days, $167M. SI: 14 days but $27.5M. Both "already done what they need to".
+  assert.equal(quickScreen(mkt({ marketCapUsd: 166_900_000, liquidityUsd: 9_000_000 }), 54).pass, false);
+  assert.match(quickScreen(mkt({ marketCapUsd: 27_500_000, liquidityUsd: 2_000_000 }), 14).reason!, /Already big/);
+  assert.match(quickScreen(mkt(), 38).reason!, /past the early window/);
+});
+
+test('RADAR: a young, active, low-cap coin passes; dumping / wash / thin / dead do not', () => {
+  const ok = quickScreen(mkt(), 4);
+  assert.equal(ok.pass, true);
+  assert.match(ok.headline, /4d old · \$900k cap/);
+  assert.equal(quickScreen(mkt({ priceChange1h: -45 }), 4).pass, false); // dumping
+  assert.match(quickScreen(mkt({ volume24hUsd: 2_000_000 }), 4).reason!, /wash/);
+  assert.equal(quickScreen(mkt({ liquidityUsd: 20_000 }), 4).pass, false);
+  const dead = quickScreen(mkt({ liquidityUsd: 900 }), 4);
+  assert.equal(dead.dead, true, 'dead coins are dropped from the watch list entirely');
+  assert.equal(quickScreen(mkt(), 0.5).pass, false, 'under a day belongs to the gem tracker');
+});
+
+test('RADAR: ranking puts the best first — activity, buy pressure, depth, trend, earliness', () => {
+  const best = quickScreen(mkt(), 2).rank;
+  const sellHeavy = quickScreen(mkt({ buys1h: 60, sells1h: 200 }), 2).rank;
+  const older = quickScreen(mkt(), 18).rank;
+  const quiet = quickScreen(mkt({ buys1h: 3, sells1h: 2 }), 2).rank;
+  const downtrend = quickScreen(mkt({ priceChange6h: -10, priceChange24h: -20 }), 2).rank;
+  for (const worse of [sellHeavy, older, quiet, downtrend]) assert.ok(best > worse, `${best} > ${worse}`);
+  assert.ok(best <= 100);
+});
+
+/* ── The "50% MIXED vs 30% WEAK" screenshot bug ────────────────────────── */
+
+test('ACCURACY: the grade is monotonic — a better raw score can never show a lower grade', () => {
+  for (const ceiling of [...Object.values(KING_GRADE.caps), 100]) {
+    let prev = -1;
+    for (let raw = 0; raw <= 100; raw += 0.5) {
+      const g = capCurve(raw, ceiling);
+      assert.ok(g >= prev, `ceiling ${ceiling}: raw ${raw} → ${g} < previous ${prev}`);
+      assert.ok(g <= ceiling + 1e-9, `ceiling ${ceiling}: ${g} exceeds the cap`);
+      prev = g;
+    }
+  }
+});
+
+test('ACCURACY: replay of the screenshot — the launch with MORE quality signals must not grade lower', () => {
+  // Two unverified 2-minute-old launches; one has extra positive signals (the
+  // "Q10" coins that were shown 30% WEAK next to plainer coins at 50% MIXED).
+  const base = (): TokenAnalysis => {
+    const t = structuredClone(FIXTURE_NEUTRAL);
+    t.identity = { ...t.identity, ageMinutes: 2 };
+    t.holders = null; t.behavior = null; t.deployer = null; t.smartMoney = null;
+    t.socials = { website: null, twitter: null, telegram: null, verified: null };
+    t.market = { ...t.market!, marketCapEur: 3000, liquidityEur: null, volume24hEur: null, lpStatus: 'unknown', sellSimulation: null };
+    return t;
+  };
+  const plain = base();
+  const better = base();
+  better.socials = { website: 'https://x.example', twitter: 'https://x.com/x', telegram: 'https://t.me/x', verified: null };
+  const g = (a: TokenAnalysis) => computeKingGrade(a, scoreToken(a), scoreQuality(a)).grade!;
+  assert.ok(scoreQuality(better).qualityScore > scoreQuality(plain).qualityScore, 'precondition: more quality signals');
+  assert.ok(g(better) >= g(plain), `better ${g(better)} vs plain ${g(plain)}`);
 });
 
 console.log(`\n${passed} tests passed.`);

@@ -163,10 +163,15 @@ export const GECKO = {
   baseUrl: 'https://api.geckoterminal.com/api/v2',
   /** Daily candles to request per coin (max useful window for the pillars). */
   historyDays: 90,
-  /** Discovery lists for the long-hold radar (trending + most-traded Solana pools). */
+  /** Discovery lists for the radar. Short trending windows on purpose: the
+   *  24h-only list and the "most traded" list are dominated by coins that
+   *  already ran ($100M+, months old) — not what an early holder needs. */
   discoveryPaths: [
-    '/networks/solana/trending_pools?page=1',
-    '/networks/solana/pools?page=1&sort=h24_tx_count_desc',
+    '/networks/solana/trending_pools?duration=1h&page=1',
+    '/networks/solana/trending_pools?duration=6h&page=1',
+    '/networks/solana/trending_pools?duration=6h&page=2',
+    '/networks/solana/trending_pools?duration=24h&page=1',
+    '/networks/solana/trending_pools?duration=24h&page=2',
   ],
 };
 
@@ -195,7 +200,7 @@ export const EARLY_GEM = {
   /** Max coins followed at once (oldest dropped ones fall off first). */
   maxTracked: 40,
   /** Re-check cadence by stage (minutes). */
-  recheckMinutes: { SEED: 10, SPROUT: 30, ROOTED: 120, DROPPED: 360 },
+  recheckMinutes: { SEED: 5, SPROUT: 20, ROOTED: 60, DROPPED: 360 },
   /** Coins re-checked per tick (keeps the shared RPC budget sane). */
   checksPerTick: 6,
   /** Disqualifiers at launch. */
@@ -252,15 +257,24 @@ export const LONG_HOLD = {
   suspiciousVolLiqRatio: 5,
   /** Close below this share of the all-time high WITH lower lows = death spiral. */
   deathSpiralAthShare: 0.1,
-  /** Radar sweep: how often, and how many new candidates to deep-check per sweep. */
-  radarEveryMinutes: 30,
-  radarDeepChecksPerSweep: 4,
-  /** Radar candidate filters (applied before any deep check). */
-  radarMinLiquidityUsd: 40_000,
-  radarMinMcapUsd: 150_000,
-  radarMaxAgeDays: 365,
-  /** Keep this many assessed coins in the radar list. */
-  radarMaxRows: 40,
+  /** Radar sweep: how often, and how many candidates get a full deep check
+   *  (full scan + price history + holders) per sweep. Everything else gets a
+   *  cheap quick screen (DexScreener, 30 coins per request). */
+  radarEveryMinutes: 1, // CONSTANT: a tick every minute, panel open or not
+  radarDeepChecksPerSweep: 4, // ×60/h = 240 deep checks/hour within free API limits
+  /** Radar = YOUNG survivors at LOW caps: old/big coins already did their run.
+   *  1 day = past the first-48h kill zone's worst; coins < 3 days are judged
+   *  by early conviction, 3+ days by the long-hold screen. */
+  radarMinAgeDays: 1,
+  radarMaxAgeDays: 21,
+  radarMinLiquidityUsd: 25_000,
+  radarMinMcapUsd: 100_000,
+  radarMaxMcapUsd: 5_000_000,
+  /** Keep this many coins in the radar list (deep-checked + quick-screened). */
+  radarMaxRows: 80,
+  /** Launches the live feed has seen are remembered (newest N) and revisited
+   *  once they're old enough — the best source of young survivors. */
+  seenLaunchesMax: 4000,
   /** Re-assess a radar coin after this long. */
   reassessHours: 6,
   /** Outcome checks for the long-hold report card. */
@@ -288,6 +302,9 @@ export const DEXSCREENER = {
   enabled: true,
   /** Recently-updated token profiles across chains; we filter chainId === 'solana'. */
   latestProfilesUrl: 'https://api.dexscreener.com/token-profiles/latest/v1',
+  /** Paid boosts (latest + most boosted). A team paying for promotion is still
+   *  active — a radar SOURCE only, never a score input (boosts can be bought). */
+  boostsUrls: ['https://api.dexscreener.com/token-boosts/latest/v1', 'https://api.dexscreener.com/token-boosts/top/v1'],
   /** Pair lookup — up to ~30 comma-joined pair addresses per call. */
   pairsUrl: 'https://api.dexscreener.com/latest/dex/pairs/solana/{pairs}',
 };

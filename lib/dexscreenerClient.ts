@@ -229,3 +229,23 @@ export async function fetchDexscreenerNewSolana(limit: number): Promise<string[]
   }
   return out;
 }
+
+/**
+ * Solana tokens currently being BOOSTED (paid promotion) — latest and top.
+ * A radar SOURCE only: boosts can be bought, so they never raise a score.
+ * They just point at coins whose team is still active and spending. [] on failure.
+ */
+export async function fetchDexscreenerBoostedSolana(): Promise<string[]> {
+  if (MOCK_MODE || !DEXSCREENER.enabled) return [];
+  const out = new Set<string>();
+  for (const url of DEXSCREENER.boostsUrls) {
+    const json = await fetchJson(url);
+    const arr = Array.isArray(json) ? json : [];
+    for (const item of arr) {
+      if (asString(pick(item, ['chainId'])) !== 'solana') continue;
+      const addr = asString(pick(item, ['tokenAddress']));
+      if (addr && BASE58_RE.test(addr)) out.add(addr);
+    }
+  }
+  return [...out];
+}

@@ -24,6 +24,17 @@ import type { LpStatus } from './types.ts';
 /** Venues pump.fun migrates graduated coins to (DexScreener `dexId`). */
 export const PUMP_MIGRATION_DEXES = new Set(['pumpswap', 'raydium']);
 
+/** DexScreener `dexId`s that ARE a launchpad bonding curve, not an AMM pool.
+ *  A coin trading here has no LP at all yet. */
+export const CURVE_DEXES = new Set(['pumpfun', 'moonshot', 'launchlab']);
+
+/** Is this coin still on a launchpad curve? pump.fun's own flag wins; the
+ *  DexScreener venue covers coins whose pump.fun lookup failed. */
+export function onLaunchCurve(pumpGraduated: boolean | null, deepestDexId: string | null): boolean {
+  if (pumpGraduated !== null) return !pumpGraduated;
+  return deepestDexId !== null && CURVE_DEXES.has(deepestDexId);
+}
+
 export function resolveLpStatus(i: {
   gmgn: LpStatus | null;
   /** pump.fun says the bonding curve completed (coin graduated). */
@@ -33,6 +44,11 @@ export function resolveLpStatus(i: {
   /** RugCheck verdict (already mapped from lpLockedPct). */
   audit: LpStatus | null;
 }): LpStatus {
+  // On a bonding curve there is NO LP pool yet — nothing can be "unlocked" or
+  // "burned". Any source's LP verdict (GMGN reports "not burned", RugCheck
+  // "0% locked") describes a pool that doesn't exist, and used to brand
+  // 2-minute-old launches "liquidity can be pulled". This check comes FIRST.
+  if (onLaunchCurve(i.pumpGraduated, i.deepestDexId)) return 'unknown';
   if (i.gmgn && i.gmgn !== 'unknown') return i.gmgn;
   if (i.pumpGraduated === true) {
     if (i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return 'burned';
@@ -42,11 +58,6 @@ export function resolveLpStatus(i: {
     if (i.deepestDexId === null) return i.audit === 'unlocked' ? 'unknown' : (i.audit ?? 'unknown');
     // Deepest pool is on some OTHER venue (a dev-made pool) → trust the auditor.
   }
-  // Still on the bonding curve: there is no AMM pool, so there is no LP to
-  // lock — the curve's SOL is program-held and nobody can withdraw it. An
-  // auditor's "0% LP locked" here describes a pool that doesn't exist and
-  // would brand every fresh launch "liquidity can be pulled". Stay unknown.
-  if (i.pumpGraduated === false) return 'unknown';
   return i.audit ?? 'unknown';
 }
 

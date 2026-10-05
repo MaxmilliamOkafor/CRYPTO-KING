@@ -61,23 +61,35 @@ await sw.evaluate(() => {
   const tokAcct = (i) => `Tacc${'z'.repeat(36)}${alpha[i]}`;
   const VAULT = `Vau${'z'.repeat(37)}A`;
   const walletPcts = [1.8, 1.5, 1.2, 1.0, 0.9, 0.8, 0.8, 0.7, 0.6, 0.6, 0.5, 0.5, 0.4, 0.4, 0.4, 0.3, 0.3, 0.3, 0.3];
-  const closes = [1,1.5,2.2,3,4,5,4.8,4,3,2.2,1.8,1.9,2.1,2.3,2.4,2.6,2.8,3.0,3.1,3.3,3.4,3.5,3.7,3.8,3.9,4.0,4.1,4.2,4.3,4.4].map((c) => c * 0.001);
-  const candles = closes.map((c, i) => [Math.floor((now - (29 - i) * DAY) / 1000), i ? closes[i - 1] : c, c * 1.05, c * 0.95, c, 120000]).reverse();
+  // 18 days: pumped 5×, crashed 67%, recovering with higher lows.
+  const closes = [1,1.5,2.2,3,4,5,4.8,4,3,2.2,1.8,1.9,2.1,2.3,2.6,3.0,3.4,3.8].map((c) => c * 0.001);
+  const candles = closes.map((c, i) => [Math.floor((now - (closes.length - 1 - i) * DAY) / 1000), i ? closes[i - 1] : c, c * 1.05, c * 0.95, c, 120000]).reverse();
   const pair = (mint, pool, sym, liq, mcap, vol, dexId, ageDays) => ({ chainId: 'solana', dexId, pairAddress: pool,
     baseToken: { address: mint, symbol: sym, name: sym }, priceUsd: '0.0044', marketCap: mcap, fdv: mcap,
     liquidity: { usd: liq }, volume: { h24: vol }, priceChange: { m5: 0.1, h1: 1.2, h6: 3, h24: 5 },
     txns: { h1: { buys: 120, sells: 90 } }, pairCreatedAt: now - ageDays * DAY });
-  const PAIRS = { [M]: pair(M, P, 'SURV', 600000, 4400000, 420000, 'pumpswap', 30),
+  // BIG = the screenshot complaint: 54 days old, $167M — it already ran.
+  const B = 'BigOldCoin11111111111111111111111111111111';
+  const BP = 'BigOldPoo1111111111111111111111111111111';
+  // G2 = what the user wants: 2 days old, $600k, active, socials.
+  const G2 = 'YoungGem2111111111111111111111111111111111';
+  const G2P = 'YoungGemPoo11111111111111111111111111111';
+  const PAIRS = { [M]: pair(M, P, 'SURV', 600000, 4400000, 420000, 'pumpswap', 18),
                   [W]: pair(W, WP, 'WASH', 50000, 900000, 1500000, 'raydium', 10),
-                  [Y]: pair(Y, YP, 'YNG', 80000, 700000, 60000, 'pumpswap', 1) };
+                  [Y]: pair(Y, YP, 'YNG', 80000, 700000, 60000, 'pumpswap', 0.5),
+                  [B]: pair(B, BP, 'STONK', 9000000, 166900000, 3000000, 'raydium', 54),
+                  [G2]: pair(G2, G2P, 'GEM2', 90000, 600000, 150000, 'pumpswap', 2) };
   const gtPool = (mint, pool, name, ageDays, liq, mcap, vol, buyers, sellers) => ({ id: `solana_${pool}`, type: 'pool',
     attributes: { address: pool, name, pool_created_at: new Date(now - ageDays * DAY).toISOString(), reserve_in_usd: String(liq),
       market_cap_usd: String(mcap), fdv_usd: String(mcap), volume_usd: { h24: String(vol) },
       transactions: { h24: { buys: buyers * 2, sells: sellers * 2, buyers, sellers } } },
     relationships: { base_token: { data: { id: `solana_${mint}`, type: 'token' } } } });
-  const GT_POOLS = [gtPool(M, P, 'SURV / SOL', 30, 600000, 4400000, 420000, 600, 400),
+  const GT_POOLS = [gtPool(M, P, 'SURV / SOL', 18, 600000, 4400000, 420000, 600, 400),
                     gtPool(W, WP, 'WASH / SOL', 10, 50000, 900000, 1500000, 12, 11),
-                    gtPool(Y, YP, 'YNG / SOL', 1, 80000, 700000, 60000, 300, 100)];
+                    gtPool(Y, YP, 'YNG / SOL', 0.5, 80000, 700000, 60000, 300, 100),
+                    gtPool(B, BP, 'STONK / SOL', 54, 9000000, 166900000, 3000000, 5000, 4000)];
+  // A pool created two days ago, captured by the new-pools feed.
+  const GT_NEW = [gtPool(G2, G2P, 'GEM2 / SOL', 2, 90000, 600000, 150000, 420, 260)];
 
   const rpc = (method, params) => {
     const a0 = Array.isArray(params) ? params[0] : null;
@@ -126,15 +138,17 @@ await sw.evaluate(() => {
       if (p.endsWith('/ohlcv/day')) return p.includes(P) ? [200, { data: { attributes: { ohlcv_list: candles } } }] : [404, {}];
       if (p === `/networks/solana/tokens/${S}/info`) return sc.graduated ? [200, { data: { attributes: { holders: { count: 900 }, telegram_handle: 'seed', twitter_handle: 'seed', websites: ['https://seed.example'] } } }] : [404, {}];
       if (p === `/networks/solana/pools/${SP}`) return [200, { data: { attributes: { address: SP, reserve_in_usd: '60000', market_cap_usd: '250000', transactions: { h24: { buyers: 400, sellers: 250 } } }, relationships: { base_token: { data: { id: `solana_${S}` } } } } }];
+      if (p === `/networks/solana/tokens/${G2}/info`) return [200, { data: { attributes: { holders: { count: 1400 }, telegram_handle: 'gem2', twitter_handle: 'gem2', websites: ['https://gem2.example'] } } }];
       if (p.startsWith('/networks/solana/tokens/') && p.endsWith('/info')) {
         return p.includes(M) ? [200, { data: { attributes: { holders: { count: 18200 }, twitter_handle: 'surv', telegram_handle: 'surv', websites: ['https://surv.example'] } } }] : [200, { data: { attributes: { holders: { count: 900 } } } }];
       }
       if (p === '/networks/solana/trending_pools' || p === '/networks/solana/pools') return [200, { data: GT_POOLS }];
-      if (p.startsWith('/networks/solana/pools/')) { const pl = GT_POOLS.find((x) => p.endsWith(x.attributes.address)); return pl ? [200, { data: pl }] : [404, {}]; }
+      if (p === '/networks/solana/new_pools') return [200, { data: u.searchParams.get('page') === '1' ? GT_NEW : [] }];
+      if (p.startsWith('/networks/solana/pools/')) { const pl = [...GT_POOLS, ...GT_NEW].find((x) => p.endsWith(x.attributes.address)); return pl ? [200, { data: pl }] : [404, {}]; }
       return [404, {}];
     }
     if (u.host === 'frontend-api-v3.pump.fun') {
-      if (u.pathname === `/coins/${M}`) return [200, { mint: M, symbol: 'SURV', name: 'Survivor', created_timestamp: now - 30 * DAY, complete: true,
+      if (u.pathname === `/coins/${M}`) return [200, { mint: M, symbol: 'SURV', name: 'Survivor', created_timestamp: now - 18 * DAY, complete: true,
         usd_market_cap: 4400000, total_supply: 1e15, creator: wallet(20), twitter: 'https://x.com/surv', telegram: 'https://t.me/surv',
         website: 'https://surv.example', reply_count: 140, token_program: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', bonding_curve: 'BCurvezzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA' }];
       if (u.pathname === `/coins/${S}`) return [200, { mint: S, symbol: 'SEED', name: 'Seedling', created_timestamp: now - 2 * 3_600_000,
@@ -189,8 +203,8 @@ for (let i = 0; i < 90; i++) {
   radar = await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_RADAR' }));
   if (radar.ok && !radar.sweeping && radar.rows.length) break;
 }
-console.log('\n=== RADAR ===');
-for (const r of radar.rows) console.log(`  ${String(r.score).padStart(3)}% ${r.tier.padEnd(11)} ${r.symbol}  ${r.ageDays?.toFixed(1)}d  mcap ${r.marketCapUsd}  — ${r.headline}`);
+console.log(`\n=== RADAR (${radar.watching} watched) ===`);
+for (const r of radar.rows) console.log(`  ${r.kind.padEnd(5)} ${String(r.score ?? 'Q' + r.rank).padStart(4)} ${String(r.verdict ?? '—').padEnd(10)} ${r.passed ? 'PASS' : 'fail'} ${r.symbol}  ${r.ageDays?.toFixed(1)}d  mcap ${r.marketCapUsd}  — ${r.headline}`);
 const lh = await pop.evaluate((m) => chrome.runtime.sendMessage({ type: 'GET_LONGHOLD', address: m }), M);
 if (lh.ok) { console.log(`\n=== LONG-HOLD DETAIL: ${lh.result.tier} ${lh.result.score}% coreVerified=${lh.result.coreVerified}`);
   for (const p of lh.result.pillars) console.log(`  ${p.label.padEnd(18)} ${p.score}/${p.max} ${p.unknown.length ? '(unverified: ' + p.unknown.join(', ') + ')' : ''}`); }
@@ -209,7 +223,9 @@ const forceTick = () =>
     await chrome.storage.local.set(d);
     chrome.alarms.create('ck-gems', { when: Date.now() + 50 });
   });
-await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LIVE_FEED' })); // the sweep feeds the spotter
+const feedRes = await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LIVE_FEED' })); // the sweep feeds the spotter
+const seedRow = feedRes.ok ? feedRes.feed.find((r) => r.symbol === 'SEED') : undefined;
+console.log('\n=== LIVE FEED ROW ===', seedRow ? `SEED unverified=${seedRow.unverified} 🌱 ${seedRow.early?.score}% ${seedRow.early?.verdict} — ${seedRow.early?.headline}` : 'missing');
 let seed;
 for (let i = 0; i < 90 && !seed; i++) { await pop.waitForTimeout(1000); seed = seedOf(await gems()); }
 console.log('\n=== 🌱 SEED SPOTTED ===', seed ? `${seed.symbol} stage=${seed.stage} verdict=${seed.verdict} conviction=${seed.score}% spotted at $${seed.spottedMcap}` : 'NOT SPOTTED');
@@ -254,7 +270,14 @@ check(/LONG-HOLD CANDIDATE/.test(txt) && /Staying Power ·/.test(txt), 'card sho
 check(an.analysis.market.lpStatus === 'burned', 'graduated pump.fun coin → LP burned');
 check(an.analysis.holders.largestNonLpWalletPct < 2, 'the pool vault (30%) is NOT counted as a whale');
 check(an.analysis.market.sellSimulation?.ok === true, 'Jupiter sell quote fills the sell check');
-check(radar.ok && radar.rows.length === 1 && radar.rows[0].symbol === 'SURV', 'radar screens out the wash-traded and 1-day-old coins');
+const syms = radar.ok ? radar.rows.map((r) => r.symbol) : [];
+check(!syms.includes('STONK'), 'radar EXCLUDES the 54-day, $167M coin that already ran (the screenshot complaint)');
+check(!syms.includes('WASH') && !syms.includes('YNG'), 'radar screens out the wash-traded and half-day-old coins');
+check(syms.includes('GEM2'), 'radar FINDS the 2-day-old $600k coin from the new-pools feed');
+check(radar.ok && radar.rows.find((r) => r.symbol === 'GEM2')?.passed === true, 'the young socialised coin passes its deep check');
+check(radar.ok && radar.watching >= 2, 'captured coins persist in the watch list (no lost writes)');
+check(radar.ok && radar.rows.find((r) => r.symbol === 'SURV')?.passed === true, 'survivor passes the deep check');
+check(radar.ok && radar.rows[0].kind === 'deep' && radar.rows[0].passed, 'best first: a deep-passed coin is at the top');
 check(lh.ok && lh.result.tier === 'CANDIDATE', 'survivor is a long-hold CANDIDATE');
 check(seed && seed.stage === 'SEED' && seed.spottedMcap === 45000, 'fresh $45k launch is auto-spotted as a SEED from the live feed');
 check(seed && seed.verdict === 'STRONG', 'seed has STRONG early signals');
@@ -262,6 +285,7 @@ check(seedScan.analysis.market.lpStatus === 'unknown', "on-curve coin isn't bran
 check(grown && grown.fired.includes('graduated') && grown.fired.includes('x5'), 'graduation + 5× milestones fire');
 check(dropped && dropped.status === 'DROPPED' && /Dev holds/.test(dropped.dropReason ?? ''), 'dev bag → thesis broken → dropped');
 check(/Gem tracker/.test(homeTxt), 'panel shows the gem tracker');
+check(seedRow && seedRow.early && seedRow.early.score > 0 && seedRow.early.verdict !== 'REJECT', 'feed shows a real 🌱 launch score for an unverified launch (not a capped 50%)');
 check(dropped && ['graduated', 'x2', 'x5', 'dropped'].every((k) => dropped.fired.includes(k)) && dropped.events.some((e) => /Spotted at \$45k/.test(e.text)), 'full alert trail: spotted → graduated → 2× → 5× → thesis broken');
 console.log(fails.length ? `\n✗ E2E FAILED: ${fails.join('; ')}` : '\n✓ E2E passed — every layer ran end to end.');
 process.exit(fails.length ? 1 : 0);

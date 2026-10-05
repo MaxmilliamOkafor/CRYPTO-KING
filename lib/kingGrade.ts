@@ -61,16 +61,13 @@ export function computeKingGrade(a: TokenAnalysis, risk: RiskResult, quality: Qu
   );
 
   /* Ceiling — strictness lives here. The LOWEST applicable cap is the binding
-   * ceiling. But rather than hard-clamping every capped coin to the exact cap
-   * (which pins a whole wave of fresh launches to the same number), coins that
-   * exceed the ceiling are ranked into a band JUST BELOW it: better coins sit
-   * near the ceiling, weaker ones lower — so they stay distinguishable while
-   * still never claiming more safety than the cap allows. */
+   * ceiling, applied through capCurve() (monotonic: better raw → better
+   * grade, never above the cap, no pile-up at the cap). */
   const caps: string[] = [];
   let ceiling = 100;
   const applyCap = (limit: number, why: string) => {
     if (limit < ceiling) ceiling = limit;
-    if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
+    if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
 
   const confirmedTrap =
@@ -99,18 +96,28 @@ export function computeKingGrade(a: TokenAnalysis, risk: RiskResult, quality: Qu
     applyCap(KING_GRADE.caps.noGemPass, '80%+ is reserved for coins that pass the full background check.');
   }
 
-  let gradeF: number;
-  if (raw <= ceiling) {
-    gradeF = raw; // ceiling doesn't bind — use the real score
-  } else {
-    // Compress the overflow (ceiling, 100] into (ceiling-band, ceiling],
-    // preserving order so the strongest capped coins rank highest.
-    const band = Math.min(22, ceiling);
-    gradeF = ceiling - band + band * ((raw - ceiling) / (100 - ceiling));
-  }
-  const grade = Math.round(Math.min(ceiling, Math.max(0, gradeF)));
+  const grade = Math.round(Math.max(0, capCurve(raw, ceiling)));
 
   return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
+}
+
+/**
+ * Map a raw score under a ceiling. MUST be monotonic: a better raw score can
+ * never produce a lower grade.
+ *
+ * The previous version left raw ≤ ceiling untouched but squeezed raw > ceiling
+ * into a band BELOW it — so under the 50% "unverified" cap, raw 49 showed 49%
+ * while raw 51 showed ~28%. In the live feed that meant coins with MORE
+ * positive signals (the Q10 ones) were shown as 30% WEAK next to plainer coins
+ * at 50% MIXED. Now: identity up to a knee at 70% of the ceiling, then a
+ * smooth compression of everything above it into (knee, ceiling]. Continuous,
+ * strictly increasing, never above the ceiling, and no pile-up at the cap.
+ */
+export function capCurve(raw: number, ceiling: number): number {
+  if (ceiling >= 100) return raw;
+  const knee = ceiling * 0.7;
+  if (raw <= knee) return raw;
+  return knee + (ceiling - knee) * ((Math.min(raw, 100) - knee) / (100 - knee));
 }
 
 export function gradeLabel(grade: number | null): string {

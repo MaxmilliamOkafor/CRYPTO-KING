@@ -30,6 +30,7 @@ import {
 import { classifyOutcome, computeAccuracy, computeLongHoldAccuracy, type LedgerEntry, type Outcome } from '../lib/outcomeLedger.ts';
 import {
   fetchDailyCandles,
+  fetchNewPools,
   fetchPool,
   fetchRadarPools,
   fetchTokenInfo,
@@ -37,13 +38,15 @@ import {
   type GeckoTokenInfo,
   type RadarPool,
 } from '../lib/geckoClient.ts';
-import { assessEarlyGem, computeGemPortfolio } from '../lib/earlyGem.ts';
+import { assessEarlyGem, computeGemPortfolio, stageForAge } from '../lib/earlyGem.ts';
+import { quickScreen } from '../lib/radarScreen.ts';
 import { assessLongHold } from '../lib/longHold.ts';
-import { resolveLpStatus } from '../lib/lpStatus.ts';
+import { onLaunchCurve, resolveLpStatus } from '../lib/lpStatus.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
 import {
   fetchDexscreenerNewSolana,
   fetchDexscreenerToken,
+  fetchDexscreenerBoostedSolana,
   fetchPairBaseTokens,
   lookupDexscreenerToken,
   peekDexscreenerToken,
@@ -87,7 +90,6 @@ import type {
   LongHoldLedgerEntry,
   LongHoldResponse,
   LongHoldResult,
-  LongHoldTier,
   MarketInfo,
   MintInfo,
   QualityResult,
@@ -378,6 +380,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       narratives: entry.analysis.narratives,
       twitter: entry.analysis.socials?.twitter ?? null,
       tracked: trackedMints.has(c.mint),
+      early: earlyForFeed(entry),
       insufficientData: entry.risk.insufficientData,
       unverified:
         entry.analysis.holders === null ||
@@ -659,8 +662,10 @@ function mergeSources(
         }
       : null);
 
-  const symbol = gmgn.symbol ?? pumpfun.symbol;
-  const name = gmgn.name ?? pumpfun.name;
+  // DexScreener names coins that pump.fun/GMGN don't (radar rows used to show
+  // the pool name "SI / SOL" instead of the ticker).
+  const symbol = gmgn.symbol ?? pumpfun.symbol ?? dexMarket?.symbol ?? null;
+  const name = gmgn.name ?? pumpfun.name ?? dexMarket?.name ?? null;
   return {
     identity: {
       address,
@@ -680,6 +685,10 @@ function mergeSources(
     smartMoney: gmgn.smartMoney,
     // Only attest launch-platform facts from a live pump.fun response — the
     // mock path stays null so the fixture walkthrough arithmetic holds exactly.
+    // pump.fun's own data when we have it; otherwise, if DexScreener shows the
+    // coin trading ON a launchpad curve, still record that it's on the curve —
+    // so the curve rules (grade ceiling, dev-dump window) apply even when the
+    // pump.fun lookup failed, instead of the coin passing as an ordinary token.
     launch:
       pumpfun.status === 'ok'
         ? {
@@ -691,7 +700,9 @@ function mergeSources(
             athRatio: pumpfun.athRatio,
             kingOfTheHill: pumpfun.kingOfTheHill,
           }
-        : null,
+        : dexMarket?.dexId && onLaunchCurve(null, dexMarket.dexId)
+          ? { platform: dexMarket.dexId === 'pumpfun' ? 'pumpfun' : null, bondingCurveComplete: false, bannedOnPlatform: null, replyCount: null }
+          : null,
     sources,
     fetchedAt: Date.now(),
   };
@@ -902,7 +913,8 @@ function ensureWatchAlarm(): void {
     chrome.alarms.create('ck-radar', { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
   }
   if (EARLY_GEM.enabled && !MOCK_MODE) {
-    chrome.alarms.create('ck-gems', { periodInMinutes: Math.min(...Object.values(EARLY_GEM.recheckMinutes)) });
+    // Every minute: due re-checks only, so idle ticks cost nothing.
+    chrome.alarms.create('ck-gems', { periodInMinutes: 1 });
   }
 }
 
@@ -917,7 +929,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void runGemTick();
     // Keep spotting seeds even when no panel is open: the feed sweep is what
     // feeds the spotter, so run one if nothing has polled it recently.
-    if (Date.now() - lastFeedSweepAt > 5 * 60_000) void getLiveFeed();
+    // Constant: a sweep at least every minute so no launch slips past while
+    // the panel is closed (the panel itself polls every few seconds).
+    if (Date.now() - lastFeedSweepAt > 55_000) void getLiveFeed();
   }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
@@ -1056,27 +1070,32 @@ interface RadarStore {
   rows: RadarRow[];
   sweptAt: number | null;
   checked: number;
-  /** Mints already announced as CANDIDATE (never notify twice). */
+  /** Mints already announced (never notify twice). */
   notified: string[];
 }
 
 const LH_CACHE_MS = 30 * 60_000;
 const candleCache = new Map<string, { k: Candle[] | null; at: number }>();
 let radarSweep: Promise<void> | null = null;
+let radarTicks = 0;
 
 async function loadRadar(): Promise<RadarStore> {
   const d = await chrome.storage.local.get(RADAR_KEY);
   const v = d[RADAR_KEY] as Partial<RadarStore> | undefined;
-  return { rows: v?.rows ?? [], sweptAt: v?.sweptAt ?? null, checked: v?.checked ?? 0, notified: v?.notified ?? [] };
+  // Rows from the old radar format (no `kind`) are dropped — they were the
+  // old/big coins the new filters exist to exclude.
+  const rows = (v?.rows ?? []).filter((r) => (r as Partial<RadarRow>).kind !== undefined);
+  return { rows, sweptAt: v?.sweptAt ?? null, checked: v?.checked ?? 0, notified: v?.notified ?? [] };
 }
 
 async function getRadar(force: boolean): Promise<RadarResponse> {
-  if (!LONG_HOLD.enabled) return { ok: false, error: 'Long-hold radar disabled in config.' };
-  if (MOCK_MODE) return { ok: false, error: 'Long-hold radar needs live mode (MOCK_MODE=false).' };
+  if (!LONG_HOLD.enabled) return { ok: false, error: 'Radar disabled in config.' };
+  if (MOCK_MODE) return { ok: false, error: 'Radar needs live mode (MOCK_MODE=false).' };
   const store = await loadRadar();
-  const stale = !store.sweptAt || Date.now() - store.sweptAt > LONG_HOLD.radarEveryMinutes * 60_000;
-  if ((force || stale) && !radarSweep) void runRadarSweep(); // don't block the UI on a slow sweep
-  return { ok: true, rows: store.rows, sweptAt: store.sweptAt, sweeping: radarSweep !== null, checked: store.checked };
+  const stale = !store.sweptAt || Date.now() - store.sweptAt > LONG_HOLD.radarEveryMinutes * 90_000;
+  if ((force || stale) && !radarSweep) void runRadarSweep(); // never block the UI on a sweep
+  const seen = await loadSeen();
+  return { ok: true, rows: store.rows, sweptAt: store.sweptAt, sweeping: radarSweep !== null, watching: seen.size, checked: store.checked };
 }
 
 function runRadarSweep(): Promise<void> {
@@ -1089,73 +1108,250 @@ function runRadarSweep(): Promise<void> {
   return radarSweep;
 }
 
+/* Seen launches: every coin that became tradeable on a DEX, remembered so it
+ * can be revisited once it has survived a day. Dead ones are pruned. */
+const SEEN_KEY = 'ck:seen';
+type Seen = { t: number | null; s: string | null; q: number };
+let seenMem: Map<string, Seen> | null = null;
+let seenLoading: Promise<Map<string, Seen>> | null = null;
+
+/** ONE shared load. Two concurrent first loads (panel poll + a scan tick)
+ *  used to each build their own map; the scan filled one and saved the other,
+ *  silently wiping every captured coin. The promise is memoised instead. */
+function loadSeen(): Promise<Map<string, Seen>> {
+  if (seenMem) return Promise.resolve(seenMem);
+  seenLoading ??= chrome.storage.local.get(SEEN_KEY).then((d) => {
+    seenMem ??= new Map(Object.entries((d[SEEN_KEY] ?? {}) as Record<string, Seen>));
+    return seenMem;
+  });
+  return seenLoading;
+}
+
+async function saveSeen(): Promise<void> {
+  if (!seenMem) return;
+  // Bound storage: keep the newest N by first-seen time.
+  if (seenMem.size > LONG_HOLD.seenLaunchesMax) {
+    // Prune IN PLACE — callers hold a reference to this same map.
+    const drop = [...seenMem.entries()].sort((a, b) => (b[1].t ?? 0) - (a[1].t ?? 0)).slice(LONG_HOLD.seenLaunchesMax);
+    for (const [m] of drop) seenMem.delete(m);
+  }
+  await chrome.storage.local.set({ [SEEN_KEY]: Object.fromEntries(seenMem) });
+}
+
+function rememberLaunch(seen: Map<string, Seen>, mint: string, createdMs: number | null, symbol: string | null): void {
+  const prev = seen.get(mint);
+  if (prev) {
+    if (prev.t === null && createdMs !== null) prev.t = createdMs;
+    return;
+  }
+  seen.set(mint, { t: createdMs, s: symbol, q: 0 });
+}
+
+/**
+ * One radar tick — runs EVERY MINUTE (alarm), panel open or not:
+ *  1. capture newly created pools (graduations/listings) into the watch list;
+ *  2. every 3rd tick, pull discovery lists (short-window trending + boosts);
+ *  3. quick-screen a rotating batch of watched coins (30 per request) — dead
+ *     ones are pruned, passing ones become rows, rows that stop passing drop;
+ *  4. deep-check the best few not checked recently;
+ *  5. rank: deep-passed first (best score), then quick-screened by rank.
+ */
 async function doRadarSweep(): Promise<void> {
   if (!LONG_HOLD.enabled || MOCK_MODE) return;
-  const pools = await fetchRadarPools();
-  const store = await loadRadar();
-  const recent = new Map(store.rows.map((r) => [r.address, r.checkedAt]));
+  const tick = radarTicks++;
   const now = Date.now();
+  const seen = await loadSeen();
 
-  // Cheap pre-filter on the discovery data, BEFORE any expensive deep check.
-  const candidates = pools
-    .filter((p) => {
-      const ageDays = p.createdMs ? (now - p.createdMs) / 86_400_000 : null;
-      if (ageDays === null || ageDays < LONG_HOLD.minAgeDays || ageDays > LONG_HOLD.radarMaxAgeDays) return false;
-      if ((p.liquidityUsd ?? 0) < LONG_HOLD.radarMinLiquidityUsd) return false;
-      const mc = p.marketCapUsd ?? 0;
-      if (mc < LONG_HOLD.radarMinMcapUsd || mc > LONG_HOLD.lateMcapUsd) return false;
-      // Wash-trading pre-screen — don't spend a deep check on obvious fakes.
-      if (p.volume24hUsd !== null && p.liquidityUsd && p.volume24hUsd / p.liquidityUsd > LONG_HOLD.washVolLiqRatio) return false;
-      const last = recent.get(p.mint);
-      return !last || now - last > LONG_HOLD.reassessHours * 3_600_000;
-    })
-    // Most unique buyers first: real participation is the scarcest signal.
-    .sort((a, b) => (b.buyers24h ?? 0) - (a.buyers24h ?? 0))
-    .slice(0, LONG_HOLD.radarDeepChecksPerSweep);
-
-  const fresh: RadarRow[] = [];
-  for (const p of candidates) {
-    const res = await assessLongHoldFor(p.mint, p);
-    if (!res) continue;
-    fresh.push(radarRowOf(p.mint, res.symbol ?? p.name, res.result, res.mcap, res.liq));
+  // 1. New pools, every tick — real liquidity only (junk pools are ~$0–5k).
+  for (const p of await fetchNewPools(2)) {
+    if ((p.liquidityUsd ?? 0) >= 15_000) rememberLaunch(seen, p.mint, p.createdMs, p.name);
+  }
+  // 2. Discovery, every 3rd tick.
+  const hints = new Map<string, RadarPool>();
+  if (tick % 3 === 0) {
+    for (const p of await fetchRadarPools()) {
+      hints.set(p.mint, p);
+      rememberLaunch(seen, p.mint, p.createdMs, p.name);
+    }
+    for (const m of [...(await fetchDexscreenerBoostedSolana()), ...(await fetchDexscreenerNewSolana(60))]) {
+      rememberLaunch(seen, m, null, null);
+    }
   }
 
+  // 3. Quick screen. Current rows every tick (so a dump shows within a
+  //    minute), plus the watched coins screened longest ago.
+  const store = await loadRadar();
+  const inWindow = (t: number | null) => t === null || (now - t) / 86_400_000 <= LONG_HOLD.radarMaxAgeDays + 1;
+  const rotation = [...seen.entries()]
+    .filter(([, v]) => inWindow(v.t) && (v.t === null || now - v.t >= (LONG_HOLD.radarMinAgeDays - 0.1) * 86_400_000))
+    .sort((a, b) => a[1].q - b[1].q)
+    .slice(0, 300)
+    .map(([m]) => m);
+  const batch = [...new Set([...store.rows.map((r) => r.address), ...rotation])];
+  await primeDexscreenerTokens(batch);
+
+  const quick = new Map<string, { rank: number; headline: string; ageDays: number; m: DexTokenMarket }>();
+  for (const mint of batch) {
+    const m = peekDexscreenerToken(mint);
+    if (m === undefined) continue; // request failed — not evidence of anything
+    const entry = seen.get(mint);
+    if (entry) entry.q = now;
+    if (m === null) {
+      // Not listed anywhere: dead if it's been around a while.
+      if (entry && entry.t !== null && now - entry.t > 2 * 86_400_000) seen.delete(mint);
+      continue;
+    }
+    const created = m.pairCreatedMs ?? entry?.t ?? null;
+    const ageDays = created !== null ? (now - created) / 86_400_000 : null;
+    if (entry && entry.t === null && created !== null) entry.t = created;
+    const qs = quickScreen(m, ageDays);
+    if (qs.dead || (ageDays !== null && ageDays > LONG_HOLD.radarMaxAgeDays)) seen.delete(mint);
+    if (qs.pass && ageDays !== null) quick.set(mint, { rank: qs.rank, headline: qs.headline, ageDays, m });
+  }
+  await saveSeen();
+
+  // 4. Deep checks: best-ranked first, skipping ones checked recently.
+  const prevRows = new Map(store.rows.map((r) => [r.address, r]));
+  const deepDue = [...quick.entries()]
+    .filter(([mint]) => {
+      const prev = prevRows.get(mint);
+      return !prev?.deepAt || now - prev.deepAt > LONG_HOLD.reassessHours * 3_600_000;
+    })
+    .sort((a, b) => b[1].rank - a[1].rank)
+    .slice(0, LONG_HOLD.radarDeepChecksPerSweep);
+
+  const deep = new Map<string, RadarRow>();
+  const autoTrack: Array<{ mint: string; out: NonNullable<LhOut> }> = [];
+  for (const [mint, q] of deepDue) {
+    const hint: RadarPool = hints.get(mint) ?? {
+      mint,
+      pool: q.m.pairAddress ?? '',
+      name: q.m.symbol,
+      createdMs: now - q.ageDays * 86_400_000,
+      liquidityUsd: q.m.liquidityUsd,
+      marketCapUsd: q.m.marketCapUsd,
+      volume24hUsd: q.m.volume24hUsd,
+      buyers24h: null,
+      sellers24h: null,
+    };
+    const out = await assessLongHoldFor(mint, hint.pool ? hint : undefined);
+    if (!out) continue;
+    const row = deepRowOf(mint, out, q.rank, q.ageDays);
+    deep.set(mint, row);
+    if (row.verdict === 'CANDIDATE' || row.verdict === 'STRONG') autoTrack.push({ mint, out });
+  }
+
+  // 5. Merge and rank.
   const toNotify: RadarRow[] = [];
   await withLock(RADAR_KEY, async () => {
     const cur = await loadRadar();
-    const byMint = new Map(cur.rows.map((r) => [r.address, r]));
-    for (const r of fresh) byMint.set(r.address, r);
-    // Drop rows nobody re-checked in 2 days — stale verdicts are misleading.
-    const rows = [...byMint.values()]
-      .filter((r) => now - r.checkedAt < 48 * 3_600_000)
-      .sort((a, b) => tierRank(a.tier) - tierRank(b.tier) || (b.score ?? -1) - (a.score ?? -1))
-      .slice(0, LONG_HOLD.radarMaxRows);
+    const old = new Map(cur.rows.map((r) => [r.address, r]));
+    const rows: RadarRow[] = [];
+    for (const [mint, q] of quick) {
+      const d = deep.get(mint);
+      const prev = old.get(mint);
+      if (d) rows.push(d);
+      else if (prev && prev.kind === 'deep') {
+        // Keep the deep verdict, refresh the live numbers.
+        rows.push({ ...prev, rank: q.rank, ageDays: q.ageDays, marketCapUsd: q.m.marketCapUsd, liquidityUsd: q.m.liquidityUsd, checkedAt: now });
+      } else {
+        rows.push(quickRowOf(mint, q.m, q.rank, q.headline, q.ageDays));
+      }
+    }
+    // Rows not screened this tick (rotation) are kept if seen in the last 20 min.
+    for (const r of cur.rows) if (!quick.has(r.address) && !batch.includes(r.address) && now - r.checkedAt < 20 * 60_000) rows.push(r);
+    rows.sort(radarOrder);
     const notified = new Set(cur.notified);
-    for (const r of fresh) {
-      if (r.tier === 'CANDIDATE' && !notified.has(r.address)) {
+    for (const r of deep.values()) {
+      if ((r.verdict === 'CANDIDATE' || r.verdict === 'STRONG') && !notified.has(r.address)) {
         notified.add(r.address);
         toNotify.push(r);
       }
     }
     await chrome.storage.local.set({
       [RADAR_KEY]: {
-        rows,
+        rows: rows.slice(0, LONG_HOLD.radarMaxRows),
         sweptAt: now,
-        checked: cur.checked + fresh.length,
-        notified: [...notified].slice(-500),
+        checked: cur.checked + deep.size,
+        notified: [...notified].slice(-1000),
       } satisfies RadarStore,
     });
   });
 
+  // Best finds go straight into the gem tracker (alerts while you hold).
+  for (const { mint, out } of autoTrack) await enlistGem(mint, out, 'auto');
+
   for (const r of toNotify) {
     const sym = r.symbol ?? `${r.address.slice(0, 4)}…${r.address.slice(-4)}`;
+    const what = r.verdict === 'CANDIDATE' ? 'Long-hold candidate' : 'Strong young coin';
     chrome.notifications.create(`ck-lh-${r.address}`, {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
-      title: `🏔 Long-hold candidate: ${sym} — Staying Power ${r.score ?? '?'}%`,
-      message: `${r.headline ?? 'Passed the long-hold screen.'} Has the traits survivors had — not a buy signal; size it to lose. Click to open.`,
+      title: `🏔 ${what}: ${sym} — ${r.score ?? '?'}% at ${r.marketCapUsd !== null ? usdK(r.marketCapUsd) : '?'}`,
+      message: `${r.headline ?? 'Passed every check.'} Now tracked for you. Not a buy signal — size it to lose. Click to open.`,
     });
   }
+}
+
+/** Best first: deep-passed (CANDIDATE/STRONG, then WATCH/PROMISING) by score,
+ *  then quick-screened by rank, then deep-failed (hidden by default in the UI). */
+function radarOrder(a: RadarRow, b: RadarRow): number {
+  const tierOf = (r: RadarRow) =>
+    r.kind === 'deep' && r.passed
+      ? r.verdict === 'CANDIDATE' || r.verdict === 'STRONG'
+        ? 0
+        : 1
+      : r.kind === 'quick'
+        ? 2
+        : 3;
+  return tierOf(a) - tierOf(b) || (b.score ?? b.rank) - (a.score ?? a.rank);
+}
+
+function quickRowOf(mint: string, m: DexTokenMarket, rank: number, headline: string, ageDays: number): RadarRow {
+  return {
+    address: mint,
+    symbol: m.symbol,
+    name: m.name,
+    kind: 'quick',
+    stage: stageForAge(ageDays * 24),
+    verdict: null,
+    score: null,
+    rank,
+    passed: true,
+    ageDays,
+    marketCapUsd: m.marketCapUsd,
+    liquidityUsd: m.liquidityUsd,
+    headline,
+    checkedAt: Date.now(),
+    deepAt: null,
+  };
+}
+
+function deepRowOf(mint: string, out: NonNullable<LhOut>, rank: number, ageDays: number): RadarRow {
+  const e = out.early;
+  const rooted = e.stage === 'ROOTED';
+  const verdict = rooted ? out.result.tier : e.verdict;
+  const passed = rooted
+    ? out.result.tier === 'CANDIDATE' || out.result.tier === 'WATCH'
+    : e.verdict === 'STRONG' || e.verdict === 'PROMISING';
+  const src = rooted ? out.result : e;
+  return {
+    address: mint,
+    symbol: out.symbol,
+    name: out.analysis.identity.name,
+    kind: 'deep',
+    stage: e.stage,
+    verdict,
+    score: rooted ? out.result.score : e.score,
+    rank,
+    passed,
+    ageDays,
+    marketCapUsd: out.mcap,
+    liquidityUsd: out.liq,
+    headline: passed ? (src.strengths[0] ?? null) : (src.disqualifiers[0] ?? src.concerns[0] ?? null),
+    checkedAt: Date.now(),
+    deepAt: Date.now(),
+  };
 }
 
 chrome.notifications?.onClicked.addListener((id) => {
@@ -1163,30 +1359,6 @@ chrome.notifications?.onClicked.addListener((id) => {
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${id.slice('ck-lh-'.length)}` });
   chrome.notifications.clear(id);
 });
-
-const TIER_ORDER: LongHoldTier[] = ['CANDIDATE', 'WATCH', 'LATE', 'TOO_EARLY', 'WEAK', 'NOT_A_HOLD', 'NO_DATA'];
-const tierRank = (t: LongHoldTier) => TIER_ORDER.indexOf(t);
-
-function radarRowOf(
-  address: string,
-  symbol: string | null,
-  r: LongHoldResult,
-  mcap: number | null,
-  liq: number | null,
-): RadarRow {
-  return {
-    address,
-    symbol,
-    name: null,
-    tier: r.tier,
-    score: r.score,
-    ageDays: r.ageDays,
-    marketCapUsd: mcap,
-    liquidityUsd: liq,
-    headline: r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? null,
-    checkedAt: Date.now(),
-  };
-}
 
 /**
  * Full staying-power assessment for one coin. `hint` = discovery data from the
@@ -1240,7 +1412,8 @@ async function doAssessLongHold(address: string, hint?: RadarPool, fresh = false
   const pool = hint?.pool ?? dex?.pairAddress ?? null;
   const [candles, poolStats, info] = await Promise.all([
     pool ? cachedCandles(pool) : Promise.resolve(null),
-    hint ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
+    // Unique buyers/sellers: from the discovery hint if it has them, else the pool.
+    hint && hint.buyers24h !== null ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
     // Holder counts drive "+N holders/hour" for tracked seeds — refresh faster then.
     cachedTokenInfo(address, fresh ? 15 * 60_000 : LH_CACHE_MS),
   ]);
@@ -1418,6 +1591,24 @@ async function getGems(): Promise<GemsResponse> {
       (b.lastMcap ?? 0) / b.spottedMcap - (a.lastMcap ?? 0) / a.spottedMcap,
   );
   return { ok: true, gems: sorted, portfolio: computeGemPortfolio(gems, EARLY_GEM.reportHorizonsDays) };
+}
+
+/** Launch score from whatever the scan has (lite or full). Unknowns score 0. */
+function earlyForFeed(entry: CacheEntry): FeedRow['early'] {
+  const a = entry.analysis;
+  const e = assessEarlyGem(a, entry.risk, {
+    ageHours: a.identity.ageMinutes !== null ? a.identity.ageMinutes / 60 : null,
+    buyers24h: null,
+    sellers24h: null,
+    holderCount: a.holders?.holderCount ?? null,
+    history: [],
+    socials: { twitter: Boolean(a.socials?.twitter), telegram: Boolean(a.socials?.telegram), website: Boolean(a.socials?.website) },
+  });
+  return {
+    score: e.score,
+    verdict: e.verdict,
+    headline: e.disqualifiers[0] ?? e.strengths[0] ?? e.concerns[0] ?? null,
+  };
 }
 
 /* Spotting ─────────────────────────────────────────────────────────────── */

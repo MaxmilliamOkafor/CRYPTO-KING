@@ -128,6 +128,21 @@ export async function fetchRadarPools(): Promise<RadarPool[]> {
   return [...byMint.values()];
 }
 
+/**
+ * The newest Solana pools, newest first. Every pump.fun graduation (and every
+ * other listing) creates a pool, so polling this every minute captures coins
+ * the moment they become tradeable on a DEX — the radar revisits them once
+ * they've survived a day. [] on failure.
+ */
+export async function fetchNewPools(pages = 2): Promise<RadarPool[]> {
+  if (MOCK_MODE || !GECKO.enabled) return [];
+  const out: RadarPool[] = [];
+  for (let page = 1; page <= pages; page++) {
+    out.push(...parsePools(await fetchJson(`${GECKO.baseUrl}/networks/solana/new_pools?page=${page}`)));
+  }
+  return out;
+}
+
 /** Base tokens that are infrastructure, not memes — never radar candidates. */
 const NOT_MEMES = new Set([
   'So11111111111111111111111111111111111111112', // wSOL

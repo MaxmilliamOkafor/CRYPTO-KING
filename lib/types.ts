@@ -399,23 +399,44 @@ export type GemsResponse =
   | { ok: true; gems: TrackedGem[]; portfolio: GemPortfolioRow[] }
   | { ok: false; error: string };
 
-/** One row of the long-hold radar list. */
+/** One row of the radar: young (1–21 days), low-cap coins, best first. */
 export interface RadarRow {
   address: string;
   symbol: string | null;
   name: string | null;
-  tier: LongHoldTier;
+  /** 'deep' = full background check done; 'quick' = passed the cheap screen,
+   *  deep check queued. */
+  kind: 'deep' | 'quick';
+  stage: GemStage;
+  /** Deep rows: long-hold tier (3+ days) or early verdict (< 3 days). */
+  verdict: LongHoldTier | EarlyVerdict | null;
+  /** Deep rows: Staying Power / Early Conviction %. */
   score: number | null;
+  /** Quick-screen rank 0–100 (every row). */
+  rank: number;
+  /** Deep rows: passed (CANDIDATE/WATCH/STRONG/PROMISING). Quick rows: true. */
+  passed: boolean;
   ageDays: number | null;
   marketCapUsd: number | null;
   liquidityUsd: number | null;
-  /** Best strength, or the reason it fails — one line for the list. */
   headline: string | null;
+  /** When the quick screen last saw it. */
   checkedAt: number;
+  /** When it was last deep-checked (null = never). */
+  deepAt: number | null;
 }
 
 export type RadarResponse =
-  | { ok: true; rows: RadarRow[]; sweptAt: number | null; sweeping: boolean; checked: number }
+  | {
+      ok: true;
+      rows: RadarRow[];
+      sweptAt: number | null;
+      sweeping: boolean;
+      /** Coins being watched right now (seen launches + discovery). */
+      watching: number;
+      /** Deep checks done in total. */
+      checked: number;
+    }
   | { ok: false; error: string };
 
 export type LongHoldResponse =
@@ -521,6 +542,9 @@ export interface FeedRow {
   twitter: string | null;
   /** 🌱 Followed by the gem tracker. */
   tracked: boolean;
+  /** 🌱 Launch score (lib/earlyGem.ts) — what the feed SHOWS for coins not
+   *  fully scanned yet, instead of an audit grade capped by missing data. */
+  early: { score: number | null; verdict: EarlyVerdict; headline: string | null } | null;
   insufficientData: boolean;
   /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
   unverified: boolean;

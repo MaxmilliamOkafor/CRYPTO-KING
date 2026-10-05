@@ -333,7 +333,7 @@ function computeKingGrade(a, risk, quality) {
   let ceiling = 100;
   const applyCap = (limit, why) => {
     if (limit < ceiling) ceiling = limit;
-    if (raw > limit) caps.push(`Ceiling ${limit}%: ${why}`);
+    if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
   const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
   const live = assessLiveState(a.market);
@@ -350,15 +350,14 @@ function computeKingGrade(a, risk, quality) {
   if (!gemBackgroundCheck(a, risk, quality).gem) {
     applyCap(KING_GRADE.caps.noGemPass, "80%+ is reserved for coins that pass the full background check.");
   }
-  let gradeF;
-  if (raw <= ceiling) {
-    gradeF = raw;
-  } else {
-    const band = Math.min(22, ceiling);
-    gradeF = ceiling - band + band * ((raw - ceiling) / (100 - ceiling));
-  }
-  const grade = Math.round(Math.min(ceiling, Math.max(0, gradeF)));
+  const grade = Math.round(Math.max(0, capCurve(raw, ceiling)));
   return { grade, label: gradeLabel(grade), caps, parts: { safety, quality: quality.qualityScore, coveragePct } };
+}
+function capCurve(raw, ceiling) {
+  if (ceiling >= 100) return raw;
+  const knee = ceiling * 0.7;
+  if (raw <= knee) return raw;
+  return knee + (ceiling - knee) * ((Math.min(raw, 100) - knee) / (100 - knee));
 }
 function gradeLabel(grade) {
   if (grade === null) return "NO DATA";

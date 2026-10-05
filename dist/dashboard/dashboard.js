@@ -86,7 +86,38 @@ document.addEventListener("DOMContentLoaded", () => {
   void loadAll();
   loadAccuracy();
   loadLongHoldAccuracy();
+  loadGemPortfolio();
 });
+function loadGemPortfolio() {
+  chrome.runtime.sendMessage({ type: "GET_GEMS" }, (res) => {
+    const body = $("gem-body");
+    const note = $("gem-note");
+    if (!res || !res.ok) {
+      note.textContent = "Gem tracker unavailable.";
+      return;
+    }
+    body.innerHTML = "";
+    const x = (v) => v === null ? "\u2014" : `${v >= 10 ? v.toFixed(0) : v.toFixed(2)}\xD7`;
+    for (const r of res.portfolio) {
+      const tr = document.createElement("tr");
+      const pf = document.createElement("td");
+      pf.textContent = x(r.portfolioMultiple);
+      if (r.portfolioMultiple !== null) pf.className = r.portfolioMultiple >= 1 ? "pnl-pos" : "pnl-neg";
+      tr.append(
+        td(`${r.horizonDays} day${r.horizonDays > 1 ? "s" : ""}`),
+        td(String(r.eligible)),
+        td(String(r.measured)),
+        td(r.measured ? `${r.alive}/${r.measured}` : "\u2014"),
+        pf,
+        td(x(r.medianMultiple)),
+        td(r.bestMultiple === null ? "\u2014" : `${r.bestSymbol ?? "?"} ${x(r.bestMultiple)}`)
+      );
+      body.appendChild(tr);
+    }
+    const active = res.gems.filter((g) => g.status === "ACTIVE").length;
+    note.textContent = res.gems.length === 0 ? "No picks yet \u2014 the tracker spots strong launches from the live feed while the browser is open." : `${res.gems.length} picks tracked (${active} active, ${res.gems.length - active} dropped). Results fill in as each pick reaches 1, 7 and 30 days.`;
+  });
+}
 function loadLongHoldAccuracy() {
   chrome.runtime.sendMessage({ type: "GET_LH_ACCURACY" }, (res) => {
     const body = $("lh-body");

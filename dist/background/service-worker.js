@@ -103,6 +103,43 @@ var GECKO = {
     "/networks/solana/pools?page=1&sort=h24_tx_count_desc"
   ]
 };
+var EARLY_GEM = {
+  enabled: true,
+  /** Only coins at or below this market cap are spotted — "early" means early. */
+  maxSpotMcapUsd: 3e5,
+  /** Lite (feed) score needed before spending a full background check. */
+  prelimMinScore: 40,
+  /** Full-scan score needed to be added to the tracker. */
+  spotMinScore: 55,
+  /** Verdict cut-offs. */
+  strongScore: 65,
+  promisingScore: 45,
+  /** Full checks of new launches per feed sweep (run in the background). */
+  fullChecksPerSweep: 2,
+  /** Max coins followed at once (oldest dropped ones fall off first). */
+  maxTracked: 40,
+  /** Re-check cadence by stage (minutes). */
+  recheckMinutes: { SEED: 10, SPROUT: 30, ROOTED: 120, DROPPED: 360 },
+  /** Coins re-checked per tick (keeps the shared RPC budget sane). */
+  checksPerTick: 6,
+  /** Disqualifiers at launch. */
+  maxDevPct: 5,
+  maxLargestWalletPct: 8,
+  maxTop10Pct: 30,
+  /** Current cap below this share of its all-time high = the pump-and-dump
+   *  already happened. */
+  minAthRatio: 0.3,
+  /** Holder growth benchmarks (new holders per hour) from early-winner data. */
+  strongHoldersPerHour: 50,
+  okHoldersPerHour: 15,
+  /** Multiples since first sight that trigger a milestone alert. */
+  multipleMilestones: [2, 5, 10, 25, 100],
+  /** "If you'd bought every pick at first sight" horizons (days). */
+  reportHorizonsDays: [1, 7, 30],
+  /** Keep following DROPPED coins (price only) this long, so the report
+   *  includes the losers too — otherwise it would be survivorship bias. */
+  followDroppedDays: 31
+};
 var LONG_HOLD = {
   enabled: true,
   /** Younger than this = inside the rug/abandon window — can't judge durability. */
@@ -811,6 +848,242 @@ function assessLiveState(market, t = LIVE_STATE) {
   return { state: "HEALTHY", reasons: [] };
 }
 
+// lib/earlyGem.ts
+var acc = (max) => ({ score: 0, max, good: [], bad: [], unknown: [] });
+function stageForAge(ageHours) {
+  if (ageHours === null || ageHours < 24) return "SEED";
+  return ageHours < 72 ? "SPROUT" : "ROOTED";
+}
+function assessEarlyGem(a, risk, x, t = EARLY_GEM) {
+  const dq = [];
+  let softOnly = true;
+  const hard = (msg) => {
+    dq.push(msg);
+    softOnly = false;
+  };
+  const m = a.mint;
+  const L = a.launch;
+  const onCurve = L?.bondingCurveComplete === false;
+  const mcap = a.market?.marketCapEur ?? null;
+  const liq = a.market?.liquidityEur ?? null;
+  if (m?.mintAuthorityActive === true) hard("Mint authority active \u2014 supply can be inflated.");
+  if (m?.freezeAuthorityActive === true) hard("Freeze authority active \u2014 wallets can be frozen.");
+  if (m?.permanentDelegateActive || m?.nonTransferable || m?.defaultAccountFrozen || m?.transferHookActive) {
+    hard("Token-2022 trap extension present.");
+  }
+  if (a.market?.sellSimulation?.ok === false) hard("Simulated sell fails \u2014 honeypot.");
+  const lp = a.market?.lpStatus ?? "unknown";
+  if (!onCurve && (lp === "unlocked" || lp === "deployer_held")) hard("Liquidity can be pulled (LP not burned/locked).");
+  if (L?.bannedOnPlatform === true) hard("Banned on its own launchpad.");
+  if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) hard("Creator is a serial launcher of dead coins.");
+  const dev = a.holders?.devHoldsPct ?? null;
+  if (dev !== null && dev > t.maxDevPct) hard(`Dev holds ${dev.toFixed(1)}% \u2014 they'd be selling into your hold.`);
+  const whale = a.holders?.largestNonLpWalletPct ?? null;
+  if (whale !== null && whale > t.maxLargestWalletPct) hard(`One wallet already holds ${whale.toFixed(1)}%.`);
+  const top10 = a.holders?.top10Pct ?? null;
+  if (top10 !== null && top10 > t.maxTop10Pct) hard(`Top 10 wallets hold ${top10.toFixed(0)}% \u2014 snipers/insiders own it.`);
+  const athR = L?.athRatio ?? null;
+  if (athR !== null && athR < t.minAthRatio) {
+    hard(`Already ${Math.round((1 - athR) * 100)}% below its peak \u2014 the pump-and-dump happened.`);
+  }
+  const volLiq = a.market?.volume24hEur != null && liq ? a.market.volume24hEur / liq : null;
+  if (volLiq !== null && volLiq > 10) hard(`Volume ${volLiq.toFixed(0)}\xD7 liquidity \u2014 wash trading.`);
+  const live = assessLiveState(a.market);
+  if (live.state === "DEAD") hard(`Already rugged/dead \u2014 ${live.reasons[0] ?? "market collapsed."}`);
+  if (live.state === "DUMPING") dq.push(`Dumping right now \u2014 ${live.reasons[0] ?? "falling hard."}`);
+  const cm = acc(30);
+  const so = x.socials;
+  if (so.telegram) cm.score += 10;
+  if (so.twitter) cm.score += 8;
+  if (so.website) cm.score += 5;
+  const n = Number(so.telegram) + Number(so.twitter) + Number(so.website);
+  if (n === 3) cm.good.push("Telegram + X + website \u2014 launches like this graduate ~17\xD7 more often.");
+  else if (so.telegram) cm.good.push("Has a Telegram \u2014 the strongest single launch signal (8.9\xD7).");
+  if (n < 3) cm.bad.push(`Missing ${[!so.telegram && "Telegram", !so.twitter && "X", !so.website && "website"].filter(Boolean).join(", ")}.`);
+  const replies = L?.replyCount ?? null;
+  if (replies === null) cm.unknown.push("launchpad replies");
+  else if (replies >= 50) {
+    cm.score += 4;
+    cm.good.push(`${replies} replies on pump.fun \u2014 people are talking.`);
+  } else if (replies >= 15) cm.score += 2;
+  if (x.holderCount !== null) {
+    if (x.holderCount >= 500) {
+      cm.score += 3;
+      cm.good.push(`${x.holderCount.toLocaleString("en-US")} holders already.`);
+    } else if (x.holderCount >= 200) cm.score += 1;
+  }
+  const fl = acc(30);
+  if (top10 === null) fl.unknown.push("top-10 concentration");
+  else {
+    fl.score += top10 <= 10 ? 12 : top10 <= 15 ? 8 : top10 <= 20 ? 4 : 0;
+    (top10 <= 15 ? fl.good : fl.bad).push(`Top 10 wallets hold ${top10.toFixed(1)}% (curve/pool excluded).`);
+  }
+  if (whale === null) fl.unknown.push("largest wallet");
+  else fl.score += whale <= 2 ? 8 : whale <= 3 ? 6 : whale <= 5 ? 3 : 0;
+  if (dev === null) fl.unknown.push("dev holdings");
+  else {
+    fl.score += dev <= 1 ? 6 : dev <= 3 ? 4 : dev <= 5 ? 2 : 0;
+    if (dev <= 1) fl.good.push("Dev holds ~nothing \u2014 no team bag over your head.");
+  }
+  const d = a.deployer;
+  if (d?.priorLaunches != null && d.graduatedLaunches != null && d.priorLaunches >= 2 && d.graduatedLaunches / d.priorLaunches >= 0.5) {
+    fl.score += 4;
+    fl.good.push(`Creator has a track record \u2014 ${d.graduatedLaunches}/${d.priorLaunches} past coins graduated.`);
+  } else if (d?.priorLaunches == null) fl.unknown.push("creator history");
+  const mo = acc(25);
+  const prog = L?.curveProgressPct ?? null;
+  if (L?.bondingCurveComplete === true) {
+    mo.score += 10;
+    mo.good.push("Graduated off the bonding curve \u2014 real buyers carried it.");
+  } else if (prog === null || x.ageHours === null) mo.unknown.push("curve progress");
+  else {
+    const perHour = prog / Math.max(x.ageHours, 0.25);
+    mo.score += perHour >= 25 ? 10 : perHour >= 10 ? 6 : perHour >= 3 ? 3 : 0;
+    if (perHour >= 10) mo.good.push(`Filling its curve fast \u2014 ${prog.toFixed(0)}% in ${fmtAge(x.ageHours)}.`);
+    else if (perHour < 3) mo.bad.push(`Stalling \u2014 only ${prog.toFixed(0)}% of the curve after ${fmtAge(x.ageHours)}.`);
+  }
+  if (x.buyers24h !== null) {
+    mo.score += x.buyers24h >= 300 ? 8 : x.buyers24h >= 100 ? 5 : x.buyers24h >= 40 ? 2 : 0;
+    if (x.buyers24h >= 100) mo.good.push(`${x.buyers24h} different wallets buying \u2014 broad demand.`);
+  } else if (L?.kingOfTheHill === true) {
+    mo.score += 6;
+    mo.good.push("Reached king of the hill on pump.fun.");
+  } else mo.unknown.push("buyer breadth");
+  const buys = x.buyers24h ?? a.market?.buys1h ?? null;
+  const sells = x.sellers24h ?? a.market?.sells1h ?? null;
+  if (buys !== null && sells !== null && buys + sells > 0) {
+    if (buys >= sells) mo.score += 4;
+    else mo.bad.push(`More selling than buying (${sells} vs ${buys}).`);
+  }
+  if (athR !== null) {
+    if (athR >= 0.6) mo.score += 3;
+    else if (athR >= 0.4) mo.score += 1;
+    if (athR < 0.6) mo.bad.push(`${Math.round((1 - athR) * 100)}% below its peak.`);
+  }
+  const ch1h = a.market?.priceChange1h ?? null;
+  if (ch1h !== null && ch1h >= 300 && volLiq !== null && volLiq < 0.2) {
+    mo.score = Math.max(0, mo.score - 6);
+    mo.bad.push(`+${ch1h.toFixed(0)}% in an hour on thin volume \u2014 artificial pump pattern.`);
+  }
+  const cv = acc(15);
+  const hph = holdersPerHour(x.history, x.holderCount);
+  if (hph === null) cv.unknown.push("holder growth (builds up while tracked)");
+  else if (hph >= t.strongHoldersPerHour) {
+    cv.score += 6;
+    cv.good.push(`+${Math.round(hph)} holders/hour \u2014 the pace early winners show.`);
+  } else if (hph >= t.okHoldersPerHour) cv.score += 3;
+  else if (hph < 0) cv.bad.push("Holders are leaving.");
+  const held = heldThroughDip(x.history);
+  if (held === null) cv.unknown.push("reaction to its first dip");
+  else if (held) {
+    cv.score += 5;
+    cv.good.push("Community held through a 25%+ dip \u2014 holders didn't panic.");
+  } else cv.bad.push("Holders sold out on the first dip.");
+  const first = x.history.find((h) => h.mcap !== null);
+  if (first?.mcap && mcap !== null) {
+    if (mcap >= first.mcap) cv.score += 4;
+  } else cv.unknown.push("trend since first sight");
+  const parts = [
+    ["community", "Community signals", cm],
+    ["fairLaunch", "Fair launch", fl],
+    ["momentum", "Organic momentum", mo],
+    ["conviction", "Holder conviction", cv]
+  ];
+  const pillars = parts.map(([key, label, p]) => ({
+    key,
+    label,
+    score: Math.min(p.max, Math.max(0, p.score)),
+    max: p.max,
+    good: p.good,
+    bad: p.bad,
+    unknown: p.unknown
+  }));
+  const score = pillars.reduce((s, p) => s + p.score, 0);
+  const coreVerified = m?.mintAuthorityActive === false && m?.freezeAuthorityActive === false && top10 !== null && whale !== null;
+  let verdict;
+  if (risk.insufficientData) verdict = "NO_DATA";
+  else if (dq.length > 0) verdict = "REJECT";
+  else if (score >= t.strongScore && coreVerified) verdict = "STRONG";
+  else if (score >= t.promisingScore) verdict = "PROMISING";
+  else verdict = "WEAK";
+  return {
+    stage: stageForAge(x.ageHours),
+    verdict,
+    score: verdict === "NO_DATA" ? null : score,
+    pillars,
+    disqualifiers: dq,
+    hardBreak: dq.length > 0 && !softOnly,
+    strengths: pillars.flatMap((p) => p.good),
+    concerns: pillars.flatMap((p) => p.bad),
+    unverified: pillars.flatMap((p) => p.unknown),
+    ageHours: x.ageHours,
+    curveProgressPct: prog
+  };
+}
+function holdersPerHour(h, current2) {
+  const pts = h.filter((s) => s.holders !== null).map((s) => ({ at: s.at, n: s.holders }));
+  if (current2 !== null) pts.push({ at: Date.now(), n: current2 });
+  if (pts.length < 2) return null;
+  const a = pts[0];
+  const b = pts[pts.length - 1];
+  const hours = (b.at - a.at) / 36e5;
+  if (hours < 1) return null;
+  return (b.n - a.n) / hours;
+}
+function heldThroughDip(h) {
+  let peakMcap = 0;
+  let peakHolders = null;
+  for (const s of h) {
+    if (s.mcap === null) continue;
+    if (s.mcap > peakMcap) {
+      peakMcap = s.mcap;
+      peakHolders = s.holders;
+      continue;
+    }
+    if (s.mcap <= peakMcap * 0.75 && peakHolders !== null && s.holders !== null) {
+      return s.holders >= peakHolders * 0.97;
+    }
+  }
+  return null;
+}
+function computeGemPortfolio(gems, horizonsDays, now2 = Date.now()) {
+  return horizonsDays.map((days) => {
+    const ms = days * 864e5;
+    const eligible = gems.filter((g) => now2 - g.spottedAt >= ms && g.spottedMcap > 0);
+    const results = [];
+    for (const g of eligible) {
+      const target = g.spottedAt + ms;
+      const tol = Math.max(6 * 36e5, ms / 4);
+      let best = null;
+      for (const s of g.snapshots) {
+        if (Math.abs(s.at - target) <= tol && (!best || Math.abs(s.at - target) < Math.abs(best.at - target))) best = s;
+      }
+      if (!best) continue;
+      if (best.dead) results.push({ mult: 0, dead: true, sym: g.symbol });
+      else if (best.mcap !== null) results.push({ mult: best.mcap / g.spottedMcap, dead: false, sym: g.symbol });
+    }
+    const mults = results.map((r) => r.mult).sort((a, b) => a - b);
+    const top = results.reduce((b, r) => !b || r.mult > b.mult ? r : b, null);
+    return {
+      horizonDays: days,
+      eligible: eligible.length,
+      measured: results.length,
+      alive: results.filter((r) => !r.dead && r.mult >= 0.1).length,
+      portfolioMultiple: mults.length ? mults.reduce((s, v) => s + v, 0) / mults.length : null,
+      medianMultiple: mults.length ? median2(mults) : null,
+      bestMultiple: top ? top.mult : null,
+      bestSymbol: top ? top.sym : null
+    };
+  });
+}
+function median2(sorted) {
+  const k = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[k] : (sorted[k - 1] + sorted[k]) / 2;
+}
+function fmtAge(h) {
+  return h < 1 ? `${Math.round(h * 60)} min` : h < 48 ? `${h.toFixed(1)}h` : `${Math.floor(h / 24)} days`;
+}
+
 // lib/rugPotential.ts
 function assessRugPotential(a, risk) {
   const hard = [];
@@ -864,7 +1137,7 @@ function assessRugPotential(a, risk) {
 }
 
 // lib/longHold.ts
-var acc = (max) => ({ score: 0, max, good: [], bad: [], unknown: [] });
+var acc2 = (max) => ({ score: 0, max, good: [], bad: [], unknown: [] });
 function assessLongHold(a, risk, x, t = LONG_HOLD) {
   const disqualifiers = [];
   const mcap = a.market?.marketCapEur ?? null;
@@ -892,7 +1165,7 @@ function assessLongHold(a, risk, x, t = LONG_HOLD) {
     disqualifiers.push(`24h volume is ${volLiq.toFixed(0)}\xD7 its liquidity \u2014 almost certainly wash-traded.`);
   }
   if (risk.reasons.some((r) => /Serial launcher/.test(r.text))) disqualifiers.push("Creator is a serial launcher of dead coins.");
-  const sv = acc(20);
+  const sv = acc2(20);
   const age = x.ageDays;
   if (age === null) sv.unknown.push("coin age");
   else {
@@ -911,7 +1184,7 @@ function assessLongHold(a, risk, x, t = LONG_HOLD) {
     } else if (ratio < 0.7) sv.bad.push("Went quiet for stretches \u2014 interest is not continuous.");
     else sv.score += 2;
   }
-  const cm = acc(15);
+  const cm = acc2(15);
   if (x.socials.telegram) cm.score += 4;
   if (x.socials.twitter) cm.score += 3;
   if (x.socials.website) cm.score += 2;
@@ -934,7 +1207,7 @@ function assessLongHold(a, risk, x, t = LONG_HOLD) {
     cm.good.push(`Holders growing ~${growth.toFixed(1)}%/day.`);
   } else if (growth >= 0) cm.score += 1;
   else cm.bad.push(`Holders shrinking (${growth.toFixed(1)}%/day) \u2014 people are leaving.`);
-  const ds = acc(20);
+  const ds = acc2(20);
   if (top10 === null) ds.unknown.push("top-10 concentration");
   else {
     ds.score += top10 <= 15 ? 10 : top10 <= 25 ? 7 : top10 <= 35 ? 4 : 0;
@@ -950,7 +1223,7 @@ function assessLongHold(a, risk, x, t = LONG_HOLD) {
     ds.score += dev <= 1 ? 4 : dev <= 3 ? 2 : 0;
     if (dev <= 1) ds.good.push("Dev holds ~nothing \u2014 no team bag waiting to sell.");
   }
-  const lq = acc(15);
+  const lq = acc2(15);
   if (lp === "burned") {
     lq.score += 5;
     lq.good.push("LP burned \u2014 liquidity can never be pulled.");
@@ -966,7 +1239,7 @@ function assessLongHold(a, risk, x, t = LONG_HOLD) {
     if (r < 0.03) lq.bad.push(`Liquidity only ${(r * 100).toFixed(1)}% of cap \u2014 price is fragile.`);
     else if (liq >= 1e5) lq.good.push(`Deep liquidity ($${fmtK(liq)}, ${(r * 100).toFixed(0)}% of cap).`);
   }
-  const dm = acc(15);
+  const dm = acc2(15);
   if (volLiq === null) dm.unknown.push("volume vs liquidity");
   else if (volLiq >= 0.1 && volLiq <= 1) {
     dm.score += 5;
@@ -997,7 +1270,7 @@ function assessLongHold(a, risk, x, t = LONG_HOLD) {
       if (recent >= prior) dm.good.push("Volume holding up week over week \u2014 not a one-off spike.");
     } else if (prior > 0) dm.bad.push("Volume collapsed vs the week before \u2014 hype is fading.");
   } else dm.unknown.push("volume persistence (needs 14 days of history)");
-  const rs = acc(15);
+  const rs = acc2(15);
   let deathSpiral = false;
   if (!k || k.length < 7) rs.unknown.push("price history (needs 7+ days)");
   else {
@@ -1122,7 +1395,11 @@ function fmtDays(d) {
 var PUMP_MIGRATION_DEXES = /* @__PURE__ */ new Set(["pumpswap", "raydium"]);
 function resolveLpStatus(i) {
   if (i.gmgn && i.gmgn !== "unknown") return i.gmgn;
-  if (i.pumpGraduated === true && i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return "burned";
+  if (i.pumpGraduated === true) {
+    if (i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return "burned";
+    if (i.deepestDexId === null) return i.audit === "unlocked" ? "unknown" : i.audit ?? "unknown";
+  }
+  if (i.pumpGraduated === false) return "unknown";
   return i.audit ?? "unknown";
 }
 function lpStatusFromLockedPct(pct) {
@@ -1365,7 +1642,10 @@ async function fetchPumpfunData(address) {
       creator: null,
       socials: f.socials,
       replyCount: null,
-      bondingCurveAccounts: []
+      bondingCurveAccounts: [],
+      curveProgressPct: null,
+      athRatio: null,
+      kingOfTheHill: null
     };
   }
   if (!PUMPFUN.enabled) return { ...EMPTY, status: "disabled" };
@@ -1401,8 +1681,24 @@ async function fetchPumpfunData(address) {
       asString(pick(json, ["bonding_curve"])),
       asString(pick(json, ["associated_bonding_curve"])),
       asString(pick(json, ["pool_address"]))
-    ].filter((s) => s !== null)
+    ].filter((s) => s !== null),
+    curveProgressPct: curveProgress(asBoolLoose(pick(json, ["complete"])), asNumber(pick(json, ["real_sol_reserves"]))),
+    athRatio: athRatio(asNumber(pick(json, ["market_cap"])), asNumber(pick(json, ["ath_market_cap"]))),
+    // Present-but-null = never reached it; key missing entirely = unknown.
+    kingOfTheHill: typeof json === "object" && json !== null && "king_of_the_hill_timestamp" in json ? pick(json, ["king_of_the_hill_timestamp"]) != null : null
   };
+}
+function curveProgress(complete, realSolLamports) {
+  if (complete === true) return 100;
+  if (realSolLamports === null || realSolLamports < 0) return null;
+  const sol = realSolLamports / 1e9;
+  if (sol > 120) return null;
+  return Math.min(100, sol / 85 * 100);
+}
+function athRatio(mcap, athMcap) {
+  if (mcap === null || athMcap === null || athMcap <= 0 || mcap <= 0) return null;
+  const r = mcap / athMcap;
+  return r > 1.05 ? null : Math.min(1, r);
 }
 var BASE58_RE2 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 async function fetchPumpfunNewCoins(limit, offset = 0) {
@@ -1468,7 +1764,10 @@ var EMPTY = {
   creator: null,
   socials: null,
   replyCount: null,
-  bondingCurveAccounts: []
+  bondingCurveAccounts: [],
+  curveProgressPct: null,
+  athRatio: null,
+  kingOfTheHill: null
 };
 
 // lib/deployerClient.ts
@@ -1600,14 +1899,14 @@ function peekDexscreenerToken(mint) {
   const hit = marketCache.get(mint);
   return hit && Date.now() - hit.at < MARKET_TTL_MS ? hit.m : void 0;
 }
-async function fetchDexscreenerToken(mint) {
-  const r = await lookupDexscreenerToken(mint);
+async function fetchDexscreenerToken(mint, fresh = false) {
+  const r = await lookupDexscreenerToken(mint, fresh);
   return r.status === "ok" ? r.market : null;
 }
-async function lookupDexscreenerToken(mint) {
+async function lookupDexscreenerToken(mint, fresh = false) {
   if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE3.test(mint)) return { status: "error" };
   const hit = marketCache.get(mint);
-  if (hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: "ok", market: hit.m };
+  if (!fresh && hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: "ok", market: hit.m };
   const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
   const pairs = json?.pairs;
   if (json === null) return { status: "error" };
@@ -2471,10 +2770,10 @@ var rugcheckAdapter = {
 
 // lib/holderMath.ts
 var SYSTEM_PROGRAM = "11111111111111111111111111111111";
-function classifyHolder(acc2, burnAddresses, knownPoolOwners) {
-  if (acc2.owner !== null && burnAddresses.has(acc2.owner)) return "burn";
-  if (acc2.owner !== null && knownPoolOwners.has(acc2.owner)) return "program";
-  if (acc2.ownerProgram !== null && acc2.ownerProgram !== SYSTEM_PROGRAM) return "program";
+function classifyHolder(acc3, burnAddresses, knownPoolOwners) {
+  if (acc3.owner !== null && burnAddresses.has(acc3.owner)) return "burn";
+  if (acc3.owner !== null && knownPoolOwners.has(acc3.owner)) return "program";
+  if (acc3.ownerProgram !== null && acc3.ownerProgram !== SYSTEM_PROGRAM) return "program";
   return "wallet";
 }
 function computeConcentration(accounts, supply, burnAddresses, knownPoolOwners = /* @__PURE__ */ new Set()) {
@@ -2766,8 +3065,17 @@ async function handle(msg) {
     case "GET_LONGHOLD": {
       if (!BASE58_RE4.test(msg.address)) return { ok: false, error: "Not a valid Solana address." };
       const res = await assessLongHoldFor(msg.address);
-      return res ? { ok: true, result: res.result, symbol: res.symbol } : { ok: false, error: "Long-hold check unavailable." };
+      if (!res) return { ok: false, error: "Long-hold check unavailable." };
+      const tracked = (await loadGems()).gems.some((g) => g.address === msg.address && g.status === "ACTIVE");
+      return { ok: true, result: res.result, early: res.early, symbol: res.symbol, tracked };
     }
+    case "GET_GEMS":
+      return getGems();
+    case "TRACK_GEM":
+      if (!BASE58_RE4.test(msg.address)) return { ok: false, error: "Not a valid Solana address." };
+      return trackGemManually(msg.address);
+    case "UNTRACK_GEM":
+      return untrackGem(msg.address);
     case "GET_LH_ACCURACY": {
       const entries = await loadLhLedger();
       return { ok: true, rows: computeLongHoldAccuracy(entries, LONG_HOLD.ledgerCheckDays), tracked: entries.length };
@@ -2779,6 +3087,7 @@ async function handle(msg) {
 var feed = /* @__PURE__ */ new Map();
 var notified = /* @__PURE__ */ new Set();
 var feedInFlight = null;
+var lastFeedSweepAt = 0;
 function getLiveFeed() {
   if (!LIVE_FEED.enabled) return Promise.resolve({ ok: false, error: "Live feed disabled in config." });
   if (feedInFlight) return feedInFlight;
@@ -2788,6 +3097,7 @@ function getLiveFeed() {
   return feedInFlight;
 }
 async function doLiveFeedSweep() {
+  lastFeedSweepAt = Date.now();
   const [pumpCoins, dexAddrs] = await Promise.all([
     fetchPumpfunNewCoins(LIVE_FEED.fetchCount),
     fetchDexscreenerNewSolana(LIVE_FEED.fetchCount)
@@ -2838,6 +3148,7 @@ async function doLiveFeedSweep() {
   };
   await Promise.all(Array.from({ length: Math.min(effectiveConcurrency(), toScan.length) }, worker));
   let fullUpgradesThisPoll = 0;
+  const seedPool = [];
   for (const c of coins) {
     let entry = cache.get(c.mint);
     if (!entry) continue;
@@ -2874,13 +3185,16 @@ async function doLiveFeedSweep() {
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
       twitter: entry.analysis.socials?.twitter ?? null,
+      tracked: trackedMints.has(c.mint),
       insufficientData: entry.risk.insufficientData,
       unverified: entry.analysis.holders === null || !entry.analysis.market || entry.analysis.market.lpStatus === "unknown",
       scannedAt: Date.now()
     };
     feed.set(c.mint, row);
     maybeNotifyLowRisk(row);
+    seedPool.push({ mint: c.mint, entry });
   }
+  queueSeedCandidates(seedPool);
   const rows = [...feed.values()].sort((a, b) => (a.ageMinutes ?? 1e9) - (b.ageMinutes ?? 1e9)).slice(0, LIVE_FEED.maxRows);
   if (feed.size > LIVE_FEED.maxRows * 2) {
     const keep = new Set(rows.map((r) => r.address));
@@ -2905,7 +3219,7 @@ function maybeNotifyLowRisk(row) {
   });
 }
 chrome.notifications?.onClicked.addListener((id) => {
-  if (!id.startsWith("ck-") || id.startsWith("ck-watch-") || id.startsWith("ck-lh-")) return;
+  if (!id.startsWith("ck-") || id.startsWith("ck-watch-") || id.startsWith("ck-lh-") || id.startsWith("ck-gem-")) return;
   const address = id.slice(3);
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
@@ -2920,11 +3234,11 @@ async function analyzeToken(address, force, rawGmgn, lite = false) {
   }
   const pending = inFlight.get(address);
   if (pending) return pending;
-  const job = doAnalyze(address, rawGmgn, lite).finally(() => inFlight.delete(address));
+  const job = doAnalyze(address, rawGmgn, lite, force).finally(() => inFlight.delete(address));
   inFlight.set(address, job);
   return job;
 }
-async function doAnalyze(address, rawGmgn, lite = false) {
+async function doAnalyze(address, rawGmgn, lite = false, force = false) {
   try {
     const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : lite && !MOCK_MODE ? Promise.resolve(emptyGmgnData()) : fetchGmgnData(address);
     const pumpfun = await fetchPumpfunData(address);
@@ -2936,7 +3250,8 @@ async function doAnalyze(address, rawGmgn, lite = false) {
       lite ? Promise.resolve({ status: "disabled", lpStatus: null, externalFlags: [] }) : rugcheckAdapter.fetchAudit(address),
       // Always fetched: served from the sweep's batch cache for lite scans, so
       // rug/dump detection runs on EVERY coin, not just the ones you open.
-      fetchDexscreenerToken(address)
+      fetchDexscreenerToken(address, force)
+      // forced scans bypass the 60s market cache
     ]);
     let deployerHist = lite ? await nullDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator) : await pumpfunDeployerAdapter.fetchDeployerHistory(address, pumpfun.creator);
     deployerHist = await applyCreatorMemory(pumpfun.creator, deployerHist);
@@ -3061,7 +3376,10 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
       platform: "pumpfun",
       bondingCurveComplete: pumpfun.bondingCurveComplete,
       bannedOnPlatform: pumpfun.isBanned,
-      replyCount: pumpfun.replyCount
+      replyCount: pumpfun.replyCount,
+      curveProgressPct: pumpfun.curveProgressPct,
+      athRatio: pumpfun.athRatio,
+      kingOfTheHill: pumpfun.kingOfTheHill
     } : null,
     sources,
     fetchedAt: Date.now()
@@ -3218,6 +3536,9 @@ function ensureWatchAlarm() {
   if (LONG_HOLD.enabled && !MOCK_MODE) {
     chrome.alarms.create("ck-radar", { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
   }
+  if (EARLY_GEM.enabled && !MOCK_MODE) {
+    chrome.alarms.create("ck-gems", { periodInMinutes: Math.min(...Object.values(EARLY_GEM.recheckMinutes)) });
+  }
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "ck-watch") {
@@ -3226,11 +3547,15 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void recheckLhLedger();
   } else if (alarm.name === "ck-radar") {
     void runRadarSweep();
+  } else if (alarm.name === "ck-gems") {
+    void runGemTick();
+    if (Date.now() - lastFeedSweepAt > 5 * 6e4) void getLiveFeed();
   }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
 void loadSettings();
+void loadGems();
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith("ck-watch-")) return;
   const address = id.slice("ck-watch-".length).split("-")[0];
@@ -3319,7 +3644,6 @@ function marketFromDex(dex) {
 var RADAR_KEY = "ck:radar";
 var LH_HIST_KEY = "ck:lh-hist";
 var LH_LEDGER_KEY = "ck:lh-ledger";
-var lhCache = /* @__PURE__ */ new Map();
 var LH_CACHE_MS = 30 * 6e4;
 var candleCache = /* @__PURE__ */ new Map();
 var radarSweep = null;
@@ -3419,17 +3743,18 @@ function radarRowOf(address, symbol, r, mcap, liq) {
   };
 }
 var lhInFlight = /* @__PURE__ */ new Map();
-function assessLongHoldFor(address, hint) {
+var lhOutCache = /* @__PURE__ */ new Map();
+function assessLongHoldFor(address, hint, fresh = false) {
   const pending = lhInFlight.get(address);
   if (pending) return pending;
-  const job = doAssessLongHold(address, hint).finally(() => lhInFlight.delete(address));
+  const job = doAssessLongHold(address, hint, fresh).finally(() => lhInFlight.delete(address));
   lhInFlight.set(address, job);
   return job;
 }
 var infoCache = /* @__PURE__ */ new Map();
-async function cachedTokenInfo(mint) {
+async function cachedTokenInfo(mint, maxAgeMs = LH_CACHE_MS) {
   const hit = infoCache.get(mint);
-  if (hit && Date.now() - hit.at < LH_CACHE_MS) return hit.v;
+  if (hit && Date.now() - hit.at < maxAgeMs) return hit.v;
   const v = await fetchTokenInfo(mint);
   if (v !== null) {
     if (infoCache.size > 300) infoCache.clear();
@@ -3437,12 +3762,10 @@ async function cachedTokenInfo(mint) {
   }
   return v;
 }
-async function doAssessLongHold(address, hint) {
-  const hit = lhCache.get(address);
-  if (hit && Date.now() - hit.at < LH_CACHE_MS && !hint) {
-    return { result: hit.result, symbol: hit.symbol, mcap: null, liq: null };
-  }
-  const res = await analyzeToken(address, false);
+async function doAssessLongHold(address, hint, fresh = false) {
+  const hit = lhOutCache.get(address);
+  if (hit && Date.now() - hit.at < LH_CACHE_MS && !hint && !fresh) return hit.out;
+  const res = await analyzeToken(address, fresh);
   if (!res.ok) return null;
   const { analysis, risk } = res;
   const dex = await fetchDexscreenerToken(address);
@@ -3450,7 +3773,8 @@ async function doAssessLongHold(address, hint) {
   const [candles, poolStats, info] = await Promise.all([
     pool ? cachedCandles(pool) : Promise.resolve(null),
     hint ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
-    cachedTokenInfo(address)
+    // Holder counts drive "+N holders/hour" for tracked seeds — refresh faster then.
+    cachedTokenInfo(address, fresh ? 15 * 6e4 : LH_CACHE_MS)
   ]);
   const holderCount = analysis.holders?.holderCount ?? info?.holderCount ?? null;
   const holderHistory = await recordHolderSnapshot(address, holderCount);
@@ -3460,26 +3784,32 @@ async function doAssessLongHold(address, hint) {
     hint?.createdMs ? (Date.now() - hint.createdMs) / 864e5 : null,
     candles && candles.length ? (Date.now() / 1e3 - candles[0].t) / 86400 : null
   ].filter((v) => v !== null && Number.isFinite(v) && v >= 0);
+  const ageDays = ages.length ? Math.max(...ages) : null;
   const so = analysis.socials;
-  const result = assessLongHold(analysis, risk, {
-    ageDays: ages.length ? Math.max(...ages) : null,
-    candles,
-    buyers24h: poolStats?.buyers24h ?? null,
-    sellers24h: poolStats?.sellers24h ?? null,
+  const socials = {
+    twitter: Boolean(so?.twitter || info?.twitter),
+    telegram: Boolean(so?.telegram || info?.telegram),
+    website: Boolean(so?.website || info?.website)
+  };
+  const buyers24h = poolStats?.buyers24h ?? null;
+  const sellers24h = poolStats?.sellers24h ?? null;
+  const result = assessLongHold(analysis, risk, { ageDays, candles, buyers24h, sellers24h, holderCount, holderHistory, socials });
+  const tracked = (await loadGems()).gems.find((g) => g.address === address);
+  const early = assessEarlyGem(analysis, risk, {
+    ageHours: ageDays !== null ? ageDays * 24 : null,
+    buyers24h,
+    sellers24h,
     holderCount,
-    holderHistory,
-    socials: {
-      twitter: Boolean(so?.twitter || info?.twitter),
-      telegram: Boolean(so?.telegram || info?.telegram),
-      website: Boolean(so?.website || info?.website)
-    }
+    history: tracked?.snapshots ?? [],
+    socials
   });
   const symbol = analysis.identity.symbol;
-  lhCache.set(address, { result, symbol, at: Date.now() });
-  if (lhCache.size > 300) lhCache.clear();
   const mcap = analysis.market?.marketCapEur ?? null;
+  const out = { result, early, symbol, mcap, liq: analysis.market?.liquidityEur ?? null, holderCount, analysis };
+  if (lhOutCache.size > 300) lhOutCache.clear();
+  lhOutCache.set(address, { out, at: Date.now() });
   await recordLhPrediction(address, symbol, result, mcap);
-  return { result, symbol, mcap, liq: analysis.market?.liquidityEur ?? null };
+  return out;
 }
 async function cachedCandles(pool) {
   const hit = candleCache.get(pool);
@@ -3552,6 +3882,296 @@ async function recheckLhLedger() {
     await chrome.storage.local.set({ [LH_LEDGER_KEY]: cur });
   });
 }
+var GEMS_KEY = "ck:gems";
+var trackedMints = /* @__PURE__ */ new Set();
+async function loadGems() {
+  const d = await chrome.storage.local.get(GEMS_KEY);
+  const v = d[GEMS_KEY];
+  const gems = Array.isArray(v?.gems) ? v.gems : [];
+  trackedMints.clear();
+  for (const g of gems) if (g.status === "ACTIVE") trackedMints.add(g.address);
+  return { gems };
+}
+async function saveGems(store) {
+  trackedMints.clear();
+  for (const g of store.gems) if (g.status === "ACTIVE") trackedMints.add(g.address);
+  await chrome.storage.local.set({ [GEMS_KEY]: store });
+}
+async function getGems() {
+  if (!EARLY_GEM.enabled) return { ok: false, error: "Gem tracker disabled in config." };
+  const { gems } = await loadGems();
+  const sorted = [...gems].sort(
+    (a, b) => Number(a.status === "DROPPED") - Number(b.status === "DROPPED") || (b.lastMcap ?? 0) / b.spottedMcap - (a.lastMcap ?? 0) / a.spottedMcap
+  );
+  return { ok: true, gems: sorted, portfolio: computeGemPortfolio(gems, EARLY_GEM.reportHorizonsDays) };
+}
+var spotQueue = [];
+var spotConsidered = /* @__PURE__ */ new Map();
+var spotDraining = false;
+function queueSeedCandidates(entries) {
+  if (!EARLY_GEM.enabled || MOCK_MODE) return;
+  const now2 = Date.now();
+  const picks = entries.filter(({ mint, entry }) => {
+    if (trackedMints.has(mint)) return false;
+    const seen = spotConsidered.get(mint);
+    if (seen && now2 - seen < 6 * 36e5) return false;
+    const mc = entry.analysis.market?.marketCapEur ?? null;
+    return mc !== null && mc > 0 && mc <= EARLY_GEM.maxSpotMcapUsd;
+  }).map(({ mint, entry }) => {
+    const a = entry.analysis;
+    const prelim = assessEarlyGem(a, entry.risk, {
+      ageHours: a.identity.ageMinutes !== null ? a.identity.ageMinutes / 60 : null,
+      buyers24h: null,
+      sellers24h: null,
+      holderCount: null,
+      history: [],
+      socials: { twitter: Boolean(a.socials?.twitter), telegram: Boolean(a.socials?.telegram), website: Boolean(a.socials?.website) }
+    });
+    return { mint, prelim };
+  }).filter((x) => x.prelim.verdict !== "REJECT" && (x.prelim.score ?? 0) >= EARLY_GEM.prelimMinScore).sort((a, b) => (b.prelim.score ?? 0) - (a.prelim.score ?? 0)).slice(0, EARLY_GEM.fullChecksPerSweep);
+  for (const p of picks) {
+    spotConsidered.set(p.mint, now2);
+    spotQueue.push(p.mint);
+  }
+  if (spotConsidered.size > 2e3) spotConsidered.clear();
+  void drainSpotQueue();
+}
+async function drainSpotQueue() {
+  if (spotDraining) return;
+  spotDraining = true;
+  try {
+    while (spotQueue.length > 0) {
+      const mint = spotQueue.shift();
+      await considerSpot(mint).catch((e) => console.warn("[CRYPTO-KING] spot check failed", e));
+    }
+  } finally {
+    spotDraining = false;
+  }
+}
+async function considerSpot(mint) {
+  const out = await assessLongHoldFor(mint);
+  if (!out) return;
+  const e = out.early;
+  const ok = (e.verdict === "STRONG" || e.verdict === "PROMISING") && (e.score ?? 0) >= EARLY_GEM.spotMinScore && out.mcap !== null && out.mcap > 0 && out.mcap <= EARLY_GEM.maxSpotMcapUsd;
+  if (!ok) return;
+  const added = await enlistGem(mint, out, "auto");
+  if (added) {
+    const sym = out.symbol ?? short4(mint);
+    chrome.notifications.create(`ck-gem-${mint}-spotted`, {
+      type: "basic",
+      iconUrl: "icons/icon128.png",
+      title: `\u{1F331} Gem spotted early: ${sym} at ${usdK(out.mcap)} \u2014 conviction ${e.score}%`,
+      message: `${e.strengths[0] ?? "Strong early signals."} Now tracking it \u2014 you'll be alerted on milestones and if the thesis breaks. Most launches still fail: size it to lose.`
+    });
+  }
+}
+async function enlistGem(mint, out, source) {
+  if (out.mcap === null || out.mcap <= 0) return false;
+  return withLock(GEMS_KEY, async () => {
+    const store = await loadGems();
+    const existing = store.gems.find((g) => g.address === mint);
+    if (existing && existing.status === "ACTIVE") return false;
+    const active = store.gems.filter((g) => g.status === "ACTIVE").length;
+    if (source === "auto" && active >= EARLY_GEM.maxTracked) return false;
+    if (existing) store.gems = store.gems.filter((g) => g.address !== mint);
+    const now2 = Date.now();
+    const stage = out.early.stage;
+    store.gems.unshift({
+      address: mint,
+      symbol: out.symbol,
+      source,
+      spottedAt: now2,
+      spottedMcap: out.mcap,
+      status: "ACTIVE",
+      dropReason: null,
+      stage,
+      verdict: stage === "ROOTED" ? out.result.tier : out.early.verdict,
+      score: stage === "ROOTED" ? out.result.score : out.early.score,
+      lastMcap: out.mcap,
+      peakMcap: out.mcap,
+      lastCheckedAt: now2,
+      nextCheckAt: now2 + EARLY_GEM.recheckMinutes[stage] * 6e4,
+      fired: [],
+      events: [{ at: now2, text: `Spotted at ${usdK(out.mcap)} (${source === "auto" ? "auto" : "you added it"}).`, tone: "info" }],
+      snapshots: [snapOf(out)]
+    });
+    const cutoff = now2 - EARLY_GEM.followDroppedDays * 864e5;
+    store.gems = store.gems.filter((g) => g.status === "ACTIVE" || g.spottedAt > cutoff).slice(0, EARLY_GEM.maxTracked * 3);
+    await saveGems(store);
+    return true;
+  });
+}
+async function trackGemManually(address) {
+  const out = await assessLongHoldFor(address);
+  if (!out) return { ok: false, error: "Could not scan this coin \u2014 try again." };
+  if (out.mcap === null || out.mcap <= 0) return { ok: false, error: "No market cap yet \u2014 cannot measure your multiple." };
+  await enlistGem(address, out, "manual");
+  return getGems();
+}
+async function untrackGem(address) {
+  await withLock(GEMS_KEY, async () => {
+    const store = await loadGems();
+    store.gems = store.gems.filter((g) => g.address !== address);
+    await saveGems(store);
+  });
+  return getGems();
+}
+var gemTick = null;
+function runGemTick() {
+  if (gemTick) return gemTick;
+  gemTick = doGemTick().catch((e) => console.warn("[CRYPTO-KING] gem tick failed", e)).finally(() => {
+    gemTick = null;
+  });
+  return gemTick;
+}
+async function doGemTick() {
+  if (!EARLY_GEM.enabled || MOCK_MODE) return;
+  const now2 = Date.now();
+  const { gems } = await loadGems();
+  const due = gems.filter((g) => g.nextCheckAt <= now2).filter((g) => g.status === "ACTIVE" || now2 - g.spottedAt < EARLY_GEM.followDroppedDays * 864e5).sort((a, b) => a.nextCheckAt - b.nextCheckAt).slice(0, EARLY_GEM.checksPerTick);
+  const updates = /* @__PURE__ */ new Map();
+  const notes = [];
+  for (const g of due) {
+    if (g.status === "DROPPED") {
+      const snap = await priceOnlySnapshot(g.address);
+      updates.set(g.address, (cur) => {
+        if (snap) pushSnap(cur, snap);
+        cur.nextCheckAt = Date.now() + EARLY_GEM.recheckMinutes.DROPPED * 6e4;
+      });
+      continue;
+    }
+    const out = await assessLongHoldFor(
+      g.address,
+      void 0,
+      /*fresh*/
+      true
+    );
+    if (!out) {
+      updates.set(g.address, (cur) => {
+        cur.nextCheckAt = Date.now() + 15 * 6e4;
+      });
+      continue;
+    }
+    updates.set(g.address, (cur) => applyCheck(cur, out, notes));
+  }
+  if (updates.size === 0) return;
+  await withLock(GEMS_KEY, async () => {
+    const store = await loadGems();
+    for (const cur of store.gems) updates.get(cur.address)?.(cur);
+    await saveGems(store);
+  });
+  for (const n of notes) chrome.notifications.create(n.id, { type: "basic", iconUrl: "icons/icon128.png", title: n.title, message: n.message, priority: 2 });
+}
+function applyCheck(g, out, notes) {
+  const now2 = Date.now();
+  const sym = g.symbol ?? short4(g.address);
+  const fire = (kind, tone, text, alertTitle) => {
+    if (g.fired.includes(kind)) return;
+    g.fired.push(kind);
+    g.events.unshift({ at: now2, text, tone });
+    if (alertTitle) notes.push({ id: `ck-gem-${g.address}-${kind}`, title: alertTitle, message: `${text} Click to open.` });
+  };
+  pushSnap(g, snapOf(out));
+  const e = out.early;
+  g.stage = e.stage;
+  g.verdict = e.stage === "ROOTED" ? out.result.tier : e.verdict;
+  g.score = e.stage === "ROOTED" ? out.result.score : e.score;
+  g.lastMcap = out.mcap;
+  if (out.mcap !== null) g.peakMcap = Math.max(g.peakMcap ?? 0, out.mcap);
+  g.lastCheckedAt = now2;
+  const mult = out.mcap !== null ? out.mcap / g.spottedMcap : null;
+  const dead = assessLiveState(out.analysis.market).state === "DEAD";
+  if (e.hardBreak || dead) {
+    const why = e.disqualifiers.find((d) => !/^Dumping right now/.test(d)) ?? e.disqualifiers[0] ?? "market collapsed";
+    g.status = "DROPPED";
+    g.dropReason = why;
+    fire("dropped", "bad", `Thesis broken \u2014 ${why}`, `\u2702 ${sym}: thesis broken \u2014 consider exiting`);
+    g.nextCheckAt = now2 + EARLY_GEM.recheckMinutes.DROPPED * 6e4;
+    trimGem(g);
+    return;
+  }
+  if (out.analysis.launch?.bondingCurveComplete === true) {
+    fire("graduated", "good", `\u{1F393} Graduated off the bonding curve at ${usdK(out.mcap ?? 0)}.`, `\u{1F393} ${sym} graduated`);
+  }
+  if (e.ageHours !== null && e.ageHours >= 24) fire("day1", "good", "Survived day 1 \u2014 about 80% of launches don\u2019t.");
+  if (e.stage === "ROOTED" && (out.result.tier === "CANDIDATE" || out.result.tier === "WATCH")) {
+    fire("rooted", "good", `\u{1F333} Rooted \u2014 passed the long-hold screen at day 3 (Staying Power ${out.result.score}%).`, `\u{1F333} ${sym} is rooted \u2014 long-hold screen passed`);
+  }
+  if (mult !== null) {
+    for (const m of EARLY_GEM.multipleMilestones) {
+      if (mult >= m) {
+        fire(`x${m}`, "good", `\u{1F680} ${m}\xD7 since spotted (${usdK(g.spottedMcap)} \u2192 ${usdK(out.mcap ?? 0)}).`, `\u{1F680} ${sym} is ${m}\xD7 since you spotted it`);
+      }
+    }
+  }
+  const firstHolders = g.snapshots.find((s) => s.holders !== null)?.holders ?? null;
+  if (firstHolders && out.holderCount !== null && out.holderCount >= firstHolders * 2) {
+    fire("holders2x", "good", `\u{1F465} Holders doubled since spotted (${firstHolders} \u2192 ${out.holderCount}).`);
+  }
+  const dayKey = new Date(now2).toISOString().slice(0, 10);
+  const dumping = e.disqualifiers.find((d) => /^Dumping right now/.test(d));
+  if (dumping) fire(`dump-${dayKey}`, "bad", `\u{1F4C9} ${dumping}`, `\u{1F4C9} ${sym} is dumping right now`);
+  const peakHolders = Math.max(0, ...g.snapshots.map((s) => s.holders ?? 0));
+  if (peakHolders > 0 && out.holderCount !== null && out.holderCount < peakHolders * 0.85) {
+    fire("holders-leaving", "bad", `\u{1F44B} Holders down ${Math.round((1 - out.holderCount / peakHolders) * 100)}% from their peak \u2014 the community is thinning.`, `\u{1F44B} ${sym}: holders are leaving`);
+  }
+  if (g.peakMcap && out.mcap !== null && out.mcap < g.peakMcap * 0.4) {
+    fire("drawdown60", "bad", `Down ${Math.round((1 - out.mcap / g.peakMcap) * 100)}% from its peak since you spotted it.`, `\u26A0 ${sym} is down 60%+ from its peak`);
+  }
+  g.nextCheckAt = now2 + EARLY_GEM.recheckMinutes[e.stage] * 6e4;
+  trimGem(g);
+}
+function snapOf(out) {
+  return {
+    at: Date.now(),
+    mcap: out.mcap,
+    holders: out.holderCount,
+    liquidity: out.liq,
+    score: out.early.stage === "ROOTED" ? out.result.score : out.early.score,
+    dead: assessLiveState(out.analysis.market).state === "DEAD"
+  };
+}
+async function priceOnlySnapshot(mint) {
+  const r = await lookupDexscreenerToken(mint);
+  if (r.status === "error") return null;
+  if (r.market) {
+    return {
+      at: Date.now(),
+      mcap: r.market.marketCapUsd,
+      holders: null,
+      liquidity: r.market.liquidityUsd,
+      score: null,
+      dead: assessLiveState(marketFromDex(r.market)).state === "DEAD"
+    };
+  }
+  const pump = await fetchPumpfunData(mint);
+  if (pump.marketCapEur === null) return null;
+  return { at: Date.now(), mcap: pump.marketCapEur, holders: null, liquidity: null, score: null, dead: false };
+}
+function pushSnap(g, s) {
+  g.snapshots.push(s);
+  if (g.snapshots.length > 400) {
+    const head = g.snapshots.slice(0, 1);
+    const tail = g.snapshots.slice(-100);
+    const mid = g.snapshots.slice(1, -100).filter((_, i) => i % 2 === 0);
+    g.snapshots = [...head, ...mid, ...tail];
+  }
+}
+function trimGem(g) {
+  g.events = g.events.slice(0, 20);
+}
+var short4 = (a) => `${a.slice(0, 4)}\u2026${a.slice(-4)}`;
+function usdK(v) {
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(0)}k`;
+  return `$${v.toFixed(0)}`;
+}
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith("ck-gem-")) return;
+  const address = id.slice("ck-gem-".length).split("-")[0];
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
+  chrome.notifications.clear(id);
+});
 async function loadRecent() {
   const data = await chrome.storage.local.get(RECENT_KEY);
   const list = data[RECENT_KEY];

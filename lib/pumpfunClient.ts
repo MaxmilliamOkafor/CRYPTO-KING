@@ -36,6 +36,11 @@ export interface PumpfunData {
   replyCount: number | null;
   /** Bonding-curve accounts — excluded from holder-concentration math in lite scans. */
   bondingCurveAccounts: string[];
+  /** Curve progress 0–100 toward graduation (see curveProgress()). */
+  curveProgressPct: number | null;
+  /** market_cap ÷ ath_market_cap (0–1). */
+  athRatio: number | null;
+  kingOfTheHill: boolean | null;
 }
 
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -57,6 +62,9 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
       socials: f.socials,
       replyCount: null,
       bondingCurveAccounts: [],
+      curveProgressPct: null,
+      athRatio: null,
+      kingOfTheHill: null,
     };
   }
 
@@ -97,7 +105,35 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
       asString(pick(json, ['associated_bonding_curve'])),
       asString(pick(json, ['pool_address'])),
     ].filter((s): s is string => s !== null),
+    curveProgressPct: curveProgress(asBoolLoose(pick(json, ['complete'])), asNumber(pick(json, ['real_sol_reserves']))),
+    athRatio: athRatio(asNumber(pick(json, ['market_cap'])), asNumber(pick(json, ['ath_market_cap']))),
+    // Present-but-null = never reached it; key missing entirely = unknown.
+    kingOfTheHill:
+      typeof json === 'object' && json !== null && 'king_of_the_hill_timestamp' in json
+        ? pick(json, ['king_of_the_hill_timestamp']) != null
+        : null,
   };
+}
+
+/**
+ * Bonding-curve progress, 0–100. pump.fun graduates a coin once ~85 SOL of
+ * net buying sits in the curve; `real_sol_reserves` is that SOL in lamports.
+ * Out-of-range values mean the unit assumption is wrong → null, not a guess.
+ */
+export function curveProgress(complete: boolean | null, realSolLamports: number | null): number | null {
+  if (complete === true) return 100;
+  if (realSolLamports === null || realSolLamports < 0) return null;
+  const sol = realSolLamports / 1e9;
+  if (sol > 120) return null; // can't be lamports of an un-graduated curve
+  return Math.min(100, (sol / 85) * 100);
+}
+
+/** Current ÷ all-time-high market cap. Both from pump.fun in the same unit;
+ *  anything outside (0, 1.05] means the fields don't match → null. */
+export function athRatio(mcap: number | null, athMcap: number | null): number | null {
+  if (mcap === null || athMcap === null || athMcap <= 0 || mcap <= 0) return null;
+  const r = mcap / athMcap;
+  return r > 1.05 ? null : Math.min(1, r);
 }
 
 /** A freshly-created coin from the pump.fun list feed (used by the Live scanner). */
@@ -202,4 +238,7 @@ const EMPTY: PumpfunData = {
   socials: null,
   replyCount: null,
   bondingCurveAccounts: [],
+  curveProgressPct: null,
+  athRatio: null,
+  kingOfTheHill: null,
 };

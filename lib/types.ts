@@ -152,6 +152,14 @@ export interface LaunchInfo {
   bannedOnPlatform: boolean | null;
   /** Platform comment count — crude community-traction signal. */
   replyCount: number | null;
+  /** Bonding-curve progress 0–100 (SOL in the curve ÷ the 85 SOL graduation
+   *  target). 100 once graduated. Optional: fixtures predate it. */
+  curveProgressPct?: number | null;
+  /** Current market cap ÷ its all-time high (0–1). Low = the pump-and-dump
+   *  already happened. Ratio only, so pump.fun's SOL units cancel out. */
+  athRatio?: number | null;
+  /** Reached pump.fun's "king of the hill" (top of the board) at some point. */
+  kingOfTheHill?: boolean | null;
 }
 
 export interface SmartMoneyInfo {
@@ -283,7 +291,9 @@ export interface JournalEntry {
 export type LongHoldTier = 'CANDIDATE' | 'WATCH' | 'WEAK' | 'TOO_EARLY' | 'LATE' | 'NOT_A_HOLD' | 'NO_DATA';
 
 export interface LongHoldPillar {
-  key: 'survival' | 'community' | 'distribution' | 'liquidity' | 'demand' | 'resilience';
+  /** Stable id (long-hold: survival/community/distribution/liquidity/demand/resilience;
+   *  early gem: community/fairLaunch/momentum/conviction). */
+  key: string;
   label: string;
   score: number;
   max: number;
@@ -310,6 +320,85 @@ export interface LongHoldResult {
   historyDays: number;
 }
 
+/* ── 🌱 Early gems: spotted at launch, followed while you hold ─────────── */
+
+/** SEED < 24h · SPROUT 1–3 days · ROOTED 3+ days (long-hold rules take over). */
+export type GemStage = 'SEED' | 'SPROUT' | 'ROOTED';
+export type EarlyVerdict = 'STRONG' | 'PROMISING' | 'WEAK' | 'REJECT' | 'NO_DATA';
+
+/** "Early Conviction" for a coin in its first days (lib/earlyGem.ts). */
+export interface EarlyGemResult {
+  stage: GemStage;
+  verdict: EarlyVerdict;
+  /** 0–100, higher = stronger early evidence. null = no data. */
+  score: number | null;
+  pillars: LongHoldPillar[];
+  disqualifiers: string[];
+  /** A disqualifier that ends the thesis for a HOLDER (not just "don't enter
+   *  right now"): everything except a temporary dump. */
+  hardBreak: boolean;
+  strengths: string[];
+  concerns: string[];
+  unverified: string[];
+  ageHours: number | null;
+  curveProgressPct: number | null;
+}
+
+export type TrackedStatus = 'ACTIVE' | 'DROPPED';
+
+export interface GemSnapshot {
+  at: number;
+  mcap: number | null;
+  holders: number | null;
+  liquidity: number | null;
+  score: number | null;
+  dead: boolean;
+}
+
+/** A coin the tracker follows from first sight (low cap) through the hold. */
+export interface TrackedGem {
+  address: string;
+  symbol: string | null;
+  source: 'auto' | 'manual';
+  spottedAt: number;
+  /** Market cap when first spotted — every multiple is measured from here. */
+  spottedMcap: number;
+  status: TrackedStatus;
+  dropReason: string | null;
+  stage: GemStage;
+  verdict: EarlyVerdict | LongHoldTier;
+  score: number | null;
+  lastMcap: number | null;
+  peakMcap: number | null;
+  lastCheckedAt: number;
+  nextCheckAt: number;
+  /** Alert kinds already fired (each fires once). */
+  fired: string[];
+  /** Latest first, capped. */
+  events: Array<{ at: number; text: string; tone: 'good' | 'bad' | 'info' }>;
+  /** Oldest first, capped — powers holder growth and the portfolio report. */
+  snapshots: GemSnapshot[];
+}
+
+/** "If you had bought every 🌱 at first sight" — per horizon. */
+export interface GemPortfolioRow {
+  horizonDays: number;
+  /** Coins spotted at least `horizonDays` ago. */
+  eligible: number;
+  /** …of which we have a measurement near the horizon. */
+  measured: number;
+  alive: number;
+  /** Equal money in each: average multiple (dead = 0×). The honest wallet number. */
+  portfolioMultiple: number | null;
+  medianMultiple: number | null;
+  bestMultiple: number | null;
+  bestSymbol: string | null;
+}
+
+export type GemsResponse =
+  | { ok: true; gems: TrackedGem[]; portfolio: GemPortfolioRow[] }
+  | { ok: false; error: string };
+
 /** One row of the long-hold radar list. */
 export interface RadarRow {
   address: string;
@@ -330,7 +419,7 @@ export type RadarResponse =
   | { ok: false; error: string };
 
 export type LongHoldResponse =
-  | { ok: true; result: LongHoldResult; symbol: string | null }
+  | { ok: true; result: LongHoldResult; early: EarlyGemResult | null; symbol: string | null; tracked: boolean }
   | { ok: false; error: string };
 
 /** Long-hold report card: did "candidates" actually hold up at 7d / 30d? */
@@ -390,7 +479,11 @@ export type BgRequest =
   | { type: 'RUN_RADAR' }
   /** Staying-power assessment for one coin (runs a full scan + history). */
   | { type: 'GET_LONGHOLD'; address: string }
-  | { type: 'GET_LH_ACCURACY' };
+  | { type: 'GET_LH_ACCURACY' }
+  /** 🌱 Gem tracker list + "bought every gem at first sight" report. */
+  | { type: 'GET_GEMS' }
+  | { type: 'TRACK_GEM'; address: string }
+  | { type: 'UNTRACK_GEM'; address: string };
 
 export type AnalyzeResponse =
   | { ok: true; analysis: TokenAnalysis; risk: RiskResult; quality: QualityResult; mock: boolean }
@@ -426,6 +519,8 @@ export interface FeedRow {
   narratives: string[];
   /** The coin's linked X/Twitter (handle or URL), auto-detected — null if none. */
   twitter: string | null;
+  /** 🌱 Followed by the gem tracker. */
+  tracked: boolean;
   insufficientData: boolean;
   /** true = key checks (holders / LP) not yet verified — score is a floor, not a verdict. */
   unverified: boolean;

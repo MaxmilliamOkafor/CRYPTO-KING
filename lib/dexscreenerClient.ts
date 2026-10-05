@@ -176,8 +176,8 @@ export function peekDexscreenerToken(mint: string): DexTokenMarket | null | unde
   return hit && Date.now() - hit.at < MARKET_TTL_MS ? hit.m : undefined;
 }
 
-export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarket | null> {
-  const r = await lookupDexscreenerToken(mint);
+export async function fetchDexscreenerToken(mint: string, fresh = false): Promise<DexTokenMarket | null> {
+  const r = await lookupDexscreenerToken(mint, fresh);
   return r.status === 'ok' ? r.market : null;
 }
 
@@ -188,10 +188,13 @@ export async function fetchDexscreenerToken(mint: string): Promise<DexTokenMarke
  */
 export async function lookupDexscreenerToken(
   mint: string,
+  /** Skip the cache — forced re-checks (tracker, watchlist) must see a
+   *  graduation or a dump that happened seconds ago. */
+  fresh = false,
 ): Promise<{ status: 'ok'; market: DexTokenMarket | null } | { status: 'error' }> {
   if (MOCK_MODE || !DEXSCREENER.enabled || !BASE58_RE.test(mint)) return { status: 'error' };
   const hit = marketCache.get(mint);
-  if (hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: 'ok', market: hit.m };
+  if (!fresh && hit && Date.now() - hit.at < MARKET_TTL_MS) return { status: 'ok', market: hit.m };
 
   const json = await fetchJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
   const pairs = (json as { pairs?: unknown[] | null } | null)?.pairs;

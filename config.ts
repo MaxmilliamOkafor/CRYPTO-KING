@@ -170,6 +170,53 @@ export const GECKO = {
   ],
 };
 
+/* ────────────── 🌱 Early gems: spot at launch, follow while you hold ───────
+ * The entry point for a long hold is EARLY — low market cap, first hours. At
+ * that stage there is little evidence, and ~80% of launches die within 48h;
+ * even launches with all three socials graduate only ~1.9% of the time. So the
+ * tracker's job is (1) surface the few launches with the strongest early
+ * evidence while the cap is still low, (2) keep re-checking each one while you
+ * hold — milestone alerts AND "the thesis just broke" alerts — and (3) report
+ * honestly what buying every pick at first sight would have returned.
+ */
+export const EARLY_GEM = {
+  enabled: true,
+  /** Only coins at or below this market cap are spotted — "early" means early. */
+  maxSpotMcapUsd: 300_000,
+  /** Lite (feed) score needed before spending a full background check. */
+  prelimMinScore: 40,
+  /** Full-scan score needed to be added to the tracker. */
+  spotMinScore: 55,
+  /** Verdict cut-offs. */
+  strongScore: 65,
+  promisingScore: 45,
+  /** Full checks of new launches per feed sweep (run in the background). */
+  fullChecksPerSweep: 2,
+  /** Max coins followed at once (oldest dropped ones fall off first). */
+  maxTracked: 40,
+  /** Re-check cadence by stage (minutes). */
+  recheckMinutes: { SEED: 10, SPROUT: 30, ROOTED: 120, DROPPED: 360 },
+  /** Coins re-checked per tick (keeps the shared RPC budget sane). */
+  checksPerTick: 6,
+  /** Disqualifiers at launch. */
+  maxDevPct: 5,
+  maxLargestWalletPct: 8,
+  maxTop10Pct: 30,
+  /** Current cap below this share of its all-time high = the pump-and-dump
+   *  already happened. */
+  minAthRatio: 0.3,
+  /** Holder growth benchmarks (new holders per hour) from early-winner data. */
+  strongHoldersPerHour: 50,
+  okHoldersPerHour: 15,
+  /** Multiples since first sight that trigger a milestone alert. */
+  multipleMilestones: [2, 5, 10, 25, 100],
+  /** "If you'd bought every pick at first sight" horizons (days). */
+  reportHorizonsDays: [1, 7, 30],
+  /** Keep following DROPPED coins (price only) this long, so the report
+   *  includes the losers too — otherwise it would be survivorship bias. */
+  followDroppedDays: 31,
+} as const;
+
 /* ────────────── 🏔 Long-hold radar ("staying power") ─────────────────────
  * Research-based screen for coins that might be HELD for weeks/months, the way
  * early PEPE/BONK/WIF holders did — as opposed to the live feed's minutes-old

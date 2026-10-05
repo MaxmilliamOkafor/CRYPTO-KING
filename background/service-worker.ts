@@ -17,6 +17,7 @@
 import {
   CACHE_TTL_MS,
   DEBUG,
+  EARLY_GEM,
   EUR_PER_USD,
   EXIT_REALITY,
   LIVE_FEED,
@@ -36,6 +37,7 @@ import {
   type GeckoTokenInfo,
   type RadarPool,
 } from '../lib/geckoClient.ts';
+import { assessEarlyGem, computeGemPortfolio } from '../lib/earlyGem.ts';
 import { assessLongHold } from '../lib/longHold.ts';
 import { resolveLpStatus } from '../lib/lpStatus.ts';
 import { nullDeployerAdapter, pumpfunDeployerAdapter } from '../lib/deployerClient.ts';
@@ -76,7 +78,10 @@ import type {
   AccuracyResponse,
   AnalyzeResponse,
   BgRequest,
+  EarlyGemResult,
   FeedRow,
+  GemSnapshot,
+  GemsResponse,
   LiveFeedResponse,
   LongHoldAccuracyResponse,
   LongHoldLedgerEntry,
@@ -94,6 +99,7 @@ import type {
   RiskResult,
   SettingsResponse,
   TokenAnalysis,
+  TrackedGem,
   WatchedCoin,
   WatchlistResponse,
   WatchSnapshot,
@@ -165,6 +171,7 @@ async function handle(
   | RadarResponse
   | LongHoldResponse
   | LongHoldAccuracyResponse
+  | GemsResponse
 > {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
@@ -215,8 +222,17 @@ async function handle(
     case 'GET_LONGHOLD': {
       if (!BASE58_RE.test(msg.address)) return { ok: false, error: 'Not a valid Solana address.' };
       const res = await assessLongHoldFor(msg.address);
-      return res ? { ok: true, result: res.result, symbol: res.symbol } : { ok: false, error: 'Long-hold check unavailable.' };
+      if (!res) return { ok: false, error: 'Long-hold check unavailable.' };
+      const tracked = (await loadGems()).gems.some((g) => g.address === msg.address && g.status === 'ACTIVE');
+      return { ok: true, result: res.result, early: res.early, symbol: res.symbol, tracked };
     }
+    case 'GET_GEMS':
+      return getGems();
+    case 'TRACK_GEM':
+      if (!BASE58_RE.test(msg.address)) return { ok: false, error: 'Not a valid Solana address.' };
+      return trackGemManually(msg.address);
+    case 'UNTRACK_GEM':
+      return untrackGem(msg.address);
     case 'GET_LH_ACCURACY': {
       const entries = await loadLhLedger();
       return { ok: true, rows: computeLongHoldAccuracy(entries, LONG_HOLD.ledgerCheckDays), tracked: entries.length };
@@ -231,6 +247,8 @@ async function handle(
 const feed = new Map<string, FeedRow>();
 const notified = new Set<string>(); // mints already desktop-notified
 let feedInFlight: Promise<LiveFeedResponse> | null = null;
+/** When the last feed sweep ran — the gem alarm runs one if nothing else has. */
+let lastFeedSweepAt = 0;
 
 /** Concurrent polls (multiple tabs) share one sweep instead of doubling the scans. */
 function getLiveFeed(): Promise<LiveFeedResponse> {
@@ -243,6 +261,7 @@ function getLiveFeed(): Promise<LiveFeedResponse> {
 }
 
 async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
+  lastFeedSweepAt = Date.now();
   // Pull fresh launches (pump.fun, newest-created) AND established/migrated
   // Solana tokens (DexScreener) so the feed covers both brand-new coins and
   // graduated ones — merged, de-duplicated, pump.fun entries first.
@@ -311,6 +330,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
   // Phase 2 — build rows; auto-upgrade a bounded number of promising lite
   // results to FULL background checks so real gems can surface.
   let fullUpgradesThisPoll = 0;
+  const seedPool: Array<{ mint: string; entry: CacheEntry }> = [];
   for (const c of coins) {
     let entry = cache.get(c.mint);
     if (!entry) continue;
@@ -357,6 +377,7 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
       graduated: entry.analysis.launch?.bondingCurveComplete ?? null,
       narratives: entry.analysis.narratives,
       twitter: entry.analysis.socials?.twitter ?? null,
+      tracked: trackedMints.has(c.mint),
       insufficientData: entry.risk.insufficientData,
       unverified:
         entry.analysis.holders === null ||
@@ -366,7 +387,11 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
     };
     feed.set(c.mint, row);
     maybeNotifyLowRisk(row);
+    seedPool.push({ mint: c.mint, entry });
   }
+  // 🌱 Spot early gems among this sweep's launches (full checks run in the
+  // background so the feed response isn't held up).
+  queueSeedCandidates(seedPool);
 
   // Newest first, capped.
   const rows = [...feed.values()]
@@ -407,7 +432,7 @@ function maybeNotifyLowRisk(row: FeedRow): void {
 
 chrome.notifications?.onClicked.addListener((id) => {
   // Watch alerts and long-hold alerts have their own handlers.
-  if (!id.startsWith('ck-') || id.startsWith('ck-watch-') || id.startsWith('ck-lh-')) return;
+  if (!id.startsWith('ck-') || id.startsWith('ck-watch-') || id.startsWith('ck-lh-') || id.startsWith('ck-gem-')) return;
   const address = id.slice(3);
   void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
   chrome.notifications.clear(id);
@@ -428,12 +453,12 @@ async function analyzeToken(address: string, force: boolean, rawGmgn?: unknown, 
   const pending = inFlight.get(address);
   if (pending) return pending;
 
-  const job = doAnalyze(address, rawGmgn, lite).finally(() => inFlight.delete(address));
+  const job = doAnalyze(address, rawGmgn, lite, force).finally(() => inFlight.delete(address));
   inFlight.set(address, job);
   return job;
 }
 
-async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Promise<AnalyzeResponse> {
+async function doAnalyze(address: string, rawGmgn?: unknown, lite = false, force = false): Promise<AnalyzeResponse> {
   try {
     // GMGN: prefer the raw payload the content script fetched same-origin (cookies
     // apply, dodges Cloudflare); otherwise fetch it here (mock mode, or the popup
@@ -460,7 +485,7 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false): Prom
       lite ? Promise.resolve({ status: 'disabled' as const, lpStatus: null, externalFlags: [] }) : rugcheckAdapter.fetchAudit(address),
       // Always fetched: served from the sweep's batch cache for lite scans, so
       // rug/dump detection runs on EVERY coin, not just the ones you open.
-      fetchDexscreenerToken(address),
+      fetchDexscreenerToken(address, force), // forced scans bypass the 60s market cache
     ]);
     // Full scans check the creator's launch history (serial-deployer signal);
     // lite feed sweeps skip it to stay within the per-poll budget. Either way,
@@ -662,6 +687,9 @@ function mergeSources(
             bondingCurveComplete: pumpfun.bondingCurveComplete,
             bannedOnPlatform: pumpfun.isBanned,
             replyCount: pumpfun.replyCount,
+            curveProgressPct: pumpfun.curveProgressPct,
+            athRatio: pumpfun.athRatio,
+            kingOfTheHill: pumpfun.kingOfTheHill,
           }
         : null,
     sources,
@@ -873,6 +901,9 @@ function ensureWatchAlarm(): void {
   if (LONG_HOLD.enabled && !MOCK_MODE) {
     chrome.alarms.create('ck-radar', { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
   }
+  if (EARLY_GEM.enabled && !MOCK_MODE) {
+    chrome.alarms.create('ck-gems', { periodInMinutes: Math.min(...Object.values(EARLY_GEM.recheckMinutes)) });
+  }
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -882,12 +913,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     void recheckLhLedger();
   } else if (alarm.name === 'ck-radar') {
     void runRadarSweep();
+  } else if (alarm.name === 'ck-gems') {
+    void runGemTick();
+    // Keep spotting seeds even when no panel is open: the feed sweep is what
+    // feeds the spotter, so run one if nothing has polled it recently.
+    if (Date.now() - lastFeedSweepAt > 5 * 60_000) void getLiveFeed();
   }
 });
 chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
-// Load user settings (Helius key) as soon as the service worker wakes.
+// Load user settings (Helius key) as soon as the service worker wakes, and
+// the tracked-gem list so feed rows are tagged 🌱 from the first sweep.
 void loadSettings();
+void loadGems();
 
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith('ck-watch-')) return;
@@ -1022,7 +1060,6 @@ interface RadarStore {
   notified: string[];
 }
 
-const lhCache = new Map<string, { result: LongHoldResult; symbol: string | null; at: number }>();
 const LH_CACHE_MS = 30 * 60_000;
 const candleCache = new Map<string, { k: Candle[] | null; at: number }>();
 let radarSweep: Promise<void> | null = null;
@@ -1155,23 +1192,34 @@ function radarRowOf(
  * Full staying-power assessment for one coin. `hint` = discovery data from the
  * radar (saves calls); without it, the pool is found via DexScreener.
  */
-type LhOut = { result: LongHoldResult; symbol: string | null; mcap: number | null; liq: number | null } | null;
+type LhOut = {
+  result: LongHoldResult;
+  /** Early-conviction view (always computed; the UI shows it for coins < 3 days). */
+  early: EarlyGemResult;
+  symbol: string | null;
+  mcap: number | null;
+  liq: number | null;
+  holderCount: number | null;
+  analysis: TokenAnalysis;
+} | null;
 const lhInFlight = new Map<string, Promise<LhOut>>();
+const lhOutCache = new Map<string, { out: NonNullable<LhOut>; at: number }>();
 
 /** De-duplicated: overlapping requests for one coin (card re-render, radar,
- *  popup) share a single assessment — GeckoTerminal allows only ~30 calls/min. */
-function assessLongHoldFor(address: string, hint?: RadarPool): Promise<LhOut> {
+ *  tracker, popup) share a single assessment — GeckoTerminal allows ~30/min.
+ *  `fresh` = the tracker's re-check: bypass every cache so a dump is seen now. */
+function assessLongHoldFor(address: string, hint?: RadarPool, fresh = false): Promise<LhOut> {
   const pending = lhInFlight.get(address);
   if (pending) return pending;
-  const job = doAssessLongHold(address, hint).finally(() => lhInFlight.delete(address));
+  const job = doAssessLongHold(address, hint, fresh).finally(() => lhInFlight.delete(address));
   lhInFlight.set(address, job);
   return job;
 }
 
 const infoCache = new Map<string, { v: GeckoTokenInfo | null; at: number }>();
-async function cachedTokenInfo(mint: string): Promise<GeckoTokenInfo | null> {
+async function cachedTokenInfo(mint: string, maxAgeMs = LH_CACHE_MS): Promise<GeckoTokenInfo | null> {
   const hit = infoCache.get(mint);
-  if (hit && Date.now() - hit.at < LH_CACHE_MS) return hit.v;
+  if (hit && Date.now() - hit.at < maxAgeMs) return hit.v;
   const v = await fetchTokenInfo(mint);
   if (v !== null) {
     if (infoCache.size > 300) infoCache.clear();
@@ -1180,22 +1228,21 @@ async function cachedTokenInfo(mint: string): Promise<GeckoTokenInfo | null> {
   return v;
 }
 
-async function doAssessLongHold(address: string, hint?: RadarPool): Promise<LhOut> {
-  const hit = lhCache.get(address);
-  if (hit && Date.now() - hit.at < LH_CACHE_MS && !hint) {
-    return { result: hit.result, symbol: hit.symbol, mcap: null, liq: null };
-  }
+async function doAssessLongHold(address: string, hint?: RadarPool, fresh = false): Promise<LhOut> {
+  const hit = lhOutCache.get(address);
+  if (hit && Date.now() - hit.at < LH_CACHE_MS && !hint && !fresh) return hit.out;
 
-  const res = await analyzeToken(address, false); // full scan (cached for 5 min)
+  const res = await analyzeToken(address, fresh); // full scan (5-min cache unless fresh)
   if (!res.ok) return null;
   const { analysis, risk } = res;
 
-  const dex = await fetchDexscreenerToken(address);
+  const dex = await fetchDexscreenerToken(address); // just refreshed by the forced scan above when `fresh`
   const pool = hint?.pool ?? dex?.pairAddress ?? null;
   const [candles, poolStats, info] = await Promise.all([
     pool ? cachedCandles(pool) : Promise.resolve(null),
     hint ? Promise.resolve(hint) : pool ? fetchPool(pool) : Promise.resolve(null),
-    cachedTokenInfo(address),
+    // Holder counts drive "+N holders/hour" for tracked seeds — refresh faster then.
+    cachedTokenInfo(address, fresh ? 15 * 60_000 : LH_CACHE_MS),
   ]);
 
   const holderCount = analysis.holders?.holderCount ?? info?.holderCount ?? null;
@@ -1208,28 +1255,34 @@ async function doAssessLongHold(address: string, hint?: RadarPool): Promise<LhOu
     hint?.createdMs ? (Date.now() - hint.createdMs) / 86_400_000 : null,
     candles && candles.length ? (Date.now() / 1000 - candles[0].t) / 86_400 : null,
   ].filter((v): v is number => v !== null && Number.isFinite(v) && v >= 0);
+  const ageDays = ages.length ? Math.max(...ages) : null;
 
   const so = analysis.socials;
-  const result = assessLongHold(analysis, risk, {
-    ageDays: ages.length ? Math.max(...ages) : null,
-    candles,
-    buyers24h: poolStats?.buyers24h ?? null,
-    sellers24h: poolStats?.sellers24h ?? null,
+  const socials = {
+    twitter: Boolean(so?.twitter || info?.twitter),
+    telegram: Boolean(so?.telegram || info?.telegram),
+    website: Boolean(so?.website || info?.website),
+  };
+  const buyers24h = poolStats?.buyers24h ?? null;
+  const sellers24h = poolStats?.sellers24h ?? null;
+  const result = assessLongHold(analysis, risk, { ageDays, candles, buyers24h, sellers24h, holderCount, holderHistory, socials });
+  const tracked = (await loadGems()).gems.find((g) => g.address === address);
+  const early = assessEarlyGem(analysis, risk, {
+    ageHours: ageDays !== null ? ageDays * 24 : null,
+    buyers24h,
+    sellers24h,
     holderCount,
-    holderHistory,
-    socials: {
-      twitter: Boolean(so?.twitter || info?.twitter),
-      telegram: Boolean(so?.telegram || info?.telegram),
-      website: Boolean(so?.website || info?.website),
-    },
+    history: tracked?.snapshots ?? [],
+    socials,
   });
 
   const symbol = analysis.identity.symbol;
-  lhCache.set(address, { result, symbol, at: Date.now() });
-  if (lhCache.size > 300) lhCache.clear();
   const mcap = analysis.market?.marketCapEur ?? null;
+  const out = { result, early, symbol, mcap, liq: analysis.market?.liquidityEur ?? null, holderCount, analysis };
+  if (lhOutCache.size > 300) lhOutCache.clear();
+  lhOutCache.set(address, { out, at: Date.now() });
   await recordLhPrediction(address, symbol, result, mcap);
-  return { result, symbol, mcap, liq: analysis.market?.liquidityEur ?? null };
+  return out;
 }
 
 async function cachedCandles(pool: string): Promise<Candle[] | null> {
@@ -1323,6 +1376,366 @@ async function recheckLhLedger(): Promise<void> {
     await chrome.storage.local.set({ [LH_LEDGER_KEY]: cur });
   });
 }
+
+/* ── 🌱 Gem tracker: spot at launch (low cap), follow while you hold ─────
+ * Seeds are spotted from the live feed: a cheap prelim score on the lite scan,
+ * then a FULL background check for the best few, then — if the early evidence
+ * is strong and the cap still low — the coin is tracked from that moment. The
+ * tracker re-checks every coin on a stage-based cadence and alerts on
+ * milestones (graduated, day 1, rooted, 2×/5×/10×…) and on broken theses (dev
+ * sold, whale/sniper control, rug mechanics, dead). Dropped coins are still
+ * price-checked for a month so the "bought every gem" report counts losers.
+ */
+
+const GEMS_KEY = 'ck:gems';
+interface GemStore {
+  gems: TrackedGem[];
+}
+/** Mirror of tracked ACTIVE mints, for tagging feed rows without storage reads. */
+const trackedMints = new Set<string>();
+
+async function loadGems(): Promise<GemStore> {
+  const d = await chrome.storage.local.get(GEMS_KEY);
+  const v = d[GEMS_KEY] as Partial<GemStore> | undefined;
+  const gems = Array.isArray(v?.gems) ? v.gems : [];
+  trackedMints.clear();
+  for (const g of gems) if (g.status === 'ACTIVE') trackedMints.add(g.address);
+  return { gems };
+}
+
+async function saveGems(store: GemStore): Promise<void> {
+  trackedMints.clear();
+  for (const g of store.gems) if (g.status === 'ACTIVE') trackedMints.add(g.address);
+  await chrome.storage.local.set({ [GEMS_KEY]: store });
+}
+
+async function getGems(): Promise<GemsResponse> {
+  if (!EARLY_GEM.enabled) return { ok: false, error: 'Gem tracker disabled in config.' };
+  const { gems } = await loadGems();
+  const sorted = [...gems].sort(
+    (a, b) =>
+      Number(a.status === 'DROPPED') - Number(b.status === 'DROPPED') ||
+      (b.lastMcap ?? 0) / b.spottedMcap - (a.lastMcap ?? 0) / a.spottedMcap,
+  );
+  return { ok: true, gems: sorted, portfolio: computeGemPortfolio(gems, EARLY_GEM.reportHorizonsDays) };
+}
+
+/* Spotting ─────────────────────────────────────────────────────────────── */
+
+const spotQueue: string[] = [];
+const spotConsidered = new Map<string, number>(); // mint → when last full-checked for spotting
+let spotDraining = false;
+
+/** Called from the feed sweep with LITE results: pick the best few prelim
+ *  seeds and queue them for a full check (runs in the background). */
+function queueSeedCandidates(entries: Array<{ mint: string; entry: CacheEntry }>): void {
+  if (!EARLY_GEM.enabled || MOCK_MODE) return;
+  const now = Date.now();
+  const picks = entries
+    .filter(({ mint, entry }) => {
+      if (trackedMints.has(mint)) return false;
+      const seen = spotConsidered.get(mint);
+      if (seen && now - seen < 6 * 3_600_000) return false;
+      const mc = entry.analysis.market?.marketCapEur ?? null;
+      return mc !== null && mc > 0 && mc <= EARLY_GEM.maxSpotMcapUsd;
+    })
+    .map(({ mint, entry }) => {
+      const a = entry.analysis;
+      const prelim = assessEarlyGem(a, entry.risk, {
+        ageHours: a.identity.ageMinutes !== null ? a.identity.ageMinutes / 60 : null,
+        buyers24h: null,
+        sellers24h: null,
+        holderCount: null,
+        history: [],
+        socials: { twitter: Boolean(a.socials?.twitter), telegram: Boolean(a.socials?.telegram), website: Boolean(a.socials?.website) },
+      });
+      return { mint, prelim };
+    })
+    .filter((x) => x.prelim.verdict !== 'REJECT' && (x.prelim.score ?? 0) >= EARLY_GEM.prelimMinScore)
+    .sort((a, b) => (b.prelim.score ?? 0) - (a.prelim.score ?? 0))
+    .slice(0, EARLY_GEM.fullChecksPerSweep);
+  for (const p of picks) {
+    spotConsidered.set(p.mint, now);
+    spotQueue.push(p.mint);
+  }
+  if (spotConsidered.size > 2000) spotConsidered.clear();
+  void drainSpotQueue();
+}
+
+async function drainSpotQueue(): Promise<void> {
+  if (spotDraining) return;
+  spotDraining = true;
+  try {
+    while (spotQueue.length > 0) {
+      const mint = spotQueue.shift() as string;
+      await considerSpot(mint).catch((e: unknown) => console.warn('[CRYPTO-KING] spot check failed', e));
+    }
+  } finally {
+    spotDraining = false;
+  }
+}
+
+async function considerSpot(mint: string): Promise<void> {
+  const out = await assessLongHoldFor(mint);
+  if (!out) return;
+  const e = out.early;
+  const ok =
+    (e.verdict === 'STRONG' || e.verdict === 'PROMISING') &&
+    (e.score ?? 0) >= EARLY_GEM.spotMinScore &&
+    out.mcap !== null &&
+    out.mcap > 0 &&
+    out.mcap <= EARLY_GEM.maxSpotMcapUsd;
+  if (!ok) return;
+  const added = await enlistGem(mint, out, 'auto');
+  if (added) {
+    const sym = out.symbol ?? short4(mint);
+    chrome.notifications.create(`ck-gem-${mint}-spotted`, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: `🌱 Gem spotted early: ${sym} at ${usdK(out.mcap as number)} — conviction ${e.score}%`,
+      message: `${e.strengths[0] ?? 'Strong early signals.'} Now tracking it — you'll be alerted on milestones and if the thesis breaks. Most launches still fail: size it to lose.`,
+    });
+  }
+}
+
+/** Add a coin to the tracker. Returns false if it's already tracked or full. */
+async function enlistGem(mint: string, out: NonNullable<LhOut>, source: 'auto' | 'manual'): Promise<boolean> {
+  if (out.mcap === null || out.mcap <= 0) return false;
+  return withLock(GEMS_KEY, async () => {
+    const store = await loadGems();
+    const existing = store.gems.find((g) => g.address === mint);
+    if (existing && existing.status === 'ACTIVE') return false;
+    const active = store.gems.filter((g) => g.status === 'ACTIVE').length;
+    if (source === 'auto' && active >= EARLY_GEM.maxTracked) return false;
+    if (existing) store.gems = store.gems.filter((g) => g.address !== mint); // re-track a dropped coin fresh
+    const now = Date.now();
+    const stage = out.early.stage;
+    store.gems.unshift({
+      address: mint,
+      symbol: out.symbol,
+      source,
+      spottedAt: now,
+      spottedMcap: out.mcap as number,
+      status: 'ACTIVE',
+      dropReason: null,
+      stage,
+      verdict: stage === 'ROOTED' ? out.result.tier : out.early.verdict,
+      score: stage === 'ROOTED' ? out.result.score : out.early.score,
+      lastMcap: out.mcap,
+      peakMcap: out.mcap,
+      lastCheckedAt: now,
+      nextCheckAt: now + EARLY_GEM.recheckMinutes[stage] * 60_000,
+      fired: [],
+      events: [{ at: now, text: `Spotted at ${usdK(out.mcap as number)} (${source === 'auto' ? 'auto' : 'you added it'}).`, tone: 'info' }],
+      snapshots: [snapOf(out)],
+    });
+    // Bound storage: drop the oldest DROPPED coins past the follow window first.
+    const cutoff = now - EARLY_GEM.followDroppedDays * 86_400_000;
+    store.gems = store.gems.filter((g) => g.status === 'ACTIVE' || g.spottedAt > cutoff).slice(0, EARLY_GEM.maxTracked * 3);
+    await saveGems(store);
+    return true;
+  });
+}
+
+async function trackGemManually(address: string): Promise<GemsResponse> {
+  const out = await assessLongHoldFor(address);
+  if (!out) return { ok: false, error: 'Could not scan this coin — try again.' };
+  if (out.mcap === null || out.mcap <= 0) return { ok: false, error: 'No market cap yet — cannot measure your multiple.' };
+  await enlistGem(address, out, 'manual');
+  return getGems();
+}
+
+async function untrackGem(address: string): Promise<GemsResponse> {
+  await withLock(GEMS_KEY, async () => {
+    const store = await loadGems();
+    store.gems = store.gems.filter((g) => g.address !== address);
+    await saveGems(store);
+  });
+  return getGems();
+}
+
+/* Re-checking ──────────────────────────────────────────────────────────── */
+
+let gemTick: Promise<void> | null = null;
+function runGemTick(): Promise<void> {
+  if (gemTick) return gemTick;
+  gemTick = doGemTick()
+    .catch((e: unknown) => console.warn('[CRYPTO-KING] gem tick failed', e))
+    .finally(() => {
+      gemTick = null;
+    });
+  return gemTick;
+}
+
+async function doGemTick(): Promise<void> {
+  if (!EARLY_GEM.enabled || MOCK_MODE) return;
+  const now = Date.now();
+  const { gems } = await loadGems();
+  const due = gems
+    .filter((g) => g.nextCheckAt <= now)
+    .filter((g) => g.status === 'ACTIVE' || now - g.spottedAt < EARLY_GEM.followDroppedDays * 86_400_000)
+    .sort((a, b) => a.nextCheckAt - b.nextCheckAt)
+    .slice(0, EARLY_GEM.checksPerTick);
+
+  // Network OUTSIDE the lock; results merged into a fresh read inside it.
+  const updates = new Map<string, (g: TrackedGem) => void>();
+  const notes: Array<{ id: string; title: string; message: string }> = [];
+  for (const g of due) {
+    if (g.status === 'DROPPED') {
+      const snap = await priceOnlySnapshot(g.address);
+      updates.set(g.address, (cur) => {
+        if (snap) pushSnap(cur, snap);
+        cur.nextCheckAt = Date.now() + EARLY_GEM.recheckMinutes.DROPPED * 60_000;
+      });
+      continue;
+    }
+    const out = await assessLongHoldFor(g.address, undefined, /*fresh*/ true);
+    if (!out) {
+      updates.set(g.address, (cur) => {
+        cur.nextCheckAt = Date.now() + 15 * 60_000; // transient failure: retry soon, never alert
+      });
+      continue;
+    }
+    updates.set(g.address, (cur) => applyCheck(cur, out, notes));
+  }
+  if (updates.size === 0) return;
+
+  await withLock(GEMS_KEY, async () => {
+    const store = await loadGems();
+    for (const cur of store.gems) updates.get(cur.address)?.(cur);
+    await saveGems(store);
+  });
+  for (const n of notes) chrome.notifications.create(n.id, { type: 'basic', iconUrl: 'icons/icon128.png', title: n.title, message: n.message, priority: 2 });
+}
+
+/** Fold one fresh assessment into a tracked coin: snapshot, stage, alerts. */
+function applyCheck(g: TrackedGem, out: NonNullable<LhOut>, notes: Array<{ id: string; title: string; message: string }>): void {
+  const now = Date.now();
+  const sym = g.symbol ?? short4(g.address);
+  const fire = (kind: string, tone: 'good' | 'bad' | 'info', text: string, alertTitle?: string) => {
+    if (g.fired.includes(kind)) return;
+    g.fired.push(kind);
+    g.events.unshift({ at: now, text, tone });
+    if (alertTitle) notes.push({ id: `ck-gem-${g.address}-${kind}`, title: alertTitle, message: `${text} Click to open.` });
+  };
+
+  pushSnap(g, snapOf(out));
+  const e = out.early;
+  g.stage = e.stage;
+  g.verdict = e.stage === 'ROOTED' ? out.result.tier : e.verdict;
+  g.score = e.stage === 'ROOTED' ? out.result.score : e.score;
+  g.lastMcap = out.mcap;
+  if (out.mcap !== null) g.peakMcap = Math.max(g.peakMcap ?? 0, out.mcap);
+  g.lastCheckedAt = now;
+  const mult = out.mcap !== null ? out.mcap / g.spottedMcap : null;
+
+  // Thesis broken → drop (and keep following the price for the report).
+  const dead = assessLiveState(out.analysis.market).state === 'DEAD';
+  if (e.hardBreak || dead) {
+    const why = e.disqualifiers.find((d) => !/^Dumping right now/.test(d)) ?? e.disqualifiers[0] ?? 'market collapsed';
+    g.status = 'DROPPED';
+    g.dropReason = why;
+    fire('dropped', 'bad', `Thesis broken — ${why}`, `✂ ${sym}: thesis broken — consider exiting`);
+    g.nextCheckAt = now + EARLY_GEM.recheckMinutes.DROPPED * 60_000;
+    trimGem(g);
+    return;
+  }
+
+  // Milestones.
+  if (out.analysis.launch?.bondingCurveComplete === true) {
+    fire('graduated', 'good', `🎓 Graduated off the bonding curve at ${usdK(out.mcap ?? 0)}.`, `🎓 ${sym} graduated`);
+  }
+  if (e.ageHours !== null && e.ageHours >= 24) fire('day1', 'good', 'Survived day 1 — about 80% of launches don’t.');
+  if (e.stage === 'ROOTED' && (out.result.tier === 'CANDIDATE' || out.result.tier === 'WATCH')) {
+    fire('rooted', 'good', `🌳 Rooted — passed the long-hold screen at day 3 (Staying Power ${out.result.score}%).`, `🌳 ${sym} is rooted — long-hold screen passed`);
+  }
+  if (mult !== null) {
+    for (const m of EARLY_GEM.multipleMilestones) {
+      if (mult >= m) {
+        fire(`x${m}`, 'good', `🚀 ${m}× since spotted (${usdK(g.spottedMcap)} → ${usdK(out.mcap ?? 0)}).`, `🚀 ${sym} is ${m}× since you spotted it`);
+      }
+    }
+  }
+  const firstHolders = g.snapshots.find((s) => s.holders !== null)?.holders ?? null;
+  if (firstHolders && out.holderCount !== null && out.holderCount >= firstHolders * 2) {
+    fire('holders2x', 'good', `👥 Holders doubled since spotted (${firstHolders} → ${out.holderCount}).`);
+  }
+
+  // Warnings that DON'T end the thesis on their own (long holds see dips).
+  const dayKey = new Date(now).toISOString().slice(0, 10);
+  const dumping = e.disqualifiers.find((d) => /^Dumping right now/.test(d));
+  if (dumping) fire(`dump-${dayKey}`, 'bad', `📉 ${dumping}`, `📉 ${sym} is dumping right now`);
+  const peakHolders = Math.max(0, ...g.snapshots.map((s) => s.holders ?? 0));
+  if (peakHolders > 0 && out.holderCount !== null && out.holderCount < peakHolders * 0.85) {
+    fire('holders-leaving', 'bad', `👋 Holders down ${Math.round((1 - out.holderCount / peakHolders) * 100)}% from their peak — the community is thinning.`, `👋 ${sym}: holders are leaving`);
+  }
+  if (g.peakMcap && out.mcap !== null && out.mcap < g.peakMcap * 0.4) {
+    fire('drawdown60', 'bad', `Down ${Math.round((1 - out.mcap / g.peakMcap) * 100)}% from its peak since you spotted it.`, `⚠ ${sym} is down 60%+ from its peak`);
+  }
+
+  g.nextCheckAt = now + EARLY_GEM.recheckMinutes[e.stage] * 60_000;
+  trimGem(g);
+}
+
+function snapOf(out: NonNullable<LhOut>): GemSnapshot {
+  return {
+    at: Date.now(),
+    mcap: out.mcap,
+    holders: out.holderCount,
+    liquidity: out.liq,
+    score: out.early.stage === 'ROOTED' ? out.result.score : out.early.score,
+    dead: assessLiveState(out.analysis.market).state === 'DEAD',
+  };
+}
+
+/** Dropped coins: price only (DexScreener, then pump.fun), cheap. */
+async function priceOnlySnapshot(mint: string): Promise<GemSnapshot | null> {
+  const r = await lookupDexscreenerToken(mint);
+  if (r.status === 'error') return null;
+  if (r.market) {
+    return {
+      at: Date.now(),
+      mcap: r.market.marketCapUsd,
+      holders: null,
+      liquidity: r.market.liquidityUsd,
+      score: null,
+      dead: assessLiveState(marketFromDex(r.market)).state === 'DEAD',
+    };
+  }
+  const pump = await fetchPumpfunData(mint);
+  if (pump.marketCapEur === null) return null; // unknown ≠ dead; try again later
+  return { at: Date.now(), mcap: pump.marketCapEur, holders: null, liquidity: null, score: null, dead: false };
+}
+
+function pushSnap(g: TrackedGem, s: GemSnapshot): void {
+  g.snapshots.push(s);
+  // Thin the middle (keep the first point and the latest 100) so day-1/7/30
+  // measurements survive while storage stays bounded.
+  if (g.snapshots.length > 400) {
+    const head = g.snapshots.slice(0, 1);
+    const tail = g.snapshots.slice(-100);
+    const mid = g.snapshots.slice(1, -100).filter((_, i) => i % 2 === 0);
+    g.snapshots = [...head, ...mid, ...tail];
+  }
+}
+
+function trimGem(g: TrackedGem): void {
+  g.events = g.events.slice(0, 20);
+}
+
+const short4 = (a: string) => `${a.slice(0, 4)}…${a.slice(-4)}`;
+function usdK(v: number): string {
+  if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
+  if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}k`;
+  return `$${v.toFixed(0)}`;
+}
+
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!id.startsWith('ck-gem-')) return;
+  const address = id.slice('ck-gem-'.length).split('-')[0];
+  void chrome.tabs.create({ url: `https://gmgn.ai/sol/token/${address}` });
+  chrome.notifications.clear(id);
+});
 
 /* ── Recent-tokens persistence (dashboard) ────────────────────────────── */
 

@@ -399,6 +399,21 @@ function gradeColors(grade) {
   return { color: "#e5484d", textColor: "#ffffff" };
 }
 
+// lib/earlyGem.ts
+var GEM_STAGE_META = {
+  SEED: { label: "\u{1F331} SEED", color: "#2f6f3e", textColor: "#dff5e3" },
+  SPROUT: { label: "\u{1F33F} SPROUT", color: "#3f8f4f", textColor: "#ffffff" },
+  ROOTED: { label: "\u{1F333} ROOTED", color: "#d4a017", textColor: "#1b1b18" },
+  DROPPED: { label: "\u2702 DROPPED", color: "#5a2a2a", textColor: "#ffd9d9" }
+};
+var EARLY_VERDICT_META = {
+  STRONG: { label: "\u{1F331} STRONG EARLY SIGNALS", color: "#d4a017", textColor: "#1b1b18" },
+  PROMISING: { label: "\u{1F33F} PROMISING", color: "#46a758", textColor: "#ffffff" },
+  WEAK: { label: "WEAK", color: "#f76b15", textColor: "#ffffff" },
+  REJECT: { label: "\u26D4 REJECT", color: "#e5484d", textColor: "#ffffff" },
+  NO_DATA: { label: "NO DATA", color: "#3a3f4c", textColor: "#e6e8ee" }
+};
+
 // lib/rugPotential.ts
 function assessRugPotential(a, risk) {
   const hard = [];
@@ -1063,6 +1078,9 @@ var STYLES = `
   .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .pf-line { font-size: 11px; color: #cfd3dc; margin: 2px 0 6px; line-height: 1.6; }
+  .pf-chip { display: inline-block; padding: 0 6px; border-radius: 5px; margin-right: 3px; font-size: 10.5px; }
+  .pf-chip.up { background: #1f3d2a; color: #9be3b0; } .pf-chip.down { background: #3d1f1f; color: #ffb3b3; }
   .lh-tier { font-size: 9.5px; font-weight: 800; letter-spacing: .03em; padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
   .lh-box { margin-top: 10px; padding: 9px 10px; border: 1px solid #3a3320; border-radius: 9px; background: #17150f; }
   .lh-box.muted { border-color: #2c303a; background: transparent; color: #8a91a0; font-size: 11px; }
@@ -1180,6 +1198,13 @@ function renderHome() {
       <div class="livelist"></div>
     </div>
 
+    <div class="scan-section gems-section">
+      <div class="scan-head"><span class="t">\u{1F331} Gem tracker \u2014 spotted at launch, followed while you hold</span></div>
+      <div class="grade-legend">New launches with the strongest early evidence (fair launch, socials, fast curve, many buyers) are spotted <b>while the cap is still low</b>, then re-checked for you: alerts on milestones and the moment the thesis breaks. Most still fail \u2014 use small, equal sizes.</div>
+      <div class="gem-portfolio"></div>
+      <div class="gems-box"><div class="scan-empty">Watching the live feed for strong launches\u2026</div></div>
+    </div>
+
     <div class="scan-section radar-section">
       <div class="scan-head">
         <span class="t">\u{1F3D4} Long-hold radar \u2014 coins that survived the rug window</span>
@@ -1285,6 +1310,7 @@ function renderHome() {
   startLiveFeed();
   body.querySelector(".radar-run")?.addEventListener("click", () => refreshRadarBox(true));
   refreshRadarBox(false);
+  refreshGemsBox();
   startRadarPoll();
   updateScanList();
   void scanPage();
@@ -1549,7 +1575,7 @@ function updateLiveList() {
         <div class="scan-item${gem ? " gem" : ""}" data-addr="${esc(r.address)}">
           <span class="mini-badge" style="background:${bg};color:${fg}">${esc(label)}</span>
           <span class="si-main">
-            <span class="si-sym">${r.ageMinutes !== null && r.ageMinutes < 2 ? '<span class="new-flash">NEW</span> ' : ""}${gem ? "\u{1F48E} " : ""}${esc(sym)}${rugTag}
+            <span class="si-sym">${r.ageMinutes !== null && r.ageMinutes < 2 ? '<span class="new-flash">NEW</span> ' : ""}${gem ? "\u{1F48E} " : ""}${r.tracked ? '<span title="Followed by the gem tracker">\u{1F331}</span> ' : ""}${esc(sym)}${rugTag}
               <span class="age">${esc(ageShort(r.ageMinutes))}</span>
               ${r.priceUsd !== null ? `<span class="price">${esc(fmtPrice(r.priceUsd))}</span>` : ""}
               ${r.marketCapEur !== null ? `<span class="mcap">${esc(eurShort(r.marketCapEur))}</span>` : ""}
@@ -1568,7 +1594,10 @@ var radarTimer = null;
 function startRadarPoll() {
   if (radarTimer) return;
   radarTimer = setInterval(() => {
-    if (view === "home" && !collapsed) refreshRadarBox(false);
+    if (view === "home" && !collapsed) {
+      refreshRadarBox(false);
+      refreshGemsBox();
+    }
   }, 6e4);
 }
 function refreshRadarBox(force) {
@@ -1606,6 +1635,62 @@ function refreshRadarBox(force) {
     wireRowHandlers(box);
   });
 }
+function refreshGemsBox() {
+  const box = shadow?.querySelector(".gems-box");
+  const pf = shadow?.querySelector(".gem-portfolio");
+  if (!box || !pf) return;
+  chrome.runtime.sendMessage({ type: "GET_GEMS" }, (res) => {
+    if (chrome.runtime.lastError || !box.isConnected) return;
+    if (!res || !res.ok) {
+      box.innerHTML = `<div class="scan-empty">${esc(res && !res.ok ? res.error : "Gem tracker unavailable.")}</div>`;
+      return;
+    }
+    const rows = res.portfolio.filter((p) => p.measured > 0);
+    pf.innerHTML = rows.length ? `<div class="pf-line">If you'd put the same amount into <b>every</b> pick at first sight: ${rows.map((p) => {
+      const m = p.portfolioMultiple ?? 0;
+      return `<span class="pf-chip ${m >= 1 ? "up" : "down"}" title="${p.measured} picks measured \xB7 ${p.alive} still alive \xB7 best ${p.bestSymbol ?? "\u2014"} ${p.bestMultiple?.toFixed(1) ?? "\u2014"}\xD7">${p.horizonDays}d: <b>${m.toFixed(2)}\xD7</b></span>`;
+    }).join(" ")}</div>` : "";
+    if (res.gems.length === 0) {
+      box.innerHTML = `<div class="scan-empty">Nothing spotted yet \u2014 strong launches appear here automatically (keep the browser open). Or open any coin and hit "\u{1F331} Track".</div>`;
+      return;
+    }
+    box.innerHTML = res.gems.slice(0, 25).map((g) => {
+      const sm = GEM_STAGE_META[g.status === "DROPPED" ? "DROPPED" : g.stage];
+      const mult = g.lastMcap !== null ? g.lastMcap / g.spottedMcap : null;
+      const multTxt = mult === null ? "" : `${mult >= 10 ? mult.toFixed(0) : mult.toFixed(1)}\xD7`;
+      const ev = g.status === "DROPPED" ? `\u2702 ${g.dropReason ?? "dropped"}` : g.events[0]?.text ?? "";
+      return `
+          <div class="scan-item${g.status === "ACTIVE" && mult !== null && mult >= 2 ? " gem" : ""}" data-addr="${esc(g.address)}">
+            <span class="mini-badge" style="background:${mult === null ? "#3a3f4c" : mult >= 1 ? "#2e7d4f" : "#8a3a10"};color:#fff">${esc(multTxt || "\u2014")}</span>
+            <span class="si-main">
+              <span class="si-sym">${esc(g.symbol ?? short(g.address))}<span class="lh-tier" style="background:${sm.color};color:${sm.textColor}">${esc(sm.label)}</span><span class="mcap">${esc(eurShort(g.spottedMcap))} \u2192 ${esc(g.lastMcap !== null ? eurShort(g.lastMcap) : "?")}</span></span>
+              <span class="si-reason">${esc(ev)}</span>
+            </span>
+            <button class="copy untrack" data-untrack="${esc(g.address)}" title="Stop tracking">\u2715</button>
+          </div>`;
+    }).join("");
+    wireRowHandlers(box);
+    box.querySelectorAll(".untrack").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        chrome.runtime.sendMessage({ type: "UNTRACK_GEM", address: btn.getAttribute("data-untrack") ?? "" }, () => refreshGemsBox());
+      });
+    });
+  });
+}
+function pillarsHtml(pillars, disqualifiers) {
+  const dq = disqualifiers.length ? `<h4>\u26D4 Disqualified</h4><ul>${disqualifiers.map((d) => `<li><span class="pts bad">\u2717</span><span>${esc(d)}</span></li>`).join("")}</ul>` : "";
+  return dq + pillars.map((p) => {
+    const pct = Math.round(p.score / p.max * 100);
+    const notes = [
+      ...p.good.map((g) => `<li><span class="pts good">\u2713</span><span>${esc(g)}</span></li>`),
+      ...p.bad.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`),
+      ...p.unknown.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`)
+    ].join("");
+    return `<div class="lh-pillar"><div class="lh-row"><span>${esc(p.label)}</span><span>${p.score}/${p.max}</span></div>
+          <div class="lh-bar"><div style="width:${pct}%;background:${gradeColors(pct).color}"></div></div><ul>${notes}</ul></div>`;
+  }).join("");
+}
 function renderLongHold(el, address) {
   if (!el) return;
   el.innerHTML = '<div class="lh-box muted">\u{1F3D4} Long-hold check: loading price history\u2026</div>';
@@ -1615,20 +1700,46 @@ function renderLongHold(el, address) {
       el.innerHTML = `<div class="lh-box muted">\u{1F3D4} Long-hold check unavailable${res && !res.ok ? ` \u2014 ${esc(res.error)}` : ""}.</div>`;
       return;
     }
+    const trackBtn = res.tracked ? '<button class="watch-btn track-btn" disabled>\u{1F331} Tracking \u2713</button>' : '<button class="watch-btn track-btn" title="Follow this coin from now: milestone alerts, and an alert the moment the thesis breaks">\u{1F331} Track this gem</button>';
+    const wireTrack = () => {
+      const b = el.querySelector(".track-btn");
+      if (!b || res.tracked) return;
+      b.addEventListener("click", () => {
+        b.disabled = true;
+        b.textContent = "\u{1F331} adding\u2026";
+        chrome.runtime.sendMessage({ type: "TRACK_GEM", address }, (r2) => {
+          b.textContent = r2?.ok ? "\u{1F331} Tracking \u2713" : `\u2715 ${r2 && !r2.ok ? r2.error : "failed"}`;
+          if (!r2?.ok) b.disabled = false;
+        });
+      });
+    };
+    const e = res.early;
+    if (e && e.stage !== "ROOTED") {
+      const vm = EARLY_VERDICT_META[e.verdict];
+      const sm = GEM_STAGE_META[e.stage];
+      const lead2 = e.disqualifiers[0] ?? e.strengths[0] ?? e.concerns[0] ?? "";
+      const age = e.ageHours === null ? "" : e.ageHours < 1 ? `${Math.round(e.ageHours * 60)} min old` : e.ageHours < 48 ? `${e.ageHours.toFixed(1)}h old` : `${Math.floor(e.ageHours / 24)} days old`;
+      const curve = e.curveProgressPct !== null && e.curveProgressPct < 100 ? ` \xB7 curve ${e.curveProgressPct.toFixed(0)}%` : "";
+      el.innerHTML = `
+        <div class="lh-box">
+          <div class="lh-head">
+            <span class="lh-tier" style="background:${sm.color};color:${sm.textColor}">${esc(sm.label)}</span>
+            <span class="lh-tier" style="background:${vm.color};color:${vm.textColor}">${esc(vm.label)}</span>
+            <span class="lh-score">${e.score === null ? "\u2014" : `${e.score}%`}</span>
+            <span class="muted" style="font-size:10.5px">Early conviction \xB7 ${esc(age)}${esc(curve)}</span>
+          </div>
+          <div class="lh-lead">${esc(lead2)}</div>
+          <div class="row" style="margin-top:6px">${trackBtn}</div>
+          <details><summary>Why \u2014 4 pillars</summary>${pillarsHtml(e.pillars, e.disqualifiers)}
+            <div class="disclaimer">At launch there's little evidence and ~80% of coins die within 48h \u2014 even STRONG launches mostly fail. Tracking re-checks it for you and alerts if the thesis breaks. Size it to lose.</div>
+          </details>
+        </div>`;
+      wireTrack();
+      return;
+    }
     const r = res.result;
     const tm = LONG_HOLD_TIER_META[r.tier];
     const lead = r.tier === "TOO_EARLY" ? `Only ${r.ageDays !== null ? `${Math.max(0, r.ageDays).toFixed(1)} days` : "hours"} old \u2014 about 80% of launches die within 48h. Check back after day 3.` : r.disqualifiers[0] ?? r.strengths[0] ?? r.concerns[0] ?? "";
-    const pillars = r.pillars.map((p) => {
-      const pct = Math.round(p.score / p.max * 100);
-      const notes = [
-        ...p.good.map((g) => `<li><span class="pts good">\u2713</span><span>${esc(g)}</span></li>`),
-        ...p.bad.map((b) => `<li><span class="pts bad">\u2717</span><span>${esc(b)}</span></li>`),
-        ...p.unknown.map((u) => `<li class="gap">Not verified: ${esc(u)}</li>`)
-      ].join("");
-      return `<div class="lh-pillar"><div class="lh-row"><span>${esc(p.label)}</span><span>${p.score}/${p.max}</span></div>
-          <div class="lh-bar"><div style="width:${pct}%;background:${gradeColors(pct).color}"></div></div><ul>${notes}</ul></div>`;
-    }).join("");
-    const dq = r.disqualifiers.length ? `<h4>\u26D4 Disqualified</h4><ul>${r.disqualifiers.map((d) => `<li><span class="pts bad">\u2717</span><span>${esc(d)}</span></li>`).join("")}</ul>` : "";
     el.innerHTML = `
       <div class="lh-box">
         <div class="lh-head">
@@ -1637,10 +1748,12 @@ function renderLongHold(el, address) {
           <span class="muted" style="font-size:10.5px">Staying Power \xB7 ${r.historyDays}d of price history</span>
         </div>
         <div class="lh-lead">${esc(lead)}</div>
-        <details><summary>Why \u2014 6 pillars</summary>${dq}${pillars}
+        <div class="row" style="margin-top:6px">${trackBtn}</div>
+        <details><summary>Why \u2014 6 pillars</summary>${pillarsHtml(r.pillars, r.disqualifiers)}
           <div class="disclaimer">Built from what separated survivors from the ~95% that die. Even CANDIDATE coins often fail \u2014 size every position to lose it.</div>
         </details>
       </div>`;
+    wireTrack();
   });
 }
 function refreshWatchlistBox() {

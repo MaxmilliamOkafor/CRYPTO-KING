@@ -17,6 +17,9 @@ import { parseSellQuote, rawAmountFor } from '../lib/jupiterClient.ts';
 import { assessLongHold, holderGrowthPerDay, pricePath, type LongHoldInputs } from '../lib/longHold.ts';
 import { parseCandles, parsePools, parseTokenInfo, type Candle } from '../lib/geckoClient.ts';
 import { lpStatusFromLockedPct, resolveLpStatus } from '../lib/lpStatus.ts';
+import { assessEarlyGem, computeGemPortfolio, heldThroughDip, holdersPerHour, stageForAge, type EarlyInputs } from '../lib/earlyGem.ts';
+import { athRatio, curveProgress } from '../lib/pumpfunClient.ts';
+import type { GemSnapshot, TrackedGem } from '../lib/types.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
 import { assessLiveState } from '../lib/liveState.ts';
 import { classifyOutcome, computeAccuracy, computeLongHoldAccuracy } from '../lib/outcomeLedger.ts';
@@ -949,6 +952,14 @@ test('LP status off gmgn.ai: graduated pump.fun coins are protocol-burned; RugCh
   // Graduated, but the deepest pool is a separate dev pool elsewhere → no assumption.
   assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: 'meteora' }), 'unknown');
   assert.equal(resolveLpStatus({ ...base, pumpGraduated: false, deepestDexId: 'pumpswap' }), 'unknown');
+  // On the curve there's no LP pool yet — an auditor's "0% locked" must not
+  // brand a fresh launch "liquidity can be pulled".
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: false, audit: 'unlocked' }), 'unknown');
+  // Found by the e2e test: minutes after graduation the pool isn't listed yet and
+  // the auditor still sees the curve ("0% locked") — that must NOT drop the coin.
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: null, audit: 'unlocked' }), 'unknown');
+  // …but a graduated coin whose deepest pool is a separate dev pool IS judged by the auditor.
+  assert.equal(resolveLpStatus({ ...base, pumpGraduated: true, deepestDexId: 'meteora', audit: 'unlocked' }), 'unlocked');
   assert.equal(resolveLpStatus({ ...base, audit: 'locked' }), 'locked');
   // GMGN, when present, is the most specific source and wins.
   assert.equal(resolveLpStatus({ ...base, gmgn: 'deployer_held', pumpGraduated: true, deepestDexId: 'pumpswap' }), 'deployer_held');
@@ -956,6 +967,122 @@ test('LP status off gmgn.ai: graduated pump.fun coins are protocol-burned; RugCh
   assert.equal(lpStatusFromLockedPct(10), 'unlocked');
   assert.equal(lpStatusFromLockedPct(70), null, 'ambiguous readings never become a hard "unlocked" verdict');
   assert.equal(lpStatusFromLockedPct(null), null);
+});
+
+/* ── 🌱 Early gems: spot at launch, follow while you hold ──────────────── */
+
+/** A 2-hour-old pump.fun launch, 60% up its bonding curve, fair distribution. */
+const freshLaunch = (): TokenAnalysis => {
+  const t = structuredClone(FIXTURE_NEUTRAL);
+  t.identity = { ...t.identity, ageMinutes: 120 };
+  t.launch = { platform: 'pumpfun', bondingCurveComplete: false, bannedOnPlatform: false, replyCount: 85, curveProgressPct: 60, athRatio: 0.9, kingOfTheHill: true };
+  t.holders = { ...t.holders!, holderCount: null, top10Pct: 9, largestNonLpWalletPct: 1.6, devHoldsPct: 0.5 };
+  t.market = { ...t.market!, marketCapEur: 45_000, liquidityEur: null, volume24hEur: null, lpStatus: 'unknown', sellSimulation: null };
+  t.deployer = { ...t.deployer!, priorLaunches: 4, priorDeadLaunches: 1, graduatedLaunches: 3 };
+  return t;
+};
+const earlyIn = (over: Partial<EarlyInputs> = {}): EarlyInputs => ({
+  ageHours: 2,
+  buyers24h: null,
+  sellers24h: null,
+  holderCount: null,
+  history: [],
+  socials: { twitter: true, telegram: true, website: true },
+  ...over,
+});
+const eg = (a: TokenAnalysis, x: EarlyInputs) => assessEarlyGem(a, scoreToken(a), x);
+
+test('EARLY: a fair, fast, well-socialised launch at $45k is a STRONG seed', () => {
+  const r = eg(freshLaunch(), earlyIn());
+  assert.equal(r.stage, 'SEED');
+  assert.equal(r.verdict, 'STRONG', `score ${r.score} dq ${r.disqualifiers.join(' | ')}`);
+  assert.ok(r.strengths.some((s) => /17×/.test(s)));
+  assert.ok(r.strengths.some((s) => /Filling its curve fast/.test(s)));
+  assert.equal(r.pillars.reduce((s, p) => s + p.max, 0), 100);
+  // Conviction is unknown at first sight — it must be listed, not assumed.
+  assert.ok(r.unverified.some((u) => /holder growth/.test(u)));
+});
+
+test('EARLY: snipers, a dev bag or an already-dumped chart REJECT the launch', () => {
+  const sniped = freshLaunch();
+  sniped.holders = { ...sniped.holders!, top10Pct: 42 };
+  assert.equal(eg(sniped, earlyIn()).verdict, 'REJECT');
+  const devBag = freshLaunch();
+  devBag.holders = { ...devBag.holders!, devHoldsPct: 12 };
+  const r = eg(devBag, earlyIn());
+  assert.equal(r.verdict, 'REJECT');
+  assert.equal(r.hardBreak, true);
+  const dumped = freshLaunch();
+  dumped.launch = { ...dumped.launch!, athRatio: 0.2 };
+  assert.ok(eg(dumped, earlyIn()).disqualifiers.some((d) => /pump-and-dump happened/.test(d)));
+});
+
+test('EARLY: a temporary dump is not a hard break (a holder keeps watching, a buyer waits)', () => {
+  const t = freshLaunch();
+  t.market = { ...t.market!, liquidityEur: 40_000, priceChange1h: -45, priceChange6h: -10, priceChange24h: 5 };
+  const r = eg(t, earlyIn());
+  assert.equal(r.verdict, 'REJECT'); // don't enter mid-dump…
+  assert.equal(r.hardBreak, false); // …but it doesn't end the thesis by itself
+});
+
+test('EARLY: no socials and a stalled curve make a WEAK launch', () => {
+  const t = freshLaunch();
+  t.launch = { ...t.launch!, curveProgressPct: 4, replyCount: 2, kingOfTheHill: false };
+  const r = eg(t, earlyIn({ ageHours: 6, socials: { twitter: false, telegram: false, website: false } }));
+  assert.equal(r.verdict, 'WEAK', `score ${r.score}`);
+  assert.ok(r.concerns.some((c) => /Stalling/.test(c)));
+});
+
+test('EARLY: conviction builds from tracked history — holder pace and holding through a dip', () => {
+  const H = 3_600_000;
+  const now = Date.now();
+  const hist: GemSnapshot[] = [
+    { at: now - 6 * H, mcap: 40_000, holders: 100, liquidity: null, score: 70, dead: false },
+    { at: now - 4 * H, mcap: 120_000, holders: 300, liquidity: null, score: 72, dead: false },
+    { at: now - 2 * H, mcap: 80_000, holders: 330, liquidity: null, score: 70, dead: false }, // -33% dip, holders UP
+    { at: now - 1 * H, mcap: 150_000, holders: 420, liquidity: null, score: 74, dead: false },
+  ];
+  assert.equal(heldThroughDip(hist), true);
+  assert.ok(holdersPerHour(hist, 450)! > 50);
+  const sold: GemSnapshot[] = [hist[0], hist[1], { ...hist[2], holders: 200 }];
+  assert.equal(heldThroughDip(sold), false);
+  assert.equal(heldThroughDip([hist[0]]), null);
+  const r = eg(freshLaunch(), earlyIn({ ageHours: 7, history: hist, holderCount: 450 }));
+  assert.ok(r.pillars.find((p) => p.key === 'conviction')!.score >= 11);
+});
+
+test('EARLY: stages by age; pump.fun curve progress and ATH ratio parse safely', () => {
+  assert.equal(stageForAge(3), 'SEED');
+  assert.equal(stageForAge(30), 'SPROUT');
+  assert.equal(stageForAge(80), 'ROOTED');
+  near(curveProgress(false, 42.5e9)!, 50); // 42.5 SOL of 85
+  assert.equal(curveProgress(true, null), 100);
+  assert.equal(curveProgress(false, 500e9), null, 'impossible value → unknown, not a guess');
+  near(athRatio(30, 60)!, 0.5);
+  assert.equal(athRatio(90, 60), null, 'current above ATH means the fields disagree');
+});
+
+test('EARLY report: "bought every gem at first sight" counts the losers too', () => {
+  const D = 86_400_000;
+  const now = 100 * D;
+  const g = (sym: string, at7: GemSnapshot | null, status: 'ACTIVE' | 'DROPPED' = 'ACTIVE'): TrackedGem => ({
+    address: sym, symbol: sym, source: 'auto', spottedAt: now - 8 * D, spottedMcap: 50_000, status, dropReason: null,
+    stage: 'ROOTED', verdict: 'CANDIDATE', score: 70, lastMcap: null, peakMcap: null, lastCheckedAt: 0, nextCheckAt: 0,
+    fired: [], events: [], snapshots: at7 ? [at7] : [],
+  });
+  const snap = (mcap: number | null, dead = false): GemSnapshot => ({ at: now - 1 * D, mcap, holders: null, liquidity: null, score: null, dead });
+  const rows = computeGemPortfolio(
+    [g('MOON', snap(1_000_000)), g('FLAT', snap(50_000)), g('RUG', snap(null, true), 'DROPPED'), g('NOSNAP', null)],
+    [7, 30],
+    now,
+  );
+  const d7 = rows.find((r) => r.horizonDays === 7)!;
+  assert.equal(d7.eligible, 4);
+  assert.equal(d7.measured, 3); // NOSNAP has no measurement near day 7
+  near(d7.portfolioMultiple!, (20 + 1 + 0) / 3); // the dropped rug counts as 0×
+  assert.equal(d7.bestSymbol, 'MOON');
+  assert.equal(d7.alive, 2);
+  assert.equal(rows.find((r) => r.horizonDays === 30)!.eligible, 0);
 });
 
 console.log(`\n${passed} tests passed.`);

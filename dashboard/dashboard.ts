@@ -12,7 +12,7 @@
 import { DISCLAIMER, MOCK_MODE } from '../config.ts';
 import { gradeColors as gradeColorsDash, gradeLabel as gradeLabelDash } from '../lib/kingGrade.ts';
 import { LONG_HOLD_TIER_META } from '../lib/longHold.ts';
-import type { AccuracyResponse, JournalEntry, LongHoldAccuracyResponse, RecentResponse, RecentToken } from '../lib/types.ts';
+import type { AccuracyResponse, GemsResponse, JournalEntry, LongHoldAccuracyResponse, RecentResponse, RecentToken } from '../lib/types.ts';
 
 const JOURNAL_KEY = 'ck:journal';
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -40,7 +40,43 @@ document.addEventListener('DOMContentLoaded', () => {
   void loadAll();
   loadAccuracy();
   loadLongHoldAccuracy();
+  loadGemPortfolio();
 });
+
+/** "If you'd bought every gem at first sight" — equal weight, losers included. */
+function loadGemPortfolio(): void {
+  chrome.runtime.sendMessage({ type: 'GET_GEMS' }, (res: GemsResponse | undefined) => {
+    const body = $('gem-body');
+    const note = $('gem-note');
+    if (!res || !res.ok) {
+      note.textContent = 'Gem tracker unavailable.';
+      return;
+    }
+    body.innerHTML = '';
+    const x = (v: number | null) => (v === null ? '—' : `${v >= 10 ? v.toFixed(0) : v.toFixed(2)}×`);
+    for (const r of res.portfolio) {
+      const tr = document.createElement('tr');
+      const pf = document.createElement('td');
+      pf.textContent = x(r.portfolioMultiple);
+      if (r.portfolioMultiple !== null) pf.className = r.portfolioMultiple >= 1 ? 'pnl-pos' : 'pnl-neg';
+      tr.append(
+        td(`${r.horizonDays} day${r.horizonDays > 1 ? 's' : ''}`),
+        td(String(r.eligible)),
+        td(String(r.measured)),
+        td(r.measured ? `${r.alive}/${r.measured}` : '—'),
+        pf,
+        td(x(r.medianMultiple)),
+        td(r.bestMultiple === null ? '—' : `${r.bestSymbol ?? '?'} ${x(r.bestMultiple)}`),
+      );
+      body.appendChild(tr);
+    }
+    const active = res.gems.filter((g) => g.status === 'ACTIVE').length;
+    note.textContent =
+      res.gems.length === 0
+        ? 'No picks yet — the tracker spots strong launches from the live feed while the browser is open.'
+        : `${res.gems.length} picks tracked (${active} active, ${res.gems.length - active} dropped). Results fill in as each pick reaches 1, 7 and 30 days.`;
+  });
+}
 
 /** The long-hold radar grading itself at 7 and 30 days. */
 function loadLongHoldAccuracy(): void {

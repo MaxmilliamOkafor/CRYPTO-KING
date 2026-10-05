@@ -34,7 +34,19 @@ export function resolveLpStatus(i: {
   audit: LpStatus | null;
 }): LpStatus {
   if (i.gmgn && i.gmgn !== 'unknown') return i.gmgn;
-  if (i.pumpGraduated === true && i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return 'burned';
+  if (i.pumpGraduated === true) {
+    if (i.deepestDexId !== null && PUMP_MIGRATION_DEXES.has(i.deepestDexId)) return 'burned';
+    // Graduated but the pool isn't listed yet (minutes after migration):
+    // auditors often still see the old curve and report "0% locked". Taking
+    // that as "pullable" dropped good coins AT graduation. Wait for the pool.
+    if (i.deepestDexId === null) return i.audit === 'unlocked' ? 'unknown' : (i.audit ?? 'unknown');
+    // Deepest pool is on some OTHER venue (a dev-made pool) → trust the auditor.
+  }
+  // Still on the bonding curve: there is no AMM pool, so there is no LP to
+  // lock — the curve's SOL is program-held and nobody can withdraw it. An
+  // auditor's "0% LP locked" here describes a pool that doesn't exist and
+  // would brand every fresh launch "liquidity can be pulled". Stay unknown.
+  if (i.pumpGraduated === false) return 'unknown';
   return i.audit ?? 'unknown';
 }
 

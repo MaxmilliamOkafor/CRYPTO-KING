@@ -47,6 +47,15 @@ await sw.evaluate(() => {
   const PDA = 'PoolPdaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'.replace(/x/g, 'z');
   const SYS = '11111111111111111111111111111111';
   const PUMPSWAP = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
+  // ── 🌱 Seed scenario (mutable from the test via globalThis.__sc) ──
+  const S = 'SeedCoin111111111111111111111111111111111';
+  const SP = 'SeedPoo1111111111111111111111111111111111';
+  const CURVE_ATA = 'CurveAtazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA';
+  const CURVE_PDA = 'CurvePdazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA';
+  const SEED_VAULT = 'SeedVauzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA';
+  const DEV_ATA = 'DevAtazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA';
+  const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+  const sc = (globalThis.__sc = { graduated: false, devPct: 0.5 });
   const alpha = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
   const wallet = (i) => `Hodr${'z'.repeat(36)}${alpha[i]}`;
   const tokAcct = (i) => `Tacc${'z'.repeat(36)}${alpha[i]}`;
@@ -77,12 +86,21 @@ await sw.evaluate(() => {
         return { value: { owner: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', data: { parsed: { type: 'mint', info: { mintAuthority: null, freezeAuthority: null, decimals: 6, supply: '1000000000000000' } } } } };
       case 'getTokenSupply':
         return { value: { amount: '1000000000000000', decimals: 6, uiAmount: 1e9, uiAmountString: '1000000000' } };
-      case 'getTokenLargestAccounts':
+      case 'getTokenLargestAccounts': {
+        if (a0 === S) {
+          // On the curve the curve's ATA holds the unsold supply; after graduation a PumpSwap vault does.
+          const pool = sc.graduated ? { address: SEED_VAULT, uiAmountString: String(200_000_000) } : { address: CURVE_ATA, uiAmountString: String(400_000_000) };
+          const dev = { address: DEV_ATA, uiAmountString: String(sc.devPct * 10_000_000) };
+          return { value: [pool, dev, ...walletPcts.slice(3).map((p, i) => ({ address: tokAcct(i), uiAmountString: String(p * 10_000_000) }))].sort((x, y) => Number(y.uiAmountString) - Number(x.uiAmountString)) };
+        }
         return { value: [{ address: VAULT, uiAmountString: String(300_000_000) }, ...walletPcts.map((p, i) => ({ address: tokAcct(i), uiAmountString: String(p * 10_000_000) }))] };
+      }
       case 'getMultipleAccounts': {
         const enc = params[1]?.encoding;
-        if (enc === 'jsonParsed') return { value: a0.map((acc) => ({ data: { parsed: { info: { owner: acc === VAULT ? PDA : wallet(alpha.indexOf(acc.slice(-1))) } } } })) };
-        return { value: a0.map((o) => ({ owner: o === PDA ? PUMPSWAP : SYS, lamports: 1 })) };
+        const ownerOf = (acc) =>
+          acc === VAULT ? PDA : acc === CURVE_ATA ? CURVE_PDA : acc === SEED_VAULT ? PDA : acc === DEV_ATA ? wallet(21) : wallet(alpha.indexOf(acc.slice(-1)));
+        if (enc === 'jsonParsed') return { value: a0.map((acc) => ({ data: { parsed: { info: { owner: ownerOf(acc) } } } })) };
+        return { value: a0.map((o) => ({ owner: o === PDA ? PUMPSWAP : o === CURVE_PDA ? PUMP_PROGRAM : SYS, lamports: 1 })) };
       }
       default: return null;
     }
@@ -96,7 +114,8 @@ await sw.evaluate(() => {
     if (u.host === 'api.dexscreener.com') {
       if (u.pathname.startsWith('/latest/dex/tokens/')) {
         const mints = decodeURIComponent(u.pathname.split('/').pop()).split(',');
-        const ps = mints.map((m) => PAIRS[m]).filter(Boolean);
+        const live = { ...PAIRS, ...(sc.graduated ? { [S]: pair(S, SP, 'SEED', 60000, 250000, 30000, 'pumpswap', 0.1) } : {}) };
+        const ps = mints.map((m) => live[m]).filter(Boolean);
         return [200, { schemaVersion: '1.0.0', pairs: ps.length ? ps : null }];
       }
       if (u.pathname.startsWith('/token-profiles')) return [200, []];
@@ -105,6 +124,8 @@ await sw.evaluate(() => {
     if (u.host === 'api.geckoterminal.com') {
       const p = u.pathname.replace('/api/v2', '');
       if (p.endsWith('/ohlcv/day')) return p.includes(P) ? [200, { data: { attributes: { ohlcv_list: candles } } }] : [404, {}];
+      if (p === `/networks/solana/tokens/${S}/info`) return sc.graduated ? [200, { data: { attributes: { holders: { count: 900 }, telegram_handle: 'seed', twitter_handle: 'seed', websites: ['https://seed.example'] } } }] : [404, {}];
+      if (p === `/networks/solana/pools/${SP}`) return [200, { data: { attributes: { address: SP, reserve_in_usd: '60000', market_cap_usd: '250000', transactions: { h24: { buyers: 400, sellers: 250 } } }, relationships: { base_token: { data: { id: `solana_${S}` } } } } }];
       if (p.startsWith('/networks/solana/tokens/') && p.endsWith('/info')) {
         return p.includes(M) ? [200, { data: { attributes: { holders: { count: 18200 }, twitter_handle: 'surv', telegram_handle: 'surv', websites: ['https://surv.example'] } } }] : [200, { data: { attributes: { holders: { count: 900 } } } }];
       }
@@ -116,11 +137,18 @@ await sw.evaluate(() => {
       if (u.pathname === `/coins/${M}`) return [200, { mint: M, symbol: 'SURV', name: 'Survivor', created_timestamp: now - 30 * DAY, complete: true,
         usd_market_cap: 4400000, total_supply: 1e15, creator: wallet(20), twitter: 'https://x.com/surv', telegram: 'https://t.me/surv',
         website: 'https://surv.example', reply_count: 140, token_program: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', bonding_curve: 'BCurvezzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA' }];
+      if (u.pathname === `/coins/${S}`) return [200, { mint: S, symbol: 'SEED', name: 'Seedling', created_timestamp: now - 2 * 3_600_000,
+        complete: sc.graduated, real_sol_reserves: sc.graduated ? 0 : 51e9, market_cap: sc.graduated ? 1700 : 300, ath_market_cap: sc.graduated ? 1700 : 320,
+        usd_market_cap: sc.graduated ? 250000 : 45000, total_supply: 1e15, creator: wallet(21), king_of_the_hill_timestamp: now - 1_800_000,
+        reply_count: 85, twitter: 'https://x.com/seed', telegram: 'https://t.me/seed', website: 'https://seed.example',
+        token_program: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', bonding_curve: CURVE_PDA, associated_bonding_curve: CURVE_ATA }];
+      if (u.pathname === `/coins/user-created-coins/${wallet(21)}`) return [200, [1, 2, 3, 4].map((i) => ({ mint: `Old${i}${'z'.repeat(37)}`, created_timestamp: now - i * 30 * DAY, usd_market_cap: i < 4 ? 900000 : 3000, complete: i < 4 }))];
       if (u.pathname.startsWith('/coins/user-created-coins/')) return [200, []];
-      if (u.pathname === '/coins') return [200, []];
+      if (u.pathname === '/coins') return [200, [{ mint: S, symbol: 'SEED', name: 'Seedling', created_timestamp: now - 2 * 3_600_000 }]];
       return [404, {}];
     }
-    if (u.host === 'api.rugcheck.xyz') return [200, { score: 1, risks: [], lpLockedPct: 100 }];
+    // On the curve RugCheck reports 0% LP locked (there's no pool yet) — the scanner must ignore that.
+    if (u.host === 'api.rugcheck.xyz') return [200, { score: 1, risks: [], lpLockedPct: u.pathname.includes(S) ? 0 : 100 }];
     if (u.host === 'lite-api.jup.ag') return [200, { outAmount: '999000', priceImpactPct: '0.0031', routePlan: [{ swapInfo: {} }] }];
     return [404, {}];
   };
@@ -170,6 +198,47 @@ const an = await pop.evaluate((m) => chrome.runtime.sendMessage({ type: 'ANALYZE
 console.log('\n=== FULL SCAN FACTS ===');
 console.log('  lpStatus:', an.analysis.market.lpStatus, '| largest wallet %:', an.analysis.holders.largestNonLpWalletPct?.toFixed(2), '| top10 %:', an.analysis.holders.top10Pct?.toFixed(2), '| dev %:', an.analysis.holders.devHoldsPct);
 console.log('  sellSimulation:', JSON.stringify(an.analysis.market.sellSimulation), '| liquidity:', an.analysis.market.liquidityEur, '| risk reasons:', an.risk.reasons.map((r) => r.text).join(' / ') || 'none');
+// ── 3. 🌱 Seed lifecycle: spotted at launch → graduates 5× → dev dumps ────────
+const S = 'SeedCoin111111111111111111111111111111111';
+const gems = () => pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_GEMS' }));
+const seedOf = (r) => (r.ok ? r.gems.find((g) => g.address === S) : undefined);
+const forceTick = () =>
+  sw.evaluate(async () => {
+    const d = await chrome.storage.local.get('ck:gems');
+    for (const g of d['ck:gems'].gems) g.nextCheckAt = 0;
+    await chrome.storage.local.set(d);
+    chrome.alarms.create('ck-gems', { when: Date.now() + 50 });
+  });
+await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LIVE_FEED' })); // the sweep feeds the spotter
+let seed;
+for (let i = 0; i < 90 && !seed; i++) { await pop.waitForTimeout(1000); seed = seedOf(await gems()); }
+console.log('\n=== 🌱 SEED SPOTTED ===', seed ? `${seed.symbol} stage=${seed.stage} verdict=${seed.verdict} conviction=${seed.score}% spotted at $${seed.spottedMcap}` : 'NOT SPOTTED');
+const early = await pop.evaluate((m) => chrome.runtime.sendMessage({ type: 'GET_LONGHOLD', address: m }), S);
+if (early.ok) for (const p of early.early.pillars) console.log(`  ${p.label.padEnd(18)} ${p.score}/${p.max}`);
+const seedScan = await pop.evaluate((m) => chrome.runtime.sendMessage({ type: 'ANALYZE_TOKEN', address: m }), S);
+console.log('  on-curve LP status:', seedScan.analysis.market.lpStatus, '| top10:', seedScan.analysis.holders.top10Pct?.toFixed(1), '| dev:', seedScan.analysis.holders.devHoldsPct);
+
+await sw.evaluate(() => { globalThis.__sc.graduated = true; });
+await forceTick();
+let grown;
+for (let i = 0; i < 90; i++) { await pop.waitForTimeout(1000); grown = seedOf(await gems()); if (grown?.lastMcap === 250000) break; }
+console.log('\n=== 🎓 AFTER GRADUATION ===', grown ? `${(grown.lastMcap / grown.spottedMcap).toFixed(1)}× · fired: ${grown.fired.join(', ')}` : '—');
+
+await sw.evaluate(() => { globalThis.__sc.devPct = 12; });
+await forceTick();
+let dropped;
+for (let i = 0; i < 90; i++) { await pop.waitForTimeout(1000); dropped = seedOf(await gems()); if (dropped?.status === 'DROPPED') break; }
+console.log('=== ✂ AFTER DEV BUYS/HOLDS 12% ===', dropped ? `${dropped.status} — ${dropped.dropReason}` : '—');
+// Headless Chrome has no notification centre (getAll() is always empty), so the
+// alert trail is verified through the events the tracker records instead.
+console.log('=== TRACKER EVENTS ===\n' + (dropped?.events ?? []).map((e) => `  [${e.tone}] ${e.text}`).join('\n'));
+
+// Panel shows the tracker section (re-open home on the gmgn page).
+await page.goto('https://gmgn.ai/trend');
+let homeTxt = '';
+for (let i = 0; i < 20; i++) { await page.waitForTimeout(1000); homeTxt = await shadowText(); if (/SEED|DROPPED/.test(homeTxt) && /Gem tracker/.test(homeTxt)) break; }
+console.log('panel gem tracker row:', (homeTxt.match(/Gem tracker[^|]*\|[\s\S]{0,400}/) ?? ['(missing)'])[0].replace(/\s*\|\s*/g, ' | ').slice(0, 400));
+
 const hits = await sw.evaluate(() => globalThis.__hits);
 const tally = {}; for (const h of hits) { const k = h.split(' ').slice(0, 2).join(' ').replace(/\/[1-9A-HJ-NP-Za-km-z]{32,44}.*/, '/…'); tally[k] = (tally[k] ?? 0) + 1; }
 console.log('\n=== NETWORK CALLS (' + hits.length + ') ===');
@@ -187,5 +256,12 @@ check(an.analysis.holders.largestNonLpWalletPct < 2, 'the pool vault (30%) is NO
 check(an.analysis.market.sellSimulation?.ok === true, 'Jupiter sell quote fills the sell check');
 check(radar.ok && radar.rows.length === 1 && radar.rows[0].symbol === 'SURV', 'radar screens out the wash-traded and 1-day-old coins');
 check(lh.ok && lh.result.tier === 'CANDIDATE', 'survivor is a long-hold CANDIDATE');
+check(seed && seed.stage === 'SEED' && seed.spottedMcap === 45000, 'fresh $45k launch is auto-spotted as a SEED from the live feed');
+check(seed && seed.verdict === 'STRONG', 'seed has STRONG early signals');
+check(seedScan.analysis.market.lpStatus === 'unknown', "on-curve coin isn't branded 'liquidity can be pulled' by RugCheck's 0%");
+check(grown && grown.fired.includes('graduated') && grown.fired.includes('x5'), 'graduation + 5× milestones fire');
+check(dropped && dropped.status === 'DROPPED' && /Dev holds/.test(dropped.dropReason ?? ''), 'dev bag → thesis broken → dropped');
+check(/Gem tracker/.test(homeTxt), 'panel shows the gem tracker');
+check(dropped && ['graduated', 'x2', 'x5', 'dropped'].every((k) => dropped.fired.includes(k)) && dropped.events.some((e) => /Spotted at \$45k/.test(e.text)), 'full alert trail: spotted → graduated → 2× → 5× → thesis broken');
 console.log(fails.length ? `\n✗ E2E FAILED: ${fails.join('; ')}` : '\n✓ E2E passed — every layer ran end to end.');
 process.exit(fails.length ? 1 : 0);

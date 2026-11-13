@@ -444,7 +444,7 @@ var $ = (id) => document.getElementById(id);
 document.addEventListener("DOMContentLoaded", () => {
   $("disclaimer").textContent = DISCLAIMER;
   $("open-dashboard").addEventListener("click", () => {
-    chrome.tabs.create({ url: chrome.runtime.getURL("dashboard/dashboard.html") });
+    chrome.tabs.create({ url: new URL("../dashboard/dashboard.html", location.href).href });
   });
   initSettings();
   void init();

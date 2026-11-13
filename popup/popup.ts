@@ -30,7 +30,8 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 document.addEventListener('DOMContentLoaded', () => {
   $('disclaimer').textContent = DISCLAIMER;
   $('open-dashboard').addEventListener('click', () => {
-    chrome.tabs.create({ url: chrome.runtime.getURL('dashboard/dashboard.html') });
+    // Relative to this page, so it works from the project folder or dist/.
+    chrome.tabs.create({ url: new URL('../dashboard/dashboard.html', location.href).href });
   });
   initSettings();
   void init();

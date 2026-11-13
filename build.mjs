@@ -1,7 +1,7 @@
 /**
  * build.mjs — esbuild-based build for the MV3 extension.
  *
- *   node build.mjs           one-shot build into dist/  (load THAT dir unpacked)
+ *   node build.mjs           one-shot build into dist/  (load the project folder OR dist/ unpacked)
  *   node build.mjs --watch   rebuild on change
  *   node build.mjs --test    bundle + run the riskScorer unit tests
  *
@@ -11,7 +11,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import * as esbuild from 'esbuild';
 
@@ -49,8 +49,23 @@ const options = {
   logLevel: 'info',
 };
 
+/**
+ * ONE manifest, two ways to load. The root manifest.json points into dist/
+ * (dist/background/…, dist/content/…), so "Load unpacked" works on the
+ * project folder itself — the folder people naturally pick, and which used
+ * to fail with "Could not load javascript 'content/content.js'". The copy in
+ * dist/ has the prefix stripped, so loading dist/ directly keeps working too.
+ */
+function writeDistManifest() {
+  const strip = (v) => (typeof v === 'string' ? v.replace(/^dist\//, '') : v);
+  const walk = (x) =>
+    Array.isArray(x) ? x.map(walk) : x && typeof x === 'object' ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, walk(v)])) : strip(x);
+  const root = JSON.parse(readFileSync('manifest.json', 'utf8'));
+  writeFileSync('dist/manifest.json', JSON.stringify(walk(root), null, 2) + '\n');
+}
+
 function copyStatic() {
-  cpSync('manifest.json', 'dist/manifest.json');
+  writeDistManifest();
   cpSync('popup/popup.html', 'dist/popup/popup.html');
   cpSync('popup/popup.css', 'dist/popup/popup.css');
   cpSync('dashboard/dashboard.html', 'dist/dashboard/dashboard.html');
@@ -73,7 +88,7 @@ async function main() {
   } else {
     await esbuild.build(options);
     copyStatic();
-    console.log('built → dist/  (chrome://extensions → Load unpacked → select dist/)');
+    console.log('built → dist/  (chrome://extensions → Load unpacked → select this project folder, or dist/)');
   }
 }
 

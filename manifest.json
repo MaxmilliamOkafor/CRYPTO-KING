@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "CRYPTO-KING — Solana Meme-Coin Risk Scanner",
+  "name": "CRYPTO-KING — Solana Gem Finder & Rug Scanner",
   "version": "2.0.0",
   "description": "Read-only gem finder and rug scanner for Solana meme coins. Spots launches early, follows your holds, warns when the thesis breaks. Risk information only — cannot detect all scams, does not guarantee profits. Not financial advice.",
   "permissions": [
@@ -22,7 +22,7 @@
     "https://rpc.magicblock.app/*"
   ],
   "background": {
-    "service_worker": "background/service-worker.js",
+    "service_worker": "dist/background/service-worker.js",
     "type": "module"
   },
   "content_scripts": [
@@ -35,22 +35,22 @@
         "https://www.dextools.io/*"
       ],
       "js": [
-        "content/content.js"
+        "dist/content/content.js"
       ],
       "run_at": "document_idle"
     }
   ],
   "action": {
-    "default_popup": "popup/popup.html",
-    "default_title": "CRYPTO-KING risk scanner"
+    "default_popup": "dist/popup/popup.html",
+    "default_title": "CRYPTO-KING"
   },
   "options_ui": {
-    "page": "dashboard/dashboard.html",
+    "page": "dist/dashboard/dashboard.html",
     "open_in_tab": true
   },
   "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "dist/icons/icon16.png",
+    "48": "dist/icons/icon48.png",
+    "128": "dist/icons/icon128.png"
   }
 }

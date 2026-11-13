@@ -3419,6 +3419,7 @@ async function fetchOwnerPrograms(owners) {
 }
 
 // background/service-worker.ts
+var ICON_URL = new URL("../icons/icon128.png", self.location.href).href;
 var RECENT_KEY = "ck:recent";
 var BASE58_RE4 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 var cache = /* @__PURE__ */ new Map();
@@ -3673,7 +3674,7 @@ function maybeNotifyLowRisk(row) {
   const sym = row.symbol ?? `${row.address.slice(0, 4)}\u2026${row.address.slice(-4)}`;
   chrome.notifications.create(`ck-${row.address}`, {
     type: "basic",
-    iconUrl: "icons/icon128.png",
+    iconUrl: ICON_URL,
     // King Grade only — one number, higher = better. (This used to append the
     // raw risk score, which runs the OPPOSITE direction.)
     title: `\u{1F48E} ${sym} \u2014 King Grade ${row.grade ?? "?"}% ${gradeLabel(row.grade)}`,
@@ -3996,7 +3997,7 @@ async function sweepWatchlist() {
     const sym = coin.symbol ?? `${coin.address.slice(0, 4)}\u2026${coin.address.slice(-4)}`;
     chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
       type: "basic",
-      iconUrl: "icons/icon128.png",
+      iconUrl: ICON_URL,
       title: `\u{1F6A8} ${sym} \u2014 watched coin alert`,
       message: `${alert.message} Click to open on GMGN.`,
       priority: 2
@@ -4278,7 +4279,7 @@ async function doRadarSweep() {
     const what = r.verdict === "CANDIDATE" ? "Long-hold candidate" : "Strong young coin";
     chrome.notifications.create(`ck-lh-${r.address}`, {
       type: "basic",
-      iconUrl: "icons/icon128.png",
+      iconUrl: ICON_URL,
       title: `\u{1F3D4} ${what}: ${sym} \u2014 ${r.score ?? "?"}% at ${r.marketCapUsd !== null ? usdK(r.marketCapUsd) : "?"}`,
       message: `${r.headline ?? "Passed every check."} Now tracked for you. Not a buy signal \u2014 size it to lose. Click to open.`
     });
@@ -4570,7 +4571,7 @@ async function considerSpot(mint) {
     const sym = out.symbol ?? short4(mint);
     chrome.notifications.create(`ck-gem-${mint}-spotted`, {
       type: "basic",
-      iconUrl: "icons/icon128.png",
+      iconUrl: ICON_URL,
       title: `\u{1F331} Gem spotted early: ${sym} at ${usdK(out.mcap)} \u2014 conviction ${e.score}%`,
       message: `${e.strengths[0] ?? "Strong early signals."} Now tracking it \u2014 you'll be alerted on milestones and if the thesis breaks. Most launches still fail: size it to lose.`
     });
@@ -4671,7 +4672,7 @@ async function doGemTick() {
     for (const cur of store.gems) updates.get(cur.address)?.(cur);
     await saveGems(store);
   });
-  for (const n of notes) chrome.notifications.create(n.id, { type: "basic", iconUrl: "icons/icon128.png", title: n.title, message: n.message, priority: 2 });
+  for (const n of notes) chrome.notifications.create(n.id, { type: "basic", iconUrl: ICON_URL, title: n.title, message: n.message, priority: 2 });
 }
 function applyCheck(g, out, notes) {
   const now2 = Date.now();

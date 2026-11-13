@@ -114,6 +114,10 @@ import type {
   XBuzzResponse,
 } from '../lib/types.ts';
 
+/** Resolved from this script's own location, so it works whether the
+ *  extension was loaded from the project folder (…/dist/icons) or dist/. */
+const ICON_URL = new URL('../icons/icon128.png', self.location.href).href;
+
 const RECENT_KEY = 'ck:recent';
 const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
@@ -463,7 +467,7 @@ function maybeNotifyLowRisk(row: FeedRow): void {
   const sym = row.symbol ?? `${row.address.slice(0, 4)}…${row.address.slice(-4)}`;
   chrome.notifications.create(`ck-${row.address}`, {
     type: 'basic',
-    iconUrl: 'icons/icon128.png',
+    iconUrl: ICON_URL,
     // King Grade only — one number, higher = better. (This used to append the
     // raw risk score, which runs the OPPOSITE direction.)
     title: `💎 ${sym} — King Grade ${row.grade ?? '?'}% ${gradeLabel(row.grade)}`,
@@ -952,7 +956,7 @@ async function sweepWatchlist(): Promise<void> {
     const sym = coin.symbol ?? `${coin.address.slice(0, 4)}…${coin.address.slice(-4)}`;
     chrome.notifications.create(`ck-watch-${coin.address}-${alert.kind}`, {
       type: 'basic',
-      iconUrl: 'icons/icon128.png',
+      iconUrl: ICON_URL,
       title: `🚨 ${sym} — watched coin alert`,
       message: `${alert.message} Click to open on GMGN.`,
       priority: 2,
@@ -1349,7 +1353,7 @@ async function doRadarSweep(): Promise<void> {
     const what = r.verdict === 'CANDIDATE' ? 'Long-hold candidate' : 'Strong young coin';
     chrome.notifications.create(`ck-lh-${r.address}`, {
       type: 'basic',
-      iconUrl: 'icons/icon128.png',
+      iconUrl: ICON_URL,
       title: `🏔 ${what}: ${sym} — ${r.score ?? '?'}% at ${r.marketCapUsd !== null ? usdK(r.marketCapUsd) : '?'}`,
       message: `${r.headline ?? 'Passed every check.'} Now tracked for you. Not a buy signal — size it to lose. Click to open.`,
     });
@@ -1745,7 +1749,7 @@ async function considerSpot(mint: string): Promise<void> {
     const sym = out.symbol ?? short4(mint);
     chrome.notifications.create(`ck-gem-${mint}-spotted`, {
       type: 'basic',
-      iconUrl: 'icons/icon128.png',
+      iconUrl: ICON_URL,
       title: `🌱 Gem spotted early: ${sym} at ${usdK(out.mcap as number)} — conviction ${e.score}%`,
       message: `${e.strengths[0] ?? 'Strong early signals.'} Now tracking it — you'll be alerted on milestones and if the thesis breaks. Most launches still fail: size it to lose.`,
     });
@@ -1859,7 +1863,7 @@ async function doGemTick(): Promise<void> {
     for (const cur of store.gems) updates.get(cur.address)?.(cur);
     await saveGems(store);
   });
-  for (const n of notes) chrome.notifications.create(n.id, { type: 'basic', iconUrl: 'icons/icon128.png', title: n.title, message: n.message, priority: 2 });
+  for (const n of notes) chrome.notifications.create(n.id, { type: 'basic', iconUrl: ICON_URL, title: n.title, message: n.message, priority: 2 });
 }
 
 /** Fold one fresh assessment into a tracked coin: snapshot, stage, alerts. */

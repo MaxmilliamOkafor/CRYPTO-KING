@@ -32,7 +32,7 @@ The repo ships with a pre-built **`dist/`** folder running in **live mode** — 
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode** (top right)
-3. Click **Load unpacked** → select the **`dist/`** folder — ⚠️ **NOT the repo root**. The root contains the TypeScript sources; Chrome can only run the bundled JavaScript in `dist/`. (Loading the root gives *"Could not load javascript 'content/content.js'"*.)
+3. Click **Load unpacked** → select the **project folder** (the one with `README.md` in it). Selecting the `dist/` folder inside it works too. Both are tested in real Chromium on every change (`npm run test:load`).
 4. Go to **gmgn.ai**, **pump.fun**, or **dextools.io** (Solana pages). Two things happen:
 
    **Two scores, both higher = better:** 🌱 **launch score** for coins that haven't been fully scanned yet (socials, fair launch, curve speed — what's actually knowable in a coin's first minutes) and 👑 **King Grade** once the full audit has run. (Showing an audit grade on unaudited coins made every fresh launch read "50% MIXED" — and, through a non-monotonic cap, graded coins with *more* positive signals *lower*. Both fixed.)

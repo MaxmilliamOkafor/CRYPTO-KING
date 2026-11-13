@@ -296,6 +296,46 @@ let cardTxt = '';
 for (let i = 0; i < 40; i++) { await page.waitForTimeout(1000); cardTxt = await shadowText(); if (/Max size: \$/.test(cardTxt)) break; }
 console.log('card risk plan:', (cardTxt.match(/Max size:[^|]*(\|[^|]*){0,3}/) ?? ['(missing)'])[0].replace(/\s*\|\s*/g, ' | ').slice(0, 260));
 
+// Optional screenshots of the real panel: CK_SHOTS=<dir> npm run test:e2e
+if (process.env.CK_SHOTS) {
+  const dir = process.env.CK_SHOTS;
+  fs.mkdirSync(dir, { recursive: true });
+  await page.setViewportSize({ width: 1100, height: 900 });
+  // The panel lives in a CLOSED shadow root — find nodes through the DevTools protocol.
+  const clickTab = async (name) => {
+    const { root } = await cdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    let id = null;
+    const walk = (n) => {
+      const a = n.attributes ?? [];
+      for (let i = 0; i < a.length; i += 2) if (a[i] === 'data-tab' && a[i + 1] === name) id = n.nodeId;
+      (n.children ?? []).forEach(walk);
+      (n.shadowRoots ?? []).forEach(walk);
+    };
+    walk(root);
+    if (id === null) return false;
+    const { model } = await cdp.send('DOM.getBoxModel', { nodeId: id });
+    const q = model.content;
+    await page.mouse.click((q[0] + q[4]) / 2, (q[1] + q[5]) / 2);
+    await page.waitForTimeout(700);
+    return true;
+  };
+  await page.screenshot({ path: path.join(dir, '1-card.png') });
+  await page.goto('https://gmgn.ai/trend');
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: path.join(dir, '2-picks.png') });
+  for (const [i, t] of [['3', 'live'], ['4', 'radar'], ['5', 'holds'], ['6', 'scan']]) {
+    if (await clickTab(t)) await page.screenshot({ path: path.join(dir, `${i}-${t}.png`) });
+  }
+  await pop.goto(`chrome-extension://${extId}/popup/popup.html`);
+  await pop.setViewportSize({ width: 380, height: 900 });
+  await pop.waitForTimeout(1200);
+  await pop.screenshot({ path: path.join(dir, '7-popup.png'), fullPage: true });
+  await pop.goto(`chrome-extension://${extId}/dashboard/dashboard.html`);
+  await pop.setViewportSize({ width: 1100, height: 900 });
+  await pop.waitForTimeout(1200);
+  await pop.screenshot({ path: path.join(dir, '8-dashboard.png'), fullPage: true });
+}
+
 const hits = await sw.evaluate(() => globalThis.__hits);
 const tally = {}; for (const h of hits) { const k = h.split(' ').slice(0, 2).join(' ').replace(/\/[1-9A-HJ-NP-Za-km-z]{32,44}.*/, '/…'); tally[k] = (tally[k] ?? 0) + 1; }
 console.log('\n=== NETWORK CALLS (' + hits.length + ') ===');

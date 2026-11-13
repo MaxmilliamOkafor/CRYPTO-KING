@@ -1,8 +1,24 @@
-# CRYPTO-KING 👑
+# CRYPTO-KING 👑 v2
 
-**Read-only Solana meme-coin risk scanner** — a Chrome extension (Manifest V3, TypeScript) that overlays a color-coded risk score directly on [GMGN.AI](https://gmgn.ai) token pages (and pump.fun coin pages).
+**Read-only gem finder & rug scanner for Solana meme coins** — a Chrome extension (Manifest V3, TypeScript). It spots launches early, finds young coins that survived the rug window, follows the coins you hold, and warns you the moment a coin's thesis breaks.
 
 > ⚠️ **Meme coins are extremely speculative and frequently go to zero. This tool reduces some risks; it cannot detect all scams and does not guarantee profits. Only risk money you can afford to lose. Not financial advice.**
+
+## v2 at a glance
+
+The panel (👑 button, bottom-right on gmgn.ai, pump.fun and dextools.io) has five tabs:
+
+| Tab | What it shows |
+|---|---|
+| 🏆 **Picks** | One short list, best first: launches, young coins (1–21 days) and coins you track, **merged and ranked**. Only coins that currently pass their checks. ✓ = full background check done, 🌱 = launch score only. |
+| 📡 **Launches** | Every new launch, scanned within seconds. "Best only" is on by default. |
+| 🏔 **Radar** | Young coins (1–21 days, $100k–$5M) that survived the first-48h kill zone. Scans every minute, panel open or not. |
+| 💼 **Holds** | The gem tracker (spotted at a low cap → followed → alerts on milestones and on a broken thesis) and the rug watchlist. |
+| 🔍 **Scan** | Scan any address; coins linked on the current page. |
+
+Below the tabs, a **data-health strip** shows one dot per source, so a failing API is visible instead of mysterious. Open any coin and its card shows a **🧮 max size** for that coin, based on the bankroll you set in the popup (Risk plan).
+
+**Works without any keys.** The free public Solana RPC refuses holder lookups, so v2 uses **RugCheck's public report as a second source** for holders, insider-held supply, LP lock, authorities, metadata mutability and its own "rugged" verdict. A free Helius key (popup → Turbo) makes holder checks reliable on every scan.
 
 ## What it is (and is not)
 

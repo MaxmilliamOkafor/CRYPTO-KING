@@ -259,7 +259,7 @@ const STYLES = `
     box-shadow: 0 10px 34px rgba(0,0,0,.5);
     overflow: hidden;
   }
-  .body { flex: 1 1 auto; overflow-y: auto; }
+  .body { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
   .titlebar { flex: 0 0 auto; }
   .titlebar {
     display: flex; align-items: center; gap: 8px; padding: 9px 10px 9px 12px;
@@ -359,10 +359,14 @@ const STYLES = `
     display: flex; align-items: center; gap: 8px; padding: 6px 6px; border-radius: 8px; cursor: pointer;
   }
   .scan-item:hover { background: #1c1f26; }
-  .mini-badge { font-weight: 800; font-size: 10px; letter-spacing: .03em; padding: 2px 6px; border-radius: 6px; min-width: 58px; text-align: center; }
-  .si-main { flex: 1; min-width: 0; }
-  .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
-  .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mini-badge { font-weight: 800; font-size: 10px; letter-spacing: .03em; padding: 2px 6px; border-radius: 6px; min-width: 58px; text-align: center; flex: 0 0 auto; white-space: nowrap; }
+  /* Rows must never be wider than the panel: chips wrap onto a second line and
+     the reason wraps to two — the old nowrap rows pushed the whole panel into
+     a horizontal scrollbar and hid the last chips. */
+  .si-main { flex: 1 1 0; min-width: 0; overflow: hidden; }
+  .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 3px 6px; }
+  .si-reason { color: #9aa1af; font-size: 10.5px; line-height: 1.35; margin-top: 1px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .scan-item > .copy, .scan-item > a { flex: 0 0 auto; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
   .tabs { display: flex; gap: 2px; margin: -4px -4px 10px; padding: 3px; background: #10131a; border: 1px solid #262b36; border-radius: 10px; position: sticky; top: -12px; z-index: 5; }
   .tab { flex: 1 1 0; padding: 6px 2px; border-radius: 7px; font: 700 11px/1.2 system-ui, sans-serif; color: #9aa1af; background: transparent; border: 0; cursor: pointer; white-space: nowrap; }

@@ -147,6 +147,12 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
     gap('Live price momentum unavailable — cannot tell if it is already dumping.');
   }
 
+  // An independent auditor's "rugged" verdict is treated like a collapse we
+  // measured ourselves — two sources can disagree on scores, not on this.
+  if (a.audit?.rugged === true && live.state !== 'DEAD') {
+    hit(w.alreadyDead, 'Marked as RUGGED by RugCheck (independent auditor).');
+  }
+
   /* ── Holder concentration ──────────────────────────────────────────── */
   const h = a.holders;
   if (!h) {
@@ -293,7 +299,10 @@ export function scoreToken(a: TokenAnalysis, w: Weights = WEIGHTS, l: Limits = L
   /* ── Total: positives, capped mitigations, clamp ───────────────────── */
   const positive = reasons.reduce((sum, r) => sum + r.points, 0);
   const rawMitigation = mitigations.reduce((sum, r) => sum + r.points, 0); // negative
-  const cappedMitigation = Math.max(rawMitigation, -MITIGATION_CAP);
+  // Good socials or smart-money interest don't soften a coin that has ALREADY
+  // collapsed or been marked rugged — there is nothing left to mitigate.
+  const terminal = live.state === 'DEAD' || a.audit?.rugged === true;
+  const cappedMitigation = terminal ? 0 : Math.max(rawMitigation, -MITIGATION_CAP);
   const riskScore = clamp(Math.round(positive + cappedMitigation), 0, 100);
 
   reasons.sort((x, y) => y.points - x.points);

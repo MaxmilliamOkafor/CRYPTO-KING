@@ -14,23 +14,37 @@ export interface Settings {
   heliusKey: string | null;
   /** Optional X (Twitter) API v2 bearer token for automated tweet-buzz. */
   xBearerToken: string | null;
+  /** Risk plan: the user's meme-coin bankroll in USD (null = not set). */
+  bankrollUsd: number | null;
+  /** Risk plan: % of the bankroll risked per pick (null = config default). */
+  riskPct: number | null;
 }
 
 const KEY = 'ck:settings';
-let current: Settings = { heliusKey: null, xBearerToken: null };
+let current: Settings = { heliusKey: null, xBearerToken: null, bankrollUsd: null, riskPct: null };
 
 const clean = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
+const posNum = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null);
 
 export async function loadSettings(): Promise<void> {
   const d = await chrome.storage.local.get(KEY);
   const s = d[KEY] as Partial<Settings> | undefined;
-  if (s) current = { heliusKey: clean(s.heliusKey), xBearerToken: clean(s.xBearerToken) };
+  if (s) {
+    current = {
+      heliusKey: clean(s.heliusKey),
+      xBearerToken: clean(s.xBearerToken),
+      bankrollUsd: posNum(s.bankrollUsd),
+      riskPct: posNum(s.riskPct),
+    };
+  }
 }
 
 export async function setSettings(patch: Partial<Settings>): Promise<Settings> {
   current = {
     heliusKey: 'heliusKey' in patch ? clean(patch.heliusKey) : current.heliusKey,
     xBearerToken: 'xBearerToken' in patch ? clean(patch.xBearerToken) : current.xBearerToken,
+    bankrollUsd: 'bankrollUsd' in patch ? posNum(patch.bankrollUsd) : current.bankrollUsd,
+    riskPct: 'riskPct' in patch ? posNum(patch.riskPct) : current.riskPct,
   };
   await chrome.storage.local.set({ [KEY]: current });
   return current;

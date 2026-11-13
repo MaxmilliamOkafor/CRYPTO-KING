@@ -47,18 +47,24 @@ export async function fetchSolanaData(
   /** pump.fun bonding-curve state: false = still on the curve (only then can a
    *  lite scan trust its concentration numbers — see fetchHolderInfoLite). */
   curveComplete: boolean | null = null,
+  /** Skip the mint cache (forced re-checks). */
+  fresh = false,
 ): Promise<SolanaData> {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, decimals: null, status: 'mock' };
   }
 
+  // The mint account comes first: it carries the supply, so the holder math
+  // needs no separate getTokenSupply call (one fewer rate-limited request per
+  // coin), and in feed sweeps it's already cached by primeMintInfos().
+  const mi = await fetchMintInfo(address, fresh);
   if (lite) {
-    const [mi, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete)]);
+    const holders = await fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete, mi?.supply ?? null);
     return { mint: mi?.mint ?? null, holders, decimals: mi?.decimals ?? null, status: mi ? 'partial' : 'unavailable' };
   }
 
-  const [mi, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address, creatorAddress)]);
+  const holders = await fetchHolderInfo(address, creatorAddress, mi?.supply ?? null);
   const mint = mi?.mint ?? null;
   const status = mint && holders ? 'ok' : mint || holders ? 'partial' : 'unavailable';
   return { mint, holders, decimals: mi?.decimals ?? null, status };
@@ -66,13 +72,58 @@ export async function fetchSolanaData(
 
 /* ── Mint account: authorities + Token-2022 extensions ─────────────────── */
 
-async function fetchMintInfo(address: string): Promise<{ mint: MintInfo; decimals: number | null } | null> {
-  const result = (await rpcCall(rpcUrlPool(), 'getAccountInfo', [
-    address,
-    { encoding: 'jsonParsed', commitment: 'confirmed' },
-  ])) as { value?: { owner?: string; data?: { parsed?: { type?: string; info?: Record<string, unknown> } } } } | null;
+type MintRead = { mint: MintInfo; decimals: number | null; supply: number | null };
+type MintAccountValue = { owner?: string; data?: { parsed?: { type?: string; info?: Record<string, unknown> } } } | null | undefined;
 
-  const value = result?.value;
+/** Parsed mint accounts, cached briefly. `null` = "not a mint" (a real answer). */
+const mintCache = new Map<string, { v: Omit<MintRead, 'mint'> & { mint: Omit<MintInfo, 'metadataMutable'> } | null; at: number }>();
+const MINT_TTL_MS = 60_000;
+
+/**
+ * Batch-load mint accounts for a whole feed sweep: ONE getMultipleAccounts
+ * call per 100 coins instead of one getAccountInfo per coin. On the public
+ * RPC (about one request a second) this is the difference between a sweep
+ * taking ~45s and ~15s.
+ */
+export async function primeMintInfos(mints: string[]): Promise<void> {
+  if (MOCK_MODE) return;
+  const now = Date.now();
+  const need = [...new Set(mints)].filter((m) => {
+    const hit = mintCache.get(m);
+    return !hit || now - hit.at > MINT_TTL_MS;
+  });
+  for (let i = 0; i < need.length; i += 100) {
+    const chunk = need.slice(i, i + 100);
+    const result = (await rpcCall(rpcUrlPool(), 'getMultipleAccounts', [
+      chunk,
+      { encoding: 'jsonParsed', commitment: 'confirmed' },
+    ])) as { value?: MintAccountValue[] } | null;
+    const values = result?.value;
+    if (!Array.isArray(values)) continue; // failed → leave uncached, per-coin lookups will retry
+    if (mintCache.size > 1500) mintCache.clear();
+    chunk.forEach((m, idx) => mintCache.set(m, { v: parseMintAccount(values[idx]), at: Date.now() }));
+  }
+}
+
+async function fetchMintInfo(address: string, fresh = false): Promise<MintRead | null> {
+  let hit = mintCache.get(address);
+  if (fresh || !hit || Date.now() - hit.at > MINT_TTL_MS) {
+    const result = (await rpcCall(rpcUrlPool(), 'getAccountInfo', [
+      address,
+      { encoding: 'jsonParsed', commitment: 'confirmed' },
+    ])) as { value?: MintAccountValue } | null;
+    if (result === null) return null; // request failed — unknown, not "not a mint"
+    hit = { v: parseMintAccount(result.value), at: Date.now() };
+    mintCache.set(address, hit);
+  }
+  if (!hit.v) return null;
+  return { ...hit.v, mint: { ...hit.v.mint, metadataMutable: await fetchMetadataMutable(address) } };
+}
+
+/** jsonParsed mint account → authorities, Token-2022 extensions, decimals, supply. */
+export function parseMintAccount(
+  value: MintAccountValue,
+): (Omit<MintRead, 'mint'> & { mint: Omit<MintInfo, 'metadataMutable'> }) | null {
   const parsed = value?.data?.parsed;
   if (!value || !parsed || parsed.type !== 'mint' || !parsed.info) return null;
 
@@ -121,11 +172,12 @@ async function fetchMintInfo(address: string): Promise<{ mint: MintInfo; decimal
     }
   }
 
+  const decimals = asNumber(info.decimals);
+  const rawSupply = asNumber(info.supply);
   return {
     mint: {
       mintAuthorityActive,
       freezeAuthorityActive,
-      metadataMutable: await fetchMetadataMutable(address),
       isToken2022,
       transferFeeBps,
       feeAuthorityActive,
@@ -134,7 +186,8 @@ async function fetchMintInfo(address: string): Promise<{ mint: MintInfo; decimal
       defaultAccountFrozen,
       nonTransferable,
     },
-    decimals: asNumber(info.decimals),
+    decimals,
+    supply: rawSupply !== null && decimals !== null && rawSupply > 0 ? rawSupply / 10 ** decimals : null,
   };
 }
 
@@ -147,14 +200,15 @@ async function fetchMetadataMutable(address: string): Promise<boolean | null> {
 
 /* ── Holder concentration (LP/burn excluded) ───────────────────────────── */
 
-async function fetchHolderInfo(address: string, creatorAddress: string | null = null): Promise<HolderInfo | null> {
-  const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(rpcUrlPool(), 'getTokenSupply', [address, { commitment: 'confirmed' }]),
-    rpcCall(rpcUrlPool(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
-  ]);
-
-  const supply = uiAmountOf((supplyRes as { value?: { uiAmountString?: unknown; uiAmount?: unknown } } | null)?.value);
+async function fetchHolderInfo(
+  address: string,
+  creatorAddress: string | null = null,
+  knownSupply: number | null = null,
+): Promise<HolderInfo | null> {
+  const largestRes = await rpcCall(rpcUrlPool(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]);
   const raw = parseLargest(largestRes);
+  if (raw.length === 0) return null; // refused/empty — don't spend a supply call on it
+  const supply = knownSupply ?? (await fetchSupply(address));
   if (supply === null || supply <= 0 || raw.length === 0) return null;
 
   // Who owns each top token account, and which PROGRAM owns that owner?
@@ -217,6 +271,7 @@ async function fetchHolderInfoLite(
   address: string,
   excludeTokenAccounts: string[],
   curveComplete: boolean | null,
+  knownSupply: number | null = null,
 ): Promise<HolderInfo | null> {
   // Without owner resolution we can only exclude pools we know by ADDRESS —
   // the bonding curve, while the coin is still on it. Once it has graduated,
@@ -227,15 +282,12 @@ async function fetchHolderInfoLite(
   // and don't spend two rate-limited RPC calls finding that out.
   if (curveComplete !== false) return null;
 
-  const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(rpcUrlPool(), 'getTokenSupply', [address, { commitment: 'confirmed' }]),
-    rpcCall(rpcUrlPool(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]),
-  ]);
-
-  const supply = uiAmountOf((supplyRes as { value?: { uiAmountString?: unknown; uiAmount?: unknown } } | null)?.value);
+  const largestRes = await rpcCall(rpcUrlPool(), 'getTokenLargestAccounts', [address, { commitment: 'confirmed' }]);
   const excluded = new Set(excludeTokenAccounts);
   const accounts = parseLargest(largestRes).filter((a) => !excluded.has(a.address));
-  if (supply === null || supply <= 0 || accounts.length === 0) return null;
+  if (accounts.length === 0) return null;
+  const supply = knownSupply ?? (await fetchSupply(address));
+  if (supply === null || supply <= 0) return null;
 
   const pct = (slice: Array<{ amount: number }>) =>
     Math.min(100, (slice.reduce((s, a) => s + a.amount, 0) / supply) * 100);
@@ -249,6 +301,12 @@ async function fetchHolderInfoLite(
     smartMoneyPct: null, // needs owner resolution — full scans only
     devHoldsPct: null, // needs owner resolution — full scans only
   };
+}
+
+/** Fallback only — the mint account normally provides the supply. */
+async function fetchSupply(address: string): Promise<number | null> {
+  const res = await rpcCall(rpcUrlPool(), 'getTokenSupply', [address, { commitment: 'confirmed' }]);
+  return uiAmountOf((res as { value?: { uiAmountString?: unknown; uiAmount?: unknown } } | null)?.value);
 }
 
 async function fetchOwners(tokenAccounts: string[]): Promise<Array<string | null>> {

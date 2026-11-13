@@ -20,6 +20,14 @@ import { lpStatusFromLockedPct, resolveLpStatus } from '../lib/lpStatus.ts';
 import { assessEarlyGem, computeGemPortfolio, heldThroughDip, holdersPerHour, stageForAge, type EarlyInputs } from '../lib/earlyGem.ts';
 import { athRatio, curveProgress } from '../lib/pumpfunClient.ts';
 import { quickScreen } from '../lib/radarScreen.ts';
+import { parseRugcheckReport } from '../lib/rugcheckClient.ts';
+import { parseMintAccount } from '../lib/solanaClient.ts';
+import { summarizeHealth } from '../lib/health.ts';
+import { buildPicks } from '../lib/picks.ts';
+import { planPosition } from '../lib/sizing.ts';
+import { parseCoin } from '../lib/pumpfunClient.ts';
+import type { SourceHealth } from '../lib/http.ts';
+import type { FeedRow, RadarRow } from '../lib/types.ts';
 import type { DexTokenMarket } from '../lib/dexscreenerClient.ts';
 import type { GemSnapshot, TrackedGem } from '../lib/types.ts';
 import { assessExitReality } from '../lib/exitReality.ts';
@@ -1161,6 +1169,160 @@ test('ACCURACY: replay of the screenshot — the launch with MORE quality signal
   const g = (a: TokenAnalysis) => computeKingGrade(a, scoreToken(a), scoreQuality(a)).grade!;
   assert.ok(scoreQuality(better).qualityScore > scoreQuality(plain).qualityScore, 'precondition: more quality signals');
   assert.ok(g(better) >= g(plain), `better ${g(better)} vs plain ${g(plain)}`);
+});
+
+/* ── v2: second data source, speed, health, picks, sizing ──────────────── */
+
+test('V2 RugCheck fallback: holders from the report, with pools / lockers / burns excluded', () => {
+  const r = parseRugcheckReport({
+    token: { mintAuthority: null, freezeAuthority: null, supply: 1e15, decimals: 6 },
+    tokenMeta: { name: 'X', symbol: 'X', mutable: false },
+    creator: 'DEV',
+    totalHolders: 2400,
+    rugged: false,
+    knownAccounts: { POOLOWNER: { name: 'Pump Fun AMM', type: 'AMM' }, LOCKER: { name: 'Streamflow', type: 'LOCKER' } },
+    markets: [{ pubkey: 'MKT', liquidityAAccount: 'VAULT_A', liquidityBAccount: 'VAULT_B', lp: { lpLockedPct: 100, lpLockedUSD: 50000 } }],
+    topHolders: [
+      { address: 'VAULT_A', owner: 'SOMEPDA', pct: 22, insider: false }, // pool vault by address
+      { address: 't1', owner: 'POOLOWNER', pct: 8, insider: false }, // pool by known owner
+      { address: 't2', owner: 'LOCKER', pct: 5, insider: false },
+      { address: 't3', owner: 'alice', pct: 3, insider: true },
+      { address: 't4', owner: 'alice', pct: 1, insider: true }, // same person, 2 accounts → 4%
+      { address: 't5', owner: 'DEV', pct: 2, insider: false },
+      { address: 't6', owner: 'bob', pct: 1.5, insider: false },
+      { address: 't7', owner: 'weird', pct: 250 }, // implausible → skipped, never guessed
+    ],
+    risks: [{ name: 'Low Liquidity', level: 'warn' }],
+  });
+  assert.equal(r.status, 'ok');
+  near(r.holders!.largestNonLpWalletPct, 4); // alice — NOT the 22% pool
+  near(r.holders!.top10Pct, 7.5);
+  near(r.holders!.bundledLaunchPct, 4); // insider-flagged supply
+  near(r.holders!.devHoldsPct, 2);
+  assert.equal(r.holders!.holderCount, 2400);
+  assert.equal(r.mintAuthorityActive, false);
+  assert.equal(r.freezeAuthorityActive, false);
+  assert.equal(r.metadataMutable, false);
+  assert.equal(r.lpStatus, 'locked');
+  assert.equal(r.rugged, false);
+  assert.deepEqual(r.externalFlags, ['RugCheck: Low Liquidity']);
+});
+
+test('V2 RugCheck fallback: unknown shapes become unknown, never a fabricated verdict', () => {
+  const empty = parseRugcheckReport({});
+  assert.equal(empty.holders, null);
+  assert.equal(empty.mintAuthorityActive, null, 'no token object → authorities NOT attested');
+  assert.equal(empty.lpStatus, null);
+  assert.equal(empty.rugged, null);
+  const live = parseRugcheckReport({ token: { mintAuthority: 'SomeAuthority111', freezeAuthority: null } });
+  assert.equal(live.mintAuthorityActive, true);
+  // A rugged verdict is a hard stop everywhere.
+  const t = structuredClone(FIXTURE_NEUTRAL);
+  t.audit = { rugged: true, flags: [] };
+  const risk = scoreToken(t);
+  assert.ok(risk.riskScore >= 60);
+  assert.ok(computeKingGrade(t, risk, scoreQuality(t)).grade! <= 10);
+  assert.equal(assessRugPotential(t, risk).verdict, 'HIGH');
+});
+
+test('V2 speed: the mint account carries the supply (no separate supply call) and all trap flags', () => {
+  const m = parseMintAccount({
+    owner: 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+    data: { parsed: { type: 'mint', info: { mintAuthority: null, freezeAuthority: 'F', decimals: 6, supply: '1000000000000000',
+      extensions: [{ extension: 'transferFeeConfig', state: { olderTransferFee: { transferFeeBasisPoints: 0 }, newerTransferFee: { transferFeeBasisPoints: 500 } } }] } } },
+  })!;
+  assert.equal(m.supply, 1_000_000_000);
+  assert.equal(m.decimals, 6);
+  assert.equal(m.mint.freezeAuthorityActive, true);
+  assert.equal(m.mint.mintAuthorityActive, false);
+  assert.equal(m.mint.transferFeeBps, 500);
+  assert.equal(parseMintAccount(null), null);
+  assert.equal(parseMintAccount({ data: { parsed: { type: 'account', info: {} } } }), null, 'a token ACCOUNT is not a mint');
+  // The newest-coins list carries full coin objects → parsed with the same parser.
+  const c = parseCoin({ symbol: 'A', created_timestamp: Date.now() - 60_000, complete: false, real_sol_reserves: 17e9, usd_market_cap: 9000, creator: 'C', bonding_curve: 'B', telegram: 'https://t.me/a' });
+  assert.equal(c.bondingCurveComplete, false);
+  near(c.curveProgressPct!, 20);
+  assert.equal(c.socials!.telegram, 'https://t.me/a');
+});
+
+test('V2 health: the public RPC refusing holder lookups is shown, and what covers for it', () => {
+  const h = (key: string, recent: boolean[], blocked = false): SourceHealth => ({ key, ok: 0, fail: 0, lastOkAt: null, lastFailAt: null, lastStatus: null, recent, blocked });
+  const covered = summarizeHealth([
+    h('api.mainnet-beta.solana.com', [true, true, false, true]),
+    h('api.mainnet-beta.solana.com getTokenLargestAccounts', [false, false, false]),
+    h('api.rugcheck.xyz', [true, true, true]),
+    h('api.dexscreener.com', [true, true]),
+  ]);
+  const holders = covered.find((r) => r.id === 'holders')!;
+  assert.equal(holders.status, 'ok');
+  assert.match(holders.note!, /RugCheck is covering/);
+  assert.equal(covered.find((r) => r.id === 'prices')!.status, 'ok');
+  assert.equal(covered.find((r) => r.id === 'history')!.status, 'idle');
+
+  // A long history of successes must not hide a source that JUST started failing,
+  // and an endpoint being skipped after repeated refusals counts as down.
+  const justBroke = summarizeHealth([
+    h('api.mainnet-beta.solana.com getTokenLargestAccounts', [...Array(17).fill(true), false, false, false], true),
+    h('rpc.magicblock.app getTokenLargestAccounts', [false]),
+    h('api.rugcheck.xyz', [true, true]),
+  ]).find((r) => r.id === 'holders')!;
+  assert.match(justBroke.note!, /RugCheck is covering/);
+  // …while a second RPC that answers keeps holders green with no warning.
+  const backupRpc = summarizeHealth([
+    h('api.mainnet-beta.solana.com getTokenLargestAccounts', [false, false, false], true),
+    h('rpc.magicblock.app getTokenLargestAccounts', [true, true, true]),
+  ]).find((r) => r.id === 'holders')!;
+  assert.equal(backupRpc.status, 'ok');
+  assert.equal(backupRpc.note, null);
+
+  const broken = summarizeHealth([
+    h('api.mainnet-beta.solana.com getTokenLargestAccounts', [false, false, false]),
+    h('api.rugcheck.xyz', [false, false, false]),
+  ]).find((r) => r.id === 'holders')!;
+  assert.equal(broken.status, 'down');
+  assert.match(broken.note!, /Helius/);
+});
+
+test('V2 Top Picks: one merged list, best first, only coins that currently pass', () => {
+  const radar = (address: string, verdict: RadarRow['verdict'], score: number, passed = true, kind: 'deep' | 'quick' = 'deep'): RadarRow => ({
+    address, symbol: address, name: null, kind, stage: 'ROOTED', verdict, score, rank: 50, passed, ageDays: 5,
+    marketCapUsd: 1e6, liquidityUsd: 1e5, headline: 'h', checkedAt: 0, deepAt: 0,
+  });
+  const feedRow = (address: string, verdict: 'STRONG' | 'PROMISING', score: number, over: Partial<FeedRow> = {}): FeedRow => ({
+    address, symbol: address, name: null, ageMinutes: 5, marketCapEur: 9000, priceUsd: null, riskScore: 10, signal: 'NEUTRAL',
+    topReason: null, qualityScore: null, grade: 38, gem: false, rugVerdict: 'UNVERIFIED', liveState: 'UNKNOWN', graduated: false,
+    narratives: [], twitter: null, tracked: false, early: { score, verdict, headline: 'x' }, insufficientData: false, unverified: true, scannedAt: 0, ...over,
+  });
+  const gem = (address: string, status: 'ACTIVE' | 'DROPPED'): TrackedGem => ({
+    address, symbol: address, source: 'auto', spottedAt: 0, spottedMcap: 50_000, status, dropReason: null, stage: 'SPROUT',
+    verdict: 'STRONG', score: 80, lastMcap: 150_000, peakMcap: 150_000, lastCheckedAt: 0, nextCheckAt: 0, fired: [],
+    events: [{ at: 0, text: '2× since spotted', tone: 'good' }], snapshots: [],
+  });
+  const picks = buildPicks(
+    [gem('HELD', 'ACTIVE'), gem('GONE', 'DROPPED')],
+    [radar('CAND', 'CANDIDATE', 90), radar('WATCHY', 'WATCH', 60), radar('FAILED', 'NOT_A_HOLD', 30, false), radar('QUEUED', null, 0, true, 'quick'), radar('HELD', 'WATCH', 55)],
+    [feedRow('SEEDY', 'STRONG', 70), feedRow('MEH', 'PROMISING', 50), feedRow('DUMPER', 'STRONG', 75, { liveState: 'DUMPING' }), feedRow('CAND', 'STRONG', 99)],
+  );
+  assert.deepEqual(picks.map((p) => p.address), ['CAND', 'HELD', 'WATCHY', 'SEEDY']);
+  const held = picks.find((p) => p.address === 'HELD')!;
+  assert.equal(held.source, 'tracked', 'the tracked entry (with its multiple) wins over the radar row');
+  near(held.multiple, 3);
+  assert.equal(picks.find((p) => p.address === 'CAND')!.source, 'radar', 'deep-checked evidence beats a launch score for the same coin');
+  assert.equal(picks.find((p) => p.address === 'SEEDY')!.deepChecked, false);
+});
+
+test('V2 sizing: a ceiling from YOUR bankroll, smaller for newer coins, capped by the pool, $0 for rejects', () => {
+  assert.equal(planPosition(null, null, 'young', 5000).maxUsd, null); // no bankroll → no number
+  assert.equal(planPosition(1000, 2, 'young', null).maxUsd, 20); // 2% of $1,000
+  assert.equal(planPosition(1000, 2, 'launch', null).maxUsd, 10); // half size at launch
+  assert.equal(planPosition(1000, 2, 'rooted', null).maxUsd, 30); // 1.5× once it passed the long-hold screen
+  assert.equal(planPosition(1000, 2, 'reject', 99999).maxUsd, 0);
+  const capped = planPosition(100_000, 2, 'young', 180);
+  assert.equal(capped.maxUsd, 180); // pool can't absorb more
+  assert.ok(capped.notes.some((n) => /Capped by the pool/.test(n)));
+  assert.equal(planPosition(1000, 50, 'young', null).maxUsd, 50, 'risk per pick is clamped to 5%');
+  assert.equal(planPosition(1000, 2, 'young', null).notes.some((n) => /50 such losses in a row/.test(n)), true);
+  assert.ok(planPosition(10_000, 2, 'young', null).maxUsd! <= 200, 'a ceiling never rounds up');
 });
 
 console.log(`\n${passed} tests passed.`);

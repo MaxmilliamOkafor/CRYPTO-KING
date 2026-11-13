@@ -58,11 +58,16 @@ export async function fetchJson(url: string, init?: RequestInit): Promise<unknow
     try {
       const res = await fetch(url, { ...init, signal: ctrl.signal });
       if (!res.ok) {
-        console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
+        // 404 is a real answer for lookups ("not a pump.fun coin"), not an outage.
+        record(host, res.status === 404, res.status);
+        if (res.status !== 404) console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
         return null;
       }
-      return (await res.json()) as unknown;
+      const body = (await res.json()) as unknown;
+      record(host, true, res.status);
+      return body;
     } catch (err) {
+      record(host, false, 0);
       console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
       return null;
     } finally {
@@ -84,17 +89,91 @@ export async function rpcCall(rpcUrl: string | string[], method: string, params:
   const urls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
   const body = JSON.stringify({ jsonrpc: '2.0', id: 'crypto-king', method, params });
   for (const url of urls) {
+    const key = `${hostOf(url)} ${method}`;
+    // An endpoint that keeps refusing ONE method (the public RPC refuses
+    // getTokenLargestAccounts outright) is skipped for that method for a
+    // while — retrying it on every coin only burned the rate budget that the
+    // methods which DO work need.
+    const blockedUntil = methodBlock.get(key);
+    if (blockedUntil !== undefined && Date.now() < blockedUntil) continue;
+
     const json = await fetchJson(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body,
     });
-    if (json && typeof json === 'object' && 'result' in (json as Record<string, unknown>)) {
+    const ok = Boolean(json && typeof json === 'object' && 'result' in (json as Record<string, unknown>));
+    recordKey(key, ok);
+    if (ok) {
+      methodFails.delete(key);
+      methodBlock.delete(key);
       return (json as Record<string, unknown>).result ?? null;
     }
+    const fails = (methodFails.get(key) ?? 0) + 1;
+    methodFails.set(key, fails);
+    if (fails >= METHOD_FAILS_BEFORE_BLOCK) methodBlock.set(key, Date.now() + METHOD_BLOCK_MS);
     // else: this endpoint failed/rate-limited → try the next in the pool
   }
   return null;
+}
+
+const methodFails = new Map<string, number>();
+const methodBlock = new Map<string, number>();
+const METHOD_FAILS_BEFORE_BLOCK = 3;
+const METHOD_BLOCK_MS = 5 * 60_000;
+
+/* ── Source health: is each data source actually answering? ──────────────
+ * Every scan depends on free third-party APIs, and when one silently fails the
+ * symptom on screen is vague ("holders not verified", "PARTIAL"). These
+ * counters make it visible: the panel shows a dot per source, so "the RPC is
+ * refusing holder lookups" is a fact on screen instead of a mystery.
+ */
+export interface SourceHealth {
+  key: string;
+  ok: number;
+  fail: number;
+  lastOkAt: number | null;
+  lastFailAt: number | null;
+  lastStatus: number | null;
+  /** Outcomes of the most recent calls, newest last (true = ok). */
+  recent: boolean[];
+  /** RPC method keys only: true while the endpoint is being skipped for this
+   *  method after repeated refusals. */
+  blocked: boolean;
+}
+
+const health = new Map<string, SourceHealth>();
+
+function recordKey(key: string, ok: boolean, status: number | null = null): void {
+  let h = health.get(key);
+  if (!h) {
+    h = { key, ok: 0, fail: 0, lastOkAt: null, lastFailAt: null, lastStatus: null, recent: [], blocked: false };
+    health.set(key, h);
+  }
+  if (ok) {
+    h.ok++;
+    h.lastOkAt = Date.now();
+  } else {
+    h.fail++;
+    h.lastFailAt = Date.now();
+  }
+  if (status !== null) h.lastStatus = status;
+  h.recent.push(ok);
+  if (h.recent.length > 20) h.recent.shift();
+}
+
+function record(host: string, ok: boolean, status: number): void {
+  recordKey(host, ok, status);
+}
+
+/** Snapshot of every source's counters (hosts, plus "host method" for RPC). */
+export function getSourceHealth(): SourceHealth[] {
+  const now = Date.now();
+  return [...health.values()].map((h) => ({
+    ...h,
+    recent: [...h.recent],
+    blocked: (methodBlock.get(h.key) ?? 0) > now,
+  }));
 }
 
 /**

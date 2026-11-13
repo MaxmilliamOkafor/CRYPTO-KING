@@ -175,6 +175,20 @@ export const GECKO = {
   ],
 };
 
+/* ────────────── Risk plan (position sizing) ────────────────────────────────
+ * The user enters a bankroll in the popup; every coin card then shows the MOST
+ * that coin can justify (lib/sizing.ts). A ceiling for risk control, never a
+ * suggestion to buy.
+ */
+export const SIZING = {
+  /** % of bankroll risked per pick when the user hasn't chosen one. */
+  defaultRiskPct: 2,
+  minRiskPct: 0.25,
+  maxRiskPct: 5, // the tool refuses to plan more than this per coin
+  /** Less evidence → smaller size. */
+  stageFactor: { launch: 0.5, young: 1, rooted: 1.5, reject: 0 },
+} as const;
+
 /* ────────────── 🌱 Early gems: spot at launch, follow while you hold ───────
  * The entry point for a long hold is EARLY — low market cap, first hours. At
  * that stage there is little evidence, and ~80% of launches die within 48h;
@@ -204,6 +218,7 @@ export const EARLY_GEM = {
   /** Coins re-checked per tick (keeps the shared RPC budget sane). */
   checksPerTick: 6,
   /** Disqualifiers at launch. */
+  maxInsiderPct: 20, // supply held by wallets RugCheck's funding graph flags as insiders
   maxDevPct: 5,
   maxLargestWalletPct: 8,
   maxTop10Pct: 30,
@@ -339,7 +354,11 @@ export const SOLANA = {
    * to speed up without ever creating an account. A Helius key, if set, takes
    * priority over this whole list.
    */
-  fallbackRpcUrls: [] as string[],
+  fallbackRpcUrls: [
+    // Keyless endpoint that still serves getTokenLargestAccounts (the public
+    // one answers 429 for it). Tried only after the primary fails a call.
+    'https://rpc.magicblock.app/mainnet',
+  ] as string[],
   /** DAS (getAsset) is only available on Helius-style RPCs. Auto-detected from the URL. */
   get supportsDas(): boolean {
     return this.rpcUrl.includes('helius');
@@ -387,8 +406,10 @@ export const RUGCHECK = {
   /** ON: the keyless summary is the only source of LP lock status off gmgn.ai
    *  (see lib/lpStatus.ts). Full scans only — never the lite feed sweep. */
   enabled: true,
-  /** Public, keyless summary endpoint (lighter than the full report). */
-  endpoint: 'https://api.rugcheck.xyz/v1/tokens/{address}/report/summary',
+  /** Public, keyless FULL report: top holders (+insider flags), known AMM
+   *  accounts, LP lock, authorities, metadata mutability, "rugged" verdict —
+   *  the second source for everything the free RPC refuses to serve. */
+  endpoint: 'https://api.rugcheck.xyz/v1/tokens/{address}/report',
 };
 
 /* ─────────────────────────── Networking behavior ─────────────────────────── */

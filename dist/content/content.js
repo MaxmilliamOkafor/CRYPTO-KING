@@ -80,6 +80,15 @@ var LIVE_FEED = {
    */
   safeMinGrade: 40
 };
+var SIZING = {
+  /** % of bankroll risked per pick when the user hasn't chosen one. */
+  defaultRiskPct: 2,
+  minRiskPct: 0.25,
+  maxRiskPct: 5,
+  // the tool refuses to plan more than this per coin
+  /** Less evidence → smaller size. */
+  stageFactor: { launch: 0.5, young: 1, rooted: 1.5, reject: 0 }
+};
 var EARLY_GEM = {
   enabled: true,
   /** Only coins at or below this market cap are spotted — "early" means early. */
@@ -100,6 +109,8 @@ var EARLY_GEM = {
   /** Coins re-checked per tick (keeps the shared RPC budget sane). */
   checksPerTick: 6,
   /** Disqualifiers at launch. */
+  maxInsiderPct: 20,
+  // supply held by wallets RugCheck's funding graph flags as insiders
   maxDevPct: 5,
   maxLargestWalletPct: 8,
   maxTop10Pct: 30,
@@ -395,7 +406,7 @@ function computeKingGrade(a, risk, quality) {
     if (limit < ceiling) ceiling = limit;
     if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
-  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held" || a.audit?.rugged === true;
   const live = assessLiveState(a.market);
   if (live.state === "DEAD") applyCap(KING_GRADE.caps.confirmedTrap, "already rugged/dead \u2014 market collapsed.");
   else if (live.state === "DUMPING") applyCap(KING_GRADE.caps.highRisk, "dumping right now.");
@@ -459,6 +470,9 @@ function assessEarlyGem(a, risk, x, t = EARLY_GEM) {
     hard("Token-2022 trap extension present.");
   }
   if (a.market?.sellSimulation?.ok === false) hard("Simulated sell fails \u2014 honeypot.");
+  if (a.audit?.rugged === true) hard("Marked as RUGGED by RugCheck.");
+  const bundled = a.holders?.bundledLaunchPct ?? null;
+  if (bundled !== null && bundled > t.maxInsiderPct) hard(`Insider-linked wallets hold ${bundled.toFixed(0)}% \u2014 a bundled launch.`);
   const lp = a.market?.lpStatus ?? "unknown";
   if (!onCurve && (lp === "unlocked" || lp === "deployer_held")) hard("Liquidity can be pulled (LP not burned/locked).");
   if (L?.bannedOnPlatform === true) hard("Banned on its own launchpad.");
@@ -674,6 +688,7 @@ function assessRugPotential(a, risk) {
     if (mint.mintAuthorityActive === null) unverified.push("mint authority");
     if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
   }
+  if (a.audit?.rugged === true) hard.push("Marked as RUGGED by RugCheck (independent auditor).");
   const sim = a.market?.sellSimulation;
   if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
   const lp = a.market?.lpStatus ?? "unknown";
@@ -718,6 +733,46 @@ var LONG_HOLD_TIER_META = {
   NOT_A_HOLD: { label: "\u26D4 NOT A HOLD", color: "#e5484d", textColor: "#ffffff" },
   NO_DATA: { label: "NO DATA", color: "#3a3f4c", textColor: "#e6e8ee" }
 };
+
+// lib/sizing.ts
+function planPosition(bankrollUsd, riskPct, stage, poolCapUsd, t = SIZING) {
+  if (stage === "reject") {
+    return { maxUsd: 0, headline: "Max size: $0 \u2014 this coin fails its checks.", notes: [] };
+  }
+  if (bankrollUsd === null || !(bankrollUsd > 0)) {
+    return {
+      maxUsd: null,
+      headline: "Set your bankroll (toolbar icon \u2192 Risk plan) to get a max size for every coin.",
+      notes: []
+    };
+  }
+  const pct = Math.min(t.maxRiskPct, Math.max(t.minRiskPct, riskPct ?? t.defaultRiskPct));
+  const factor = t.stageFactor[stage];
+  const byBankroll = bankrollUsd * (pct / 100) * factor;
+  const capped = poolCapUsd !== null && poolCapUsd < byBankroll;
+  const max = roundDown(capped ? poolCapUsd : byBankroll);
+  const notes = [];
+  notes.push(
+    stage === "launch" ? `Half size: a launch this new has the least evidence (${pct}% \xD7 ${factor} of your $${fmt(bankrollUsd)}).` : stage === "rooted" ? `Passed the long-hold screen, so up to ${factor}\xD7 your normal ${pct}% per pick.` : `${pct}% of your $${fmt(bankrollUsd)} bankroll per pick.`
+  );
+  if (capped) notes.push(`Capped by the pool: selling more than ~$${fmt(poolCapUsd)} would move the price against you.`);
+  if (poolCapUsd === null && stage !== "launch") notes.push("Pool depth unknown \u2014 the real exit limit could be lower.");
+  if (max > 0) {
+    const share = max / bankrollUsd * 100;
+    notes.push(`If it goes to zero you lose $${fmt(max)} \u2014 ${share < 0.1 ? "<0.1" : share.toFixed(1)}% of your bankroll. You could take ${Math.floor(bankrollUsd / max)} such losses in a row.`);
+  }
+  return { maxUsd: max, headline: `Max size: $${fmt(max)}`, notes };
+}
+function roundDown(v) {
+  if (v < 1) return 0;
+  if (v < 20) return Math.floor(v);
+  if (v < 200) return Math.floor(v / 5) * 5;
+  if (v < 2e3) return Math.floor(v / 25) * 25;
+  return Math.floor(v / 100) * 100;
+}
+function fmt(v) {
+  return v >= 1e3 ? Math.round(v).toLocaleString("en-US") : String(Math.round(v * 100) / 100);
+}
 
 // lib/linkTargets.ts
 var BASE58 = "[1-9A-HJ-NP-Za-km-z]{32,44}";
@@ -807,11 +862,15 @@ async function fetchJson(url, init) {
     try {
       const res = await fetch(url, { ...init, signal: ctrl.signal });
       if (!res.ok) {
-        console.warn(`[CRYPTO-KING] ${host2} responded ${res.status} for ${url}`);
+        record(host2, res.status === 404, res.status);
+        if (res.status !== 404) console.warn(`[CRYPTO-KING] ${host2} responded ${res.status} for ${url}`);
         return null;
       }
-      return await res.json();
+      const body = await res.json();
+      record(host2, true, res.status);
+      return body;
     } catch (err) {
+      record(host2, false, 0);
       console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
       return null;
     } finally {
@@ -820,6 +879,28 @@ async function fetchJson(url, init) {
   });
   st.chain = run.catch(() => void 0);
   return run;
+}
+var METHOD_BLOCK_MS = 5 * 6e4;
+var health = /* @__PURE__ */ new Map();
+function recordKey(key, ok, status = null) {
+  let h = health.get(key);
+  if (!h) {
+    h = { key, ok: 0, fail: 0, lastOkAt: null, lastFailAt: null, lastStatus: null, recent: [], blocked: false };
+    health.set(key, h);
+  }
+  if (ok) {
+    h.ok++;
+    h.lastOkAt = Date.now();
+  } else {
+    h.fail++;
+    h.lastFailAt = Date.now();
+  }
+  if (status !== null) h.lastStatus = status;
+  h.recent.push(ok);
+  if (h.recent.length > 20) h.recent.shift();
+}
+function record(host2, ok, status) {
+  recordKey(host2, ok, status);
 }
 
 // lib/twitterClient.ts
@@ -1314,6 +1395,25 @@ var STYLES = `
   .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .tabs { display: flex; gap: 2px; margin: -4px -4px 10px; padding: 3px; background: #10131a; border: 1px solid #262b36; border-radius: 10px; position: sticky; top: -12px; z-index: 5; }
+  .tab { flex: 1 1 0; padding: 6px 2px; border-radius: 7px; font: 700 11px/1.2 system-ui, sans-serif; color: #9aa1af; background: transparent; border: 0; cursor: pointer; white-space: nowrap; }
+  .tab:hover { color: #e6e8ee; background: #1a1e27; }
+  .tab.on { color: #1b1b18; background: #d4a017; }
+  .tab-n { display: inline-block; min-width: 0; margin-left: 4px; padding: 0 5px; border-radius: 8px; background: rgba(0,0,0,.28); font-size: 10px; }
+  .tab-n:empty { display: none; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+  .pane > .scan-section:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
+  .picks-status, .radar-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
+  .health { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 9px; margin-top: 12px; padding-top: 8px; border-top: 1px solid #2c303a; font-size: 10px; color: #8a91a0; }
+  .h-title { font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #6f7686; }
+  .h-item { display: inline-flex; align-items: center; gap: 4px; cursor: help; }
+  .h-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .health-note { display: none; margin-top: 5px; padding: 5px 8px; border-radius: 6px; background: #2a2110; border: 1px solid #4a3a16; color: #f0d48a; font-size: 10.5px; line-height: 1.4; }
+  .size-line { margin-top: 6px; padding: 6px 8px; border-radius: 7px; background: #141a24; border: 1px solid #263246; font-size: 11px; }
+  .size-line b { color: #9fd0ff; }
+  .size-line ul { margin: 3px 0 0; padding: 0; }
+  .size-line li { list-style: none; color: #9aa1af; font-size: 10.5px; padding: 1px 0; }
   .pf-line { font-size: 11px; color: #cfd3dc; margin: 2px 0 6px; line-height: 1.6; }
   .pf-chip { display: inline-block; padding: 0 6px; border-radius: 5px; margin-right: 3px; font-size: 10.5px; }
   .pf-chip.up { background: #1f3d2a; color: #9be3b0; } .pf-chip.down { background: #3d1f1f; color: #ffb3b3; }
@@ -1380,7 +1480,7 @@ function wrapEl() {
 function renderCollapsed() {
   const w = wrapEl();
   w.innerHTML = `
-    <div class="fab" title="Open CRYPTO-KING risk scanner">\u{1F451}
+    <div class="fab" title="Open CRYPTO-KING">\u{1F451}
       <span class="fab-badge" hidden>0</span>
     </div>`;
   refreshGemAlerts();
@@ -1401,7 +1501,7 @@ function cardBody() {
     <div class="card">
       <div class="titlebar">
         <span class="crown">\u{1F451}</span>
-        <span class="title">CRYPTO-KING <small>\xB7 risk scanner</small></span>
+        <span class="title">CRYPTO-KING <small>\xB7 gem finder &amp; rug scanner</small></span>
         <button class="icon-btn collapse" title="Collapse">\u2013</button>
       </div>
       <div class="body"></div>
@@ -1417,7 +1517,22 @@ function renderHome() {
   const body = cardBody();
   const onThisPage = addressFromUrl() ?? addressFromDom();
   body.innerHTML = `
-    <div class="live-section">
+    <div class="tabs">
+      <button class="tab" data-tab="picks">\u{1F3C6} Picks<span class="tab-n" data-n="picks"></span></button>
+      <button class="tab" data-tab="live">\u{1F4E1} Launches</button>
+      <button class="tab" data-tab="radar">\u{1F3D4} Radar</button>
+      <button class="tab" data-tab="holds">\u{1F4BC} Holds<span class="tab-n" data-n="holds"></span></button>
+      <button class="tab" data-tab="scan">\u{1F50D} Scan</button>
+    </div>
+
+    <div class="pane" data-pane="picks">
+      <div class="scan-head"><span class="live-dot"></span><span class="t">Top picks right now \u2014 best first</span></div>
+      <div class="grade-legend">The short list: launches, young coins (1\u201321 days) and coins you're tracking, <b>merged and ranked</b>. Only coins that currently <b>pass their checks</b> appear. \u2713 = full background check done \xB7 \u{1F331} = launch score only (click to run the full check). Worth researching \u2014 never a buy signal.</div>
+      <div class="picks-status">Scanning\u2026</div>
+      <div class="picks-box"></div>
+    </div>
+
+    <div class="pane live-section" data-pane="live">
       <div class="scan-head">
         <span class="live-dot"></span>
         <span class="t">Live Solana launches \u2014 auto-scanning</span>
@@ -1434,13 +1549,20 @@ function renderHome() {
       <div class="livelist"></div>
     </div>
 
+    <div class="pane" data-pane="holds">
     <div class="scan-section gems-section">
       <div class="scan-head"><span class="t">\u{1F331} Gem tracker \u2014 spotted at launch, followed while you hold</span></div>
       <div class="grade-legend">New launches with the strongest early evidence (fair launch, socials, fast curve, many buyers) are spotted <b>while the cap is still low</b>, then re-checked for you: alerts on milestones and the moment the thesis breaks. Most still fail \u2014 use small, equal sizes.</div>
       <div class="gem-portfolio"></div>
       <div class="gems-box"><div class="scan-empty">Watching the live feed for strong launches\u2026</div></div>
     </div>
+    <div class="scan-section">
+      <div class="scan-head"><span class="t">\u{1F441} Watching (rug alerts)</span></div>
+      <div class="watchlist-box"><div class="scan-empty">Nothing watched \u2014 open a coin and hit "\u{1F441} Watch".</div></div>
+    </div>
+    </div>
 
+    <div class="pane" data-pane="radar">
     <div class="scan-section radar-section">
       <div class="scan-head">
         <span class="t">\u{1F3D4} Young-gem radar \u2014 1\u201321 days old, under $5M, best first</span>
@@ -1450,7 +1572,9 @@ function renderHome() {
       <div class="radar-status">Loading radar\u2026</div>
       <div class="radar-box"></div>
     </div>
+    </div>
 
+    <div class="pane" data-pane="scan">
     <div class="scan-section">
       <div class="scan-head"><span class="t">Scan a specific coin (Solana only)</span></div>
       <div class="scan-row">
@@ -1461,11 +1585,6 @@ function renderHome() {
     </div>
 
     <div class="scan-section">
-      <div class="scan-head"><span class="t">\u{1F441} Watching (rug alerts)</span></div>
-      <div class="watchlist-box"><div class="scan-empty">Nothing watched \u2014 open a coin and hit "\u{1F441} Watch".</div></div>
-    </div>
-
-    <div class="scan-section">
       <div class="scan-head">
         <span class="t">Coins linked on this page</span>
         <button class="rescan">\u21BB Rescan</button>
@@ -1473,7 +1592,18 @@ function renderHome() {
       <div class="scan-status"></div>
       <div class="scanlist"></div>
     </div>
+    </div>
+
+    <div class="health" title="Is each data source answering? Green = yes."></div>
+    <div class="health-note"></div>
     <div class="disclaimer">${esc(DISCLAIMER)}</div>`;
+  const showTab = (name) => {
+    homeTab = name;
+    body.querySelectorAll(".tab").forEach((t) => t.classList.toggle("on", t.dataset.tab === name));
+    body.querySelectorAll(".pane").forEach((p) => p.classList.toggle("on", p.dataset.pane === name));
+  };
+  body.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => showTab(t.dataset.tab)));
+  showTab(homeTab);
   const input = body.querySelector(".scan-input");
   const go = () => {
     const addr = extractAddress(input?.value ?? "");
@@ -1547,6 +1677,8 @@ function renderHome() {
   body.querySelector(".radar-run")?.addEventListener("click", () => refreshRadarBox(true));
   refreshRadarBox(false);
   refreshGemsBox();
+  refreshPicksBox();
+  refreshHealth();
   startRadarPoll();
   updateScanList();
   void scanPage();
@@ -1770,7 +1902,7 @@ function refreshGemAlerts() {
   fab.classList.toggle("gem-alert", unseen > 0);
   badge.hidden = unseen === 0;
   badge.textContent = String(unseen);
-  fab.title = unseen > 0 ? `CRYPTO-KING: ${unseen} \u{1F48E} candidate${unseen > 1 ? "s" : ""} \u2014 click to review` : "Open CRYPTO-KING risk scanner";
+  fab.title = unseen > 0 ? `CRYPTO-KING: ${unseen} \u{1F48E} candidate${unseen > 1 ? "s" : ""} \u2014 click to review` : "Open CRYPTO-KING";
 }
 function setLiveStatus(text) {
   const el = shadow?.querySelector(".live-status");
@@ -1844,10 +1976,75 @@ function startRadarPoll() {
   if (radarTimer) return;
   radarTimer = setInterval(() => {
     if (view === "home" && !collapsed) {
+      refreshPicksBox();
       refreshRadarBox(false);
       refreshGemsBox();
+      refreshHealth();
     }
   }, 15e3);
+}
+var homeTab = "picks";
+function setTabCount(name, n) {
+  const el = shadow?.querySelector(`.tab-n[data-n="${name}"]`);
+  if (el) el.textContent = n > 0 ? String(n) : "";
+}
+function refreshPicksBox() {
+  const box = shadow?.querySelector(".picks-box");
+  const status = shadow?.querySelector(".picks-status");
+  if (!box || !status) return;
+  chrome.runtime.sendMessage({ type: "GET_PICKS" }, (res) => {
+    if (chrome.runtime.lastError || !box.isConnected) return;
+    if (!res || !res.ok) {
+      status.textContent = res && !res.ok ? res.error : "Top Picks unavailable.";
+      return;
+    }
+    setTabCount("picks", res.picks.length);
+    const deep = res.picks.filter((p) => p.deepChecked).length;
+    status.textContent = `\u{1F440} ${res.watching.toLocaleString("en-US")} young coins + ${res.scannedLaunches} launches watched \xB7 \u{1F3C6} ${res.picks.length} pass right now (${deep} fully checked)`;
+    if (res.picks.length === 0) {
+      box.innerHTML = `<div class="scan-empty">Nothing passes right now. That's normal \u2014 about 95% of coins don't. Scanning continues every minute, even with this panel closed; picks appear here (and as desktop alerts) the moment one passes.</div>`;
+      return;
+    }
+    box.innerHTML = res.picks.map((p) => {
+      const gc = gradeColors(p.score);
+      const v = p.verdict;
+      const m = v in LONG_HOLD_TIER_META ? LONG_HOLD_TIER_META[v] : EARLY_VERDICT_META[v];
+      const sm = GEM_STAGE_META[p.stage];
+      const age = p.ageHours === null ? null : p.ageHours < 1 ? `${Math.max(1, Math.round(p.ageHours * 60))}m old` : p.ageHours < 48 ? `${Math.round(p.ageHours)}h old` : `${Math.floor(p.ageHours / 24)}d old`;
+      const meta = [
+        p.marketCapUsd !== null ? eurShort(p.marketCapUsd) : null,
+        age,
+        p.multiple !== null ? `${p.multiple >= 10 ? p.multiple.toFixed(0) : p.multiple.toFixed(1)}\xD7 since spotted` : null
+      ].filter(Boolean).join(" \xB7 ");
+      return `
+          <div class="scan-item${p.tier === 1 ? " gem" : ""}" data-addr="${esc(p.address)}">
+            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${p.score === null ? "\u2014" : `${p.score}%`}</span>
+            <span class="si-main">
+              <span class="si-sym">${p.source === "tracked" ? '<span title="You are tracking this coin">\u{1F4BC}</span> ' : ""}${esc(p.symbol ?? short(p.address))}
+                <span class="lh-tier" style="background:${sm.color};color:${sm.textColor}">${esc(sm.label)}</span>
+                ${m ? `<span class="lh-tier" style="background:${m.color};color:${m.textColor}">${esc(m.label.replace(/^[^A-Za-z]+/, ""))}</span>` : ""}
+                <span class="lh-tier" style="background:#232833;color:${p.deepChecked ? "#8fe0a6" : "#c9b56a"}" title="${p.deepChecked ? "Full background check done" : "Launch score only \u2014 click to run the full check"}">${p.deepChecked ? "\u2713 checked" : "\u{1F331} launch score"}</span></span>
+              <span class="si-reason">${esc(meta)}${meta && p.headline ? " \xB7 " : ""}${esc(p.headline ?? "")}</span>
+            </span>
+            <button class="copy" data-copy="${esc(p.address)}" title="Copy token address">\u29C9</button>
+          </div>`;
+    }).join("");
+    wireRowHandlers(box);
+  });
+}
+function refreshHealth() {
+  const el = shadow?.querySelector(".health");
+  const noteEl = shadow?.querySelector(".health-note");
+  if (!el || !noteEl) return;
+  chrome.runtime.sendMessage({ type: "GET_HEALTH" }, (res) => {
+    if (chrome.runtime.lastError || !el.isConnected || !res?.ok) return;
+    const color = { ok: "#46a758", degraded: "#ffb224", down: "#e5484d", idle: "#4a5060" };
+    const word = { ok: "working", degraded: "unreliable", down: "not answering", idle: "not used yet" };
+    el.innerHTML = '<span class="h-title">Data</span>' + res.sources.map((r) => `<span class="h-item" title="${esc(r.label)}: ${word[r.status]}${r.note ? ` \u2014 ${esc(r.note)}` : ""}"><span class="h-dot" style="background:${color[r.status]}"></span>${esc(r.label)}</span>`).join("");
+    const notes = res.sources.filter((r) => r.note && r.status !== "idle").map((r) => r.note);
+    noteEl.textContent = notes[0] ?? "";
+    noteEl.style.display = notes.length ? "block" : "none";
+  });
 }
 var radarShowRejected = false;
 function refreshRadarBox(force) {
@@ -1918,6 +2115,7 @@ function refreshGemsBox() {
       const m = p.portfolioMultiple ?? 0;
       return `<span class="pf-chip ${m >= 1 ? "up" : "down"}" title="${p.measured} picks measured \xB7 ${p.alive} still alive \xB7 best ${p.bestSymbol ?? "\u2014"} ${p.bestMultiple?.toFixed(1) ?? "\u2014"}\xD7">${p.horizonDays}d: <b>${m.toFixed(2)}\xD7</b></span>`;
     }).join(" ")}</div>` : "";
+    setTabCount("holds", res.gems.filter((g) => g.status === "ACTIVE").length);
     if (res.gems.length === 0) {
       box.innerHTML = `<div class="scan-empty">Nothing spotted yet \u2014 strong launches appear here automatically (keep the browser open). Or open any coin and hit "\u{1F331} Track".</div>`;
       return;
@@ -1959,8 +2157,22 @@ function pillarsHtml(pillars, disqualifiers) {
           <div class="lh-bar"><div style="width:${pct}%;background:${gradeColors(pct).color}"></div></div><ul>${notes}</ul></div>`;
   }).join("");
 }
-function renderLongHold(el, address) {
+function sizeLineHtml(stage, analysis, settings) {
+  const s = settings && settings.ok ? settings : null;
+  const exit = assessExitReality(analysis.market, analysis.mint);
+  const plan = planPosition(s?.bankrollUsd ?? null, s?.riskPct ?? null, stage, exit.maxToleratedUsd);
+  return `<div class="size-line">\u{1F9EE} <b>${esc(plan.headline)}</b>${plan.notes.length ? `<ul>${plan.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}</div>`;
+}
+function renderLongHold(el, address, analysis) {
   if (!el) return;
+  let settings;
+  chrome.runtime.sendMessage({ type: "GET_SETTINGS" }, (r) => {
+    void chrome.runtime.lastError;
+    settings = r;
+    const slot = el.querySelector(".size-slot");
+    if (slot?.dataset.stage) slot.innerHTML = sizeLineHtml(slot.dataset.stage, analysis, settings);
+  });
+  const sizeSlot = (stage) => `<div class="size-slot" data-stage="${stage}">${sizeLineHtml(stage, analysis, settings)}</div>`;
   el.innerHTML = '<div class="lh-box muted">\u{1F3D4} Long-hold check: loading price history\u2026</div>';
   chrome.runtime.sendMessage({ type: "GET_LONGHOLD", address }, (res) => {
     if (chrome.runtime.lastError || !el.isConnected || currentAddress !== address) return;
@@ -1997,6 +2209,7 @@ function renderLongHold(el, address) {
             <span class="muted" style="font-size:10.5px">Early conviction \xB7 ${esc(age)}${esc(curve)}</span>
           </div>
           <div class="lh-lead">${esc(lead2)}</div>
+          ${sizeSlot(e.verdict === "STRONG" || e.verdict === "PROMISING" ? e.stage === "SEED" ? "launch" : "young" : "reject")}
           <div class="row" style="margin-top:6px">${trackBtn}</div>
           <details><summary>Why \u2014 4 pillars</summary>${pillarsHtml(e.pillars, e.disqualifiers)}
             <div class="disclaimer">At launch there's little evidence and ~80% of coins die within 48h \u2014 even STRONG launches mostly fail. Tracking re-checks it for you and alerts if the thesis breaks. Size it to lose.</div>
@@ -2016,6 +2229,7 @@ function renderLongHold(el, address) {
           <span class="muted" style="font-size:10.5px">Staying Power \xB7 ${r.historyDays}d of price history</span>
         </div>
         <div class="lh-lead">${esc(lead)}</div>
+        ${sizeSlot(r.tier === "CANDIDATE" ? "rooted" : r.tier === "WATCH" || r.tier === "LATE" ? "young" : "reject")}
         <div class="row" style="margin-top:6px">${trackBtn}</div>
         <details><summary>Why \u2014 6 pillars</summary>${pillarsHtml(r.pillars, r.disqualifiers)}
           <div class="disclaimer">Built from what separated survivors from the ~95% that die. Even CANDIDATE coins often fail \u2014 size every position to lose it.</div>
@@ -2340,7 +2554,7 @@ function render(analysis, risk, quality, mock) {
   const copyBtn = body.querySelector(".copy");
   copyBtn?.addEventListener("click", () => copyToClipboard(analysis.identity.address, copyBtn));
   renderXMonitor(body.querySelector(".x-monitor"), analysis);
-  renderLongHold(body.querySelector(".longhold"), analysis.identity.address);
+  renderLongHold(body.querySelector(".longhold"), analysis.identity.address, analysis);
   const watchBtn = body.querySelector(".watch-btn");
   watchBtn?.addEventListener("click", () => {
     watchBtn.disabled = true;

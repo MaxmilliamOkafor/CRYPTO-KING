@@ -335,7 +335,7 @@ function computeKingGrade(a, risk, quality) {
     if (limit < ceiling) ceiling = limit;
     if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
-  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held" || a.audit?.rugged === true;
   const live = assessLiveState(a.market);
   if (live.state === "DEAD") applyCap(KING_GRADE.caps.confirmedTrap, "already rugged/dead \u2014 market collapsed.");
   else if (live.state === "DUMPING") applyCap(KING_GRADE.caps.highRisk, "dumping right now.");
@@ -399,6 +399,7 @@ function assessRugPotential(a, risk) {
     if (mint.mintAuthorityActive === null) unverified.push("mint authority");
     if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
   }
+  if (a.audit?.rugged === true) hard.push("Marked as RUGGED by RugCheck (independent auditor).");
   const sim = a.market?.sellSimulation;
   if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
   const lp = a.market?.lpStatus ?? "unknown";
@@ -455,8 +456,16 @@ function initSettings() {
   const xInput = $("x-token");
   const xStatus = $("x-status");
   const xMsg = $("x-msg");
+  const bankroll = $("bankroll");
+  const riskPct = $("risk-pct");
+  const riskStatus = $("risk-status");
+  const riskMsg = $("risk-msg");
   const paint = (res) => {
     if (!res || !res.ok) return;
+    riskStatus.textContent = res.bankrollUsd ? `$${res.bankrollUsd.toLocaleString("en-US")} \xB7 ${res.riskPct ?? 2}% per pick` : "not set";
+    riskStatus.className = res.bankrollUsd ? "turbo-on" : "turbo-off";
+    if (res.bankrollUsd && !bankroll.value) bankroll.value = String(res.bankrollUsd);
+    if (res.riskPct && !riskPct.value) riskPct.value = String(res.riskPct);
     status.textContent = res.hasHelius ? "ON" : "off";
     status.className = res.hasHelius ? "turbo-on" : "turbo-off";
     if (res.hasHelius) input.placeholder = "Helius key saved \u2713 (paste a new one to change)";
@@ -465,6 +474,44 @@ function initSettings() {
     if (res.hasX) xInput.placeholder = "X token saved \u2713 (paste a new one to change)";
   };
   chrome.runtime.sendMessage({ type: "GET_SETTINGS" }, paint);
+  $("save-risk").addEventListener("click", () => {
+    const b = Number(bankroll.value);
+    const r = Number(riskPct.value);
+    riskMsg.textContent = "Saving\u2026";
+    riskMsg.className = "settings-msg";
+    chrome.runtime.sendMessage(
+      { type: "SET_SETTINGS", bankrollUsd: b > 0 ? b : null, riskPct: r > 0 ? Math.min(5, Math.max(0.25, r)) : null },
+      (res) => {
+        if (chrome.runtime.lastError || !res || !res.ok) {
+          riskMsg.textContent = "Could not save.";
+          riskMsg.className = "settings-msg err";
+          return;
+        }
+        paint(res);
+        riskMsg.textContent = res.bankrollUsd ? `Saved \u2014 a normal pick is capped at $${Math.floor(res.bankrollUsd * (res.riskPct ?? 2) / 100)}, a brand-new launch at half that.` : "Risk plan cleared.";
+        riskMsg.className = "settings-msg ok";
+      }
+    );
+  });
+  chrome.runtime.sendMessage({ type: "GET_HEALTH" }, (res) => {
+    if (chrome.runtime.lastError || !res?.ok) return;
+    const color = { ok: "#46a758", degraded: "#ffb224", down: "#e5484d", idle: "#4a5060" };
+    const word = { ok: "working", degraded: "unreliable", down: "not answering", idle: "not used yet" };
+    const box = $("health");
+    box.innerHTML = "";
+    for (const r of res.sources) {
+      const item = document.createElement("span");
+      item.className = "h-item";
+      item.title = `${r.label}: ${word[r.status]}`;
+      const dot = document.createElement("span");
+      dot.className = "h-dot";
+      dot.style.background = color[r.status];
+      item.append(dot, document.createTextNode(r.label));
+      box.appendChild(item);
+    }
+    const note = res.sources.find((r) => r.note && r.status !== "idle")?.note;
+    $("health-note").textContent = note ?? "Green = answering \xB7 grey = not used yet (open a coin or the panel to start scanning).";
+  });
   $("save-key").addEventListener("click", () => {
     const key = input.value.trim();
     msg.textContent = "Saving\u2026";

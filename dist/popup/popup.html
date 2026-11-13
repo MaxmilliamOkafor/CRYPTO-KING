@@ -8,7 +8,7 @@
   <body>
     <header>
       <h1>CRYPTO-KING</h1>
-      <span class="subtitle">Solana meme-coin risk scanner</span>
+      <span class="subtitle">Gem finder &amp; rug scanner · v2</span>
       <span id="mock-badge" class="mock" hidden>MOCK DATA</span>
     </header>
 
@@ -63,8 +63,21 @@
       </section>
 
       <section id="settings" class="settings">
-        <h2>⚡ Turbo mode <span id="turbo-status" class="turbo-off">off — not required</span></h2>
-        <p class="settings-hint">Everything works without this. Turbo is <b>optional</b>: a free Helius RPC key (helius.dev → API Keys) just makes the feed scan ~3× more coins per refresh and enables the metadata-mutability audit. Skip it and the tool runs fine on the public RPC, only slower.</p>
+        <h2>🧮 Risk plan <span id="risk-status" class="turbo-off">not set</span></h2>
+        <p class="settings-hint">Most picks fail — even good-looking ones. What keeps an early-entry strategy alive is <b>size</b>. Enter the money you've set aside for meme coins and every coin card shows the <b>most</b> that coin can justify (smaller for brand-new launches, capped by what the pool lets you sell). A ceiling for risk control — never a suggestion to buy.</p>
+        <div class="settings-row">
+          <input id="bankroll" type="number" min="0" step="any" placeholder="Bankroll in $ (e.g. 500)" />
+          <input id="risk-pct" type="number" min="0.25" max="5" step="0.25" placeholder="% per pick (2)" style="max-width:120px" />
+          <button id="save-risk">Save</button>
+        </div>
+        <div id="risk-msg" class="settings-msg"></div>
+
+        <h2 style="margin-top:12px">📶 Data sources</h2>
+        <div id="health" class="health"></div>
+        <div id="health-note" class="settings-hint"></div>
+
+        <h2 style="margin-top:12px">⚡ Turbo mode <span id="turbo-status" class="turbo-off">off — not required</span></h2>
+        <p class="settings-hint">Works without this. But the free public Solana RPC often <b>refuses holder lookups</b>, so the extension falls back to RugCheck (full scans only). A free Helius key (helius.dev → API Keys) makes holder checks reliable on <b>every</b> scan, scans ~3× more launches per sweep, and adds the metadata-mutability check.</p>
         <div class="settings-row">
           <input id="helius-key" type="password" placeholder="Helius API key" spellcheck="false" autocomplete="off" />
           <button id="save-key">Save</button>

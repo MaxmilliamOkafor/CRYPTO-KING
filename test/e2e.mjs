@@ -55,7 +55,7 @@ await sw.evaluate(() => {
   const SEED_VAULT = 'SeedVauzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA';
   const DEV_ATA = 'DevAtazzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzA';
   const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
-  const sc = (globalThis.__sc = { graduated: false, devPct: 0.5 });
+  const sc = (globalThis.__sc = { graduated: false, devPct: 0.5, rpcRefusesHolders: false });
   const alpha = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
   const wallet = (i) => `Hodr${'z'.repeat(36)}${alpha[i]}`;
   const tokAcct = (i) => `Tacc${'z'.repeat(36)}${alpha[i]}`;
@@ -91,6 +91,7 @@ await sw.evaluate(() => {
   // A pool created two days ago, captured by the new-pools feed.
   const GT_NEW = [gtPool(G2, G2P, 'GEM2 / SOL', 2, 90000, 600000, 150000, 420, 260)];
 
+  const REFUSED = Symbol('refused');
   const rpc = (method, params) => {
     const a0 = Array.isArray(params) ? params[0] : null;
     switch (method) {
@@ -99,6 +100,7 @@ await sw.evaluate(() => {
       case 'getTokenSupply':
         return { value: { amount: '1000000000000000', decimals: 6, uiAmount: 1e9, uiAmountString: '1000000000' } };
       case 'getTokenLargestAccounts': {
+        if (sc.rpcRefusesHolders) return REFUSED; // what the free public RPC really does
         if (a0 === S) {
           // On the curve the curve's ATA holds the unsold supply; after graduation a PumpSwap vault does.
           const pool = sc.graduated ? { address: SEED_VAULT, uiAmountString: String(200_000_000) } : { address: CURVE_ATA, uiAmountString: String(400_000_000) };
@@ -111,7 +113,10 @@ await sw.evaluate(() => {
         const enc = params[1]?.encoding;
         const ownerOf = (acc) =>
           acc === VAULT ? PDA : acc === CURVE_ATA ? CURVE_PDA : acc === SEED_VAULT ? PDA : acc === DEV_ATA ? wallet(21) : wallet(alpha.indexOf(acc.slice(-1)));
-        if (enc === 'jsonParsed') return { value: a0.map((acc) => ({ data: { parsed: { info: { owner: ownerOf(acc) } } } })) };
+        // The feed's batched mint primer asks for MINT accounts; holder math asks for token accounts.
+        const MINT_ACCT = { owner: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', data: { parsed: { type: 'mint', info: { mintAuthority: null, freezeAuthority: null, decimals: 6, supply: '1000000000000000' } } } };
+        const isMint = (acc) => /Coin|Gem2|^DezX/.test(acc) && !/Ata|Vau|Pda|^Tacc|^Hodr/.test(acc);
+        if (enc === 'jsonParsed') return { value: a0.map((acc) => (isMint(acc) ? MINT_ACCT : { data: { parsed: { type: 'account', info: { owner: ownerOf(acc) } } } })) };
         return { value: a0.map((o) => ({ owner: o === PDA ? PUMPSWAP : o === CURVE_PDA ? PUMP_PROGRAM : SYS, lamports: 1 })) };
       }
       default: return null;
@@ -121,8 +126,11 @@ await sw.evaluate(() => {
     const u = new URL(url);
     if (u.host === 'api.mainnet-beta.solana.com') {
       const b = JSON.parse(init.body);
-      return [200, { jsonrpc: '2.0', id: b.id, result: rpc(b.method, b.params) }];
+      const result = rpc(b.method, b.params);
+      if (result === REFUSED) return [429, { error: 'Too many requests for a specific RPC call' }];
+      return [200, { jsonrpc: '2.0', id: b.id, result }];
     }
+    if (u.host === 'rpc.magicblock.app') return [503, {}];
     if (u.host === 'api.dexscreener.com') {
       if (u.pathname.startsWith('/latest/dex/tokens/')) {
         const mints = decodeURIComponent(u.pathname.split('/').pop()).split(',');
@@ -162,7 +170,18 @@ await sw.evaluate(() => {
       return [404, {}];
     }
     // On the curve RugCheck reports 0% LP locked (there's no pool yet) — the scanner must ignore that.
-    if (u.host === 'api.rugcheck.xyz') return [200, { score: 1, risks: [], lpLockedPct: u.pathname.includes(S) ? 0 : 100 }];
+    if (u.host === 'api.rugcheck.xyz') {
+      // FULL report: the same holders the RPC would give (pool vault + wallets), in RugCheck's shape.
+      const onSeed = u.pathname.includes(S);
+      return [200, {
+        token: { mintAuthority: null, freezeAuthority: null, supply: 1e15, decimals: 6 },
+        tokenMeta: { mutable: false }, rugged: false, totalHolders: 18200, creator: wallet(20), risks: [],
+        knownAccounts: { [PDA]: { name: 'Pump Fun AMM', type: 'AMM' } },
+        markets: [{ pubkey: P, liquidityAAccount: VAULT, lp: { lpLockedPct: onSeed ? 0 : 100, lpLockedUSD: 600000 } }],
+        topHolders: [{ address: VAULT, owner: PDA, pct: 30, insider: false },
+          ...walletPcts.map((pct, i) => ({ address: tokAcct(i), owner: wallet(i), pct, insider: i === 3 }))],
+      }];
+    }
     if (u.host === 'lite-api.jup.ag') return [200, { outAmount: '999000', priceImpactPct: '0.0031', routePlan: [{ swapInfo: {} }] }];
     return [404, {}];
   };
@@ -255,6 +274,28 @@ let homeTxt = '';
 for (let i = 0; i < 20; i++) { await page.waitForTimeout(1000); homeTxt = await shadowText(); if (/SEED|DROPPED/.test(homeTxt) && /Gem tracker/.test(homeTxt)) break; }
 console.log('panel gem tracker row:', (homeTxt.match(/Gem tracker[^|]*\|[\s\S]{0,400}/) ?? ['(missing)'])[0].replace(/\s*\|\s*/g, ' | ').slice(0, 400));
 
+// ── 4. The free RPC refuses holder lookups → RugCheck must cover ─────────────
+await sw.evaluate(() => { globalThis.__sc.rpcRefusesHolders = true; });
+let an2;
+for (let i = 0; i < 3; i++) an2 = await pop.evaluate((m) => chrome.runtime.sendMessage({ type: 'ANALYZE_TOKEN', address: m, force: true }), M); // 3 refusals in a row
+const health = await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_HEALTH' }));
+const hHolders = health.ok ? health.sources.find((r) => r.id === 'holders') : null;
+console.log('\n=== RPC REFUSES HOLDERS → BACKUP ===');
+console.log('  largest wallet %:', an2.analysis.holders?.largestNonLpWalletPct?.toFixed(2), '| top10 %:', an2.analysis.holders?.top10Pct?.toFixed(2), '| insiders %:', an2.analysis.holders?.bundledLaunchPct, '| holders:', an2.analysis.holders?.holderCount, '| metadata mutable:', an2.analysis.mint?.metadataMutable);
+console.log('  health:', health.ok ? health.sources.map((r) => `${r.label}=${r.status}`).join(' ') : 'n/a');
+console.log('  note:', hHolders?.note);
+// (left refused from here on: everything below must keep working on the backup)
+
+// ── 5. Top Picks + risk plan ─────────────────────────────────────────────────
+const picks = await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_PICKS' }));
+console.log('\n=== 🏆 TOP PICKS ===');
+if (picks.ok) for (const p of picks.picks) console.log(`  T${p.tier} ${String(p.score).padStart(3)}% ${p.verdict.padEnd(10)} ${p.symbol} (${p.source}${p.deepChecked ? ', checked' : ''})`);
+await pop.evaluate(() => chrome.runtime.sendMessage({ type: 'SET_SETTINGS', bankrollUsd: 1000, riskPct: 2 }));
+await page.goto(`https://gmgn.ai/sol/token/${M}`);
+let cardTxt = '';
+for (let i = 0; i < 40; i++) { await page.waitForTimeout(1000); cardTxt = await shadowText(); if (/Max size: \$/.test(cardTxt)) break; }
+console.log('card risk plan:', (cardTxt.match(/Max size:[^|]*(\|[^|]*){0,3}/) ?? ['(missing)'])[0].replace(/\s*\|\s*/g, ' | ').slice(0, 260));
+
 const hits = await sw.evaluate(() => globalThis.__hits);
 const tally = {}; for (const h of hits) { const k = h.split(' ').slice(0, 2).join(' ').replace(/\/[1-9A-HJ-NP-Za-km-z]{32,44}.*/, '/…'); tally[k] = (tally[k] ?? 0) + 1; }
 console.log('\n=== NETWORK CALLS (' + hits.length + ') ===');
@@ -285,6 +326,13 @@ check(seedScan.analysis.market.lpStatus === 'unknown', "on-curve coin isn't bran
 check(grown && grown.fired.includes('graduated') && grown.fired.includes('x5'), 'graduation + 5× milestones fire');
 check(dropped && dropped.status === 'DROPPED' && /Dev holds/.test(dropped.dropReason ?? ''), 'dev bag → thesis broken → dropped');
 check(/Gem tracker/.test(homeTxt), 'panel shows the gem tracker');
+check(/Top picks right now/.test(homeTxt) && /Picks/.test(homeTxt) && /Launches/.test(homeTxt), 'panel has the tabbed layout with Top Picks');
+check(/Data/.test(homeTxt) && /Holders/.test(homeTxt), 'panel shows the data-health strip');
+check(an2.analysis.holders && Math.abs(an2.analysis.holders.largestNonLpWalletPct - 1.8) < 0.01, 'RPC refuses holders → RugCheck supplies them, pool still excluded');
+check(an2.analysis.holders?.holderCount === 18200 && an2.analysis.mint?.metadataMutable === false, 'RugCheck adds holder count + metadata mutability');
+check(hHolders && hHolders.status === 'ok' && /RugCheck is covering/.test(hHolders.note ?? ''), 'health strip explains that RugCheck is covering for the RPC');
+check(picks.ok && picks.picks[0]?.symbol === 'SURV' && picks.picks.some((p) => p.symbol === 'GEM2') && !picks.picks.some((p) => ['STONK', 'WASH', 'SEED'].includes(p.symbol)), 'Top Picks: best first, passing coins only (dropped seed excluded)');
+check(/Max size: \$30/.test(cardTxt), 'risk plan: $1,000 bankroll × 2% × 1.5 (long-hold candidate) = $30 max');
 check(seedRow && seedRow.early && seedRow.early.score > 0 && seedRow.early.verdict !== 'REJECT', 'feed shows a real 🌱 launch score for an unverified launch (not a capped 50%)');
 check(dropped && ['graduated', 'x2', 'x5', 'dropped'].every((k) => dropped.fired.includes(k)) && dropped.events.some((e) => /Spotted at \$45k/.test(e.text)), 'full alert trail: spotted → graduated → 2× → 5× → thesis broken');
 console.log(fails.length ? `\n✗ E2E FAILED: ${fails.join('; ')}` : '\n✓ E2E passed — every layer ran end to end.');

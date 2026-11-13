@@ -1,6 +1,6 @@
 {
   "name": "crypto-king",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "description": "CRYPTO-KING \u2014 read-only Solana meme-coin risk scanner Chrome extension (MV3) overlaying GMGN.AI. Risk information only; not financial advice.",

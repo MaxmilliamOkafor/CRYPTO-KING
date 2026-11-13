@@ -91,3 +91,7 @@ footer {
   padding: 10px 14px; border-top: 1px solid #2c303a;
   color: #8a91a0; font-size: 10.5px;
 }
+
+.health { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: #c8cdd8; margin: 4px 0; }
+.health .h-item { display: inline-flex; align-items: center; gap: 5px; }
+.health .h-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }

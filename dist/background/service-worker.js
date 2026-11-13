@@ -128,6 +128,8 @@ var EARLY_GEM = {
   /** Coins re-checked per tick (keeps the shared RPC budget sane). */
   checksPerTick: 6,
   /** Disqualifiers at launch. */
+  maxInsiderPct: 20,
+  // supply held by wallets RugCheck's funding graph flags as insiders
   maxDevPct: 5,
   maxLargestWalletPct: 8,
   maxTop10Pct: 30,
@@ -224,7 +226,11 @@ var SOLANA = {
    * to speed up without ever creating an account. A Helius key, if set, takes
    * priority over this whole list.
    */
-  fallbackRpcUrls: [],
+  fallbackRpcUrls: [
+    // Keyless endpoint that still serves getTokenLargestAccounts (the public
+    // one answers 429 for it). Tried only after the primary fails a call.
+    "https://rpc.magicblock.app/mainnet"
+  ],
   /** DAS (getAsset) is only available on Helius-style RPCs. Auto-detected from the URL. */
   get supportsDas() {
     return this.rpcUrl.includes("helius");
@@ -262,8 +268,10 @@ var RUGCHECK = {
   /** ON: the keyless summary is the only source of LP lock status off gmgn.ai
    *  (see lib/lpStatus.ts). Full scans only — never the lite feed sweep. */
   enabled: true,
-  /** Public, keyless summary endpoint (lighter than the full report). */
-  endpoint: "https://api.rugcheck.xyz/v1/tokens/{address}/report/summary"
+  /** Public, keyless FULL report: top holders (+insider flags), known AMM
+   *  accounts, LP lock, authorities, metadata mutability, "rugged" verdict —
+   *  the second source for everything the free RPC refuses to serve. */
+  endpoint: "https://api.rugcheck.xyz/v1/tokens/{address}/report"
 };
 var RATE_LIMITS_MS = {
   default: 1100,
@@ -666,11 +674,15 @@ async function fetchJson(url, init) {
     try {
       const res = await fetch(url, { ...init, signal: ctrl.signal });
       if (!res.ok) {
-        console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
+        record(host, res.status === 404, res.status);
+        if (res.status !== 404) console.warn(`[CRYPTO-KING] ${host} responded ${res.status} for ${url}`);
         return null;
       }
-      return await res.json();
+      const body = await res.json();
+      record(host, true, res.status);
+      return body;
     } catch (err) {
+      record(host, false, 0);
       console.warn(`[CRYPTO-KING] fetch failed for ${url}:`, err);
       return null;
     } finally {
@@ -684,16 +696,59 @@ async function rpcCall(rpcUrl, method, params) {
   const urls = Array.isArray(rpcUrl) ? rpcUrl : [rpcUrl];
   const body = JSON.stringify({ jsonrpc: "2.0", id: "crypto-king", method, params });
   for (const url of urls) {
+    const key = `${hostOf(url)} ${method}`;
+    const blockedUntil = methodBlock.get(key);
+    if (blockedUntil !== void 0 && Date.now() < blockedUntil) continue;
     const json = await fetchJson(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body
     });
-    if (json && typeof json === "object" && "result" in json) {
+    const ok = Boolean(json && typeof json === "object" && "result" in json);
+    recordKey(key, ok);
+    if (ok) {
+      methodFails.delete(key);
+      methodBlock.delete(key);
       return json.result ?? null;
     }
+    const fails = (methodFails.get(key) ?? 0) + 1;
+    methodFails.set(key, fails);
+    if (fails >= METHOD_FAILS_BEFORE_BLOCK) methodBlock.set(key, Date.now() + METHOD_BLOCK_MS);
   }
   return null;
+}
+var methodFails = /* @__PURE__ */ new Map();
+var methodBlock = /* @__PURE__ */ new Map();
+var METHOD_FAILS_BEFORE_BLOCK = 3;
+var METHOD_BLOCK_MS = 5 * 6e4;
+var health = /* @__PURE__ */ new Map();
+function recordKey(key, ok, status = null) {
+  let h = health.get(key);
+  if (!h) {
+    h = { key, ok: 0, fail: 0, lastOkAt: null, lastFailAt: null, lastStatus: null, recent: [], blocked: false };
+    health.set(key, h);
+  }
+  if (ok) {
+    h.ok++;
+    h.lastOkAt = Date.now();
+  } else {
+    h.fail++;
+    h.lastFailAt = Date.now();
+  }
+  if (status !== null) h.lastStatus = status;
+  h.recent.push(ok);
+  if (h.recent.length > 20) h.recent.shift();
+}
+function record(host, ok, status) {
+  recordKey(host, ok, status);
+}
+function getSourceHealth() {
+  const now2 = Date.now();
+  return [...health.values()].map((h) => ({
+    ...h,
+    recent: [...h.recent],
+    blocked: (methodBlock.get(h.key) ?? 0) > now2
+  }));
 }
 function pick(obj, paths) {
   for (const path of paths) {
@@ -899,6 +954,9 @@ function assessEarlyGem(a, risk, x, t = EARLY_GEM) {
     hard("Token-2022 trap extension present.");
   }
   if (a.market?.sellSimulation?.ok === false) hard("Simulated sell fails \u2014 honeypot.");
+  if (a.audit?.rugged === true) hard("Marked as RUGGED by RugCheck.");
+  const bundled = a.holders?.bundledLaunchPct ?? null;
+  if (bundled !== null && bundled > t.maxInsiderPct) hard(`Insider-linked wallets hold ${bundled.toFixed(0)}% \u2014 a bundled launch.`);
   const lp = a.market?.lpStatus ?? "unknown";
   if (!onCurve && (lp === "unlocked" || lp === "deployer_held")) hard("Liquidity can be pulled (LP not burned/locked).");
   if (L?.bannedOnPlatform === true) hard("Banned on its own launchpad.");
@@ -1111,6 +1169,119 @@ function fmtAge(h) {
   return h < 1 ? `${Math.round(h * 60)} min` : h < 48 ? `${h.toFixed(1)}h` : `${Math.floor(h / 24)} days`;
 }
 
+// lib/health.ts
+var RPC_HOST = /solana\.com$|helius-rpc\.com$|magicblock\.app$/;
+var WINDOW = 8;
+function statusOf(all) {
+  const recent = all.slice(-WINDOW);
+  if (recent.length === 0) return "idle";
+  const ok = recent.filter(Boolean).length;
+  if (ok === 0) return recent.length >= 3 ? "down" : "degraded";
+  return ok / recent.length >= 0.7 ? "ok" : "degraded";
+}
+function summarizeHealth(raw) {
+  const host = (h) => raw.find((r) => r.key === h);
+  const recentOf = (keys) => keys.flatMap((k) => k.recent);
+  const row = (id, label, recent, note = null) => ({
+    id,
+    label,
+    status: statusOf(recent),
+    note
+  });
+  const rpcHosts = raw.filter((r) => !r.key.includes(" ") && RPC_HOST.test(r.key));
+  const holderRpc = raw.filter((r) => r.key.endsWith(" getTokenLargestAccounts"));
+  const rug = host("api.rugcheck.xyz");
+  const rank = { ok: 3, degraded: 2, down: 1, idle: 0 };
+  const perEndpoint = holderRpc.map((k) => k.blocked ? "down" : statusOf(k.recent));
+  const holderRpcStatus = perEndpoint.length ? perEndpoint.reduce((best, cur) => rank[cur] > rank[best] ? cur : best, "idle") : "idle";
+  const rugStatus = statusOf(rug?.recent ?? []);
+  let holderStatus;
+  let holderNote = null;
+  if (holderRpcStatus === "ok") holderStatus = "ok";
+  else if (rugStatus === "ok" || rugStatus === "degraded") {
+    holderStatus = holderRpcStatus === "idle" && rugStatus === "ok" ? "ok" : rugStatus;
+    if (holderRpcStatus === "down" || holderRpcStatus === "degraded") {
+      holderNote = "The free Solana RPC is refusing holder lookups \u2014 RugCheck is covering (full scans only).";
+    }
+  } else if (holderRpcStatus === "idle" && rugStatus === "idle") holderStatus = "idle";
+  else {
+    holderStatus = holderRpcStatus === "degraded" ? "degraded" : "down";
+    holderNote = 'Holder checks are failing, so coins will read as "not verified". A free Helius key (toolbar icon \u2192 Turbo) fixes this.';
+  }
+  return [
+    row("launches", "Launches", host("frontend-api-v3.pump.fun")?.recent ?? []),
+    row("prices", "Prices", host("api.dexscreener.com")?.recent ?? []),
+    row("chain", "Solana RPC", recentOf(rpcHosts)),
+    { id: "holders", label: "Holders", status: holderStatus, note: holderNote },
+    row("history", "History", host("api.geckoterminal.com")?.recent ?? []),
+    row("audit", "Audit", rug?.recent ?? []),
+    row("sell", "Sell check", host("lite-api.jup.ag")?.recent ?? [])
+  ];
+}
+
+// lib/picks.ts
+var TOP = /* @__PURE__ */ new Set(["CANDIDATE", "STRONG"]);
+var PASS = /* @__PURE__ */ new Set(["CANDIDATE", "STRONG", "WATCH", "PROMISING"]);
+function buildPicks(gems, radar, feed2, max = 20) {
+  const out = /* @__PURE__ */ new Map();
+  for (const r of radar) {
+    if (r.kind !== "deep" || !r.passed || r.verdict === null || !PASS.has(r.verdict)) continue;
+    out.set(r.address, {
+      address: r.address,
+      symbol: r.symbol,
+      source: "radar",
+      tier: TOP.has(r.verdict) ? 1 : 2,
+      score: r.score,
+      verdict: r.verdict,
+      stage: r.stage,
+      marketCapUsd: r.marketCapUsd,
+      ageHours: r.ageDays !== null ? r.ageDays * 24 : null,
+      headline: r.headline,
+      multiple: null,
+      deepChecked: true
+    });
+  }
+  for (const g of gems) {
+    if (g.status !== "ACTIVE" || !PASS.has(g.verdict)) continue;
+    const last = g.snapshots[g.snapshots.length - 1];
+    if (last?.dead) continue;
+    out.set(g.address, {
+      address: g.address,
+      symbol: g.symbol,
+      source: "tracked",
+      tier: TOP.has(g.verdict) ? 1 : 2,
+      score: g.score,
+      verdict: g.verdict,
+      stage: g.stage,
+      marketCapUsd: g.lastMcap,
+      ageHours: null,
+      headline: g.events[0]?.text ?? null,
+      multiple: g.lastMcap !== null && g.spottedMcap > 0 ? g.lastMcap / g.spottedMcap : null,
+      deepChecked: true
+    });
+  }
+  for (const f of feed2) {
+    if (out.has(f.address)) continue;
+    if (f.insufficientData || f.liveState === "DEAD" || f.liveState === "DUMPING" || f.rugVerdict === "HIGH") continue;
+    if (!f.early || f.early.verdict !== "STRONG") continue;
+    out.set(f.address, {
+      address: f.address,
+      symbol: f.symbol,
+      source: "launch",
+      tier: 3,
+      score: f.early.score,
+      verdict: "STRONG",
+      stage: f.ageMinutes !== null && f.ageMinutes >= 4320 ? "ROOTED" : f.ageMinutes !== null && f.ageMinutes >= 1440 ? "SPROUT" : "SEED",
+      marketCapUsd: f.marketCapEur,
+      ageHours: f.ageMinutes !== null ? f.ageMinutes / 60 : null,
+      headline: f.early.headline,
+      multiple: null,
+      deepChecked: false
+    });
+  }
+  return [...out.values()].sort((a, b) => a.tier - b.tier || (b.score ?? -1) - (a.score ?? -1)).slice(0, max);
+}
+
 // lib/radarScreen.ts
 function quickScreen(m, ageDays, t = LONG_HOLD) {
   const liq = m.liquidityUsd;
@@ -1189,6 +1360,7 @@ function assessRugPotential(a, risk) {
     if (mint.mintAuthorityActive === null) unverified.push("mint authority");
     if (mint.freezeAuthorityActive === null) unverified.push("freeze authority");
   }
+  if (a.audit?.rugged === true) hard.push("Marked as RUGGED by RugCheck (independent auditor).");
   const sim = a.market?.sellSimulation;
   if (sim?.ok === false) hard.push("Simulated sell FAILS \u2014 honeypot behavior.");
   const lp = a.market?.lpStatus ?? "unknown";
@@ -1712,7 +1884,7 @@ function simpleHash(s) {
 
 // lib/pumpfunClient.ts
 var TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchPumpfunData(address) {
+async function fetchPumpfunData(address, fresh = false) {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return {
@@ -1735,9 +1907,22 @@ async function fetchPumpfunData(address) {
     };
   }
   if (!PUMPFUN.enabled) return { ...EMPTY, status: "disabled" };
+  const hit = coinCache.get(address);
+  if (!fresh && hit && Date.now() - hit.at < COIN_TTL_MS) return hit.d;
   const url = `${PUMPFUN.baseUrl}${PUMPFUN.coinEndpoint.replace("{address}", address)}`;
   const json = await fetchJson(url);
   if (json === null) return { ...EMPTY, status: "unavailable" };
+  const d = parseCoin(json);
+  cacheCoin(address, d);
+  return d;
+}
+var coinCache = /* @__PURE__ */ new Map();
+var COIN_TTL_MS = 45e3;
+function cacheCoin(mint, d) {
+  if (coinCache.size > 800) coinCache.clear();
+  coinCache.set(mint, { d, at: Date.now() });
+}
+function parseCoin(json) {
   const createdMs = asNumber(pick(json, ["created_timestamp"]));
   const tokenProgram = asString(pick(json, ["token_program"]));
   const website = asString(pick(json, ["website"]));
@@ -1802,6 +1987,9 @@ async function fetchPumpfunNewCoins(limit, offset = 0) {
       name: asString(pick(c, ["name"])),
       createdMs: asNumber(pick(c, ["created_timestamp"]))
     });
+    if (pick(c, ["creator"]) !== void 0 && pick(c, ["bonding_curve"]) !== void 0 && pick(c, ["complete"]) !== void 0) {
+      cacheCoin(mint, parseCoin(c));
+    }
   }
   return out;
 }
@@ -2165,7 +2353,7 @@ function computeKingGrade(a, risk, quality) {
     if (limit < ceiling) ceiling = limit;
     if (raw > limit * 0.7) caps.push(`Ceiling ${limit}%: ${why}`);
   };
-  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held";
+  const confirmedTrap = a.mint?.mintAuthorityActive === true || a.mint?.freezeAuthorityActive === true || a.mint?.permanentDelegateActive === true || a.mint?.nonTransferable === true || a.mint?.defaultAccountFrozen === true || a.market?.sellSimulation?.ok === false || a.market?.lpStatus === "deployer_held" || a.audit?.rugged === true;
   const live = assessLiveState(a.market);
   if (live.state === "DEAD") applyCap(KING_GRADE.caps.confirmedTrap, "already rugged/dead \u2014 market collapsed.");
   else if (live.state === "DUMPING") applyCap(KING_GRADE.caps.highRisk, "dumping right now.");
@@ -2592,6 +2780,9 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
   } else if (live.state === "UNKNOWN" && a.market !== null) {
     gap("Live price momentum unavailable \u2014 cannot tell if it is already dumping.");
   }
+  if (a.audit?.rugged === true && live.state !== "DEAD") {
+    hit(w.alreadyDead, "Marked as RUGGED by RugCheck (independent auditor).");
+  }
   const h = a.holders;
   if (!h) {
     gap("Holder distribution unavailable.");
@@ -2712,7 +2903,8 @@ function scoreToken(a, w = WEIGHTS, l = LIMITS) {
   }
   const positive = reasons.reduce((sum, r) => sum + r.points, 0);
   const rawMitigation = mitigations.reduce((sum, r) => sum + r.points, 0);
-  const cappedMitigation = Math.max(rawMitigation, -MITIGATION_CAP);
+  const terminal = live.state === "DEAD" || a.audit?.rugged === true;
+  const cappedMitigation = terminal ? 0 : Math.max(rawMitigation, -MITIGATION_CAP);
   const riskScore = clamp(Math.round(positive + cappedMitigation), 0, 100);
   reasons.sort((x, y) => y.points - x.points);
   const insufficientData = a.mint === null && a.market === null && a.holders === null;
@@ -2736,17 +2928,27 @@ function fmtK3(n) {
 
 // lib/settings.ts
 var KEY = "ck:settings";
-var current = { heliusKey: null, xBearerToken: null };
+var current = { heliusKey: null, xBearerToken: null, bankrollUsd: null, riskPct: null };
 var clean = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
+var posNum = (v) => typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
 async function loadSettings() {
   const d = await chrome.storage.local.get(KEY);
   const s = d[KEY];
-  if (s) current = { heliusKey: clean(s.heliusKey), xBearerToken: clean(s.xBearerToken) };
+  if (s) {
+    current = {
+      heliusKey: clean(s.heliusKey),
+      xBearerToken: clean(s.xBearerToken),
+      bankrollUsd: posNum(s.bankrollUsd),
+      riskPct: posNum(s.riskPct)
+    };
+  }
 }
 async function setSettings(patch) {
   current = {
     heliusKey: "heliusKey" in patch ? clean(patch.heliusKey) : current.heliusKey,
-    xBearerToken: "xBearerToken" in patch ? clean(patch.xBearerToken) : current.xBearerToken
+    xBearerToken: "xBearerToken" in patch ? clean(patch.xBearerToken) : current.xBearerToken,
+    bankrollUsd: "bankrollUsd" in patch ? posNum(patch.bankrollUsd) : current.bankrollUsd,
+    riskPct: "riskPct" in patch ? posNum(patch.riskPct) : current.riskPct
   };
   await chrome.storage.local.set({ [KEY]: current });
   return current;
@@ -2848,23 +3050,123 @@ function computeWatchAlerts(baseline, current2) {
 }
 
 // lib/rugcheckClient.ts
+var EMPTY_AUDIT = {
+  status: "unavailable",
+  lpStatus: null,
+  externalFlags: [],
+  holders: null,
+  mintAuthorityActive: null,
+  freezeAuthorityActive: null,
+  metadataMutable: null,
+  rugged: null
+};
 var rugcheckAdapter = {
-  async fetchAudit(address) {
-    if (MOCK_MODE) return { status: "mock", lpStatus: null, externalFlags: [] };
-    if (!RUGCHECK.enabled) return { status: "disabled", lpStatus: null, externalFlags: [] };
+  async fetchAudit(address, excludeTokenAccounts = [], creator = null) {
+    if (MOCK_MODE) return { ...EMPTY_AUDIT, status: "mock" };
+    if (!RUGCHECK.enabled) return { ...EMPTY_AUDIT, status: "disabled" };
     const json = await fetchJson(RUGCHECK.endpoint.replace("{address}", address));
-    if (json === null) return { status: "unavailable", lpStatus: null, externalFlags: [] };
-    const externalFlags = [];
-    const risks = pick(json, ["risks"]);
-    if (Array.isArray(risks)) {
-      for (const r of risks) {
-        const name = pick(r, ["name", "description"]);
-        if (typeof name === "string") externalFlags.push(`RugCheck: ${name}`);
+    if (json === null) return { ...EMPTY_AUDIT };
+    return parseRugcheckReport(json, excludeTokenAccounts, creator);
+  }
+};
+function parseRugcheckReport(json, excludeTokenAccounts = [], creatorHint = null) {
+  const externalFlags = [];
+  const risks = pick(json, ["risks"]);
+  if (Array.isArray(risks)) {
+    for (const r of risks) {
+      const name = pick(r, ["name", "description"]);
+      if (typeof name === "string") externalFlags.push(`RugCheck: ${name}`);
+    }
+  }
+  const markets = pick(json, ["markets"]);
+  let lockedPct = null;
+  const vaults = /* @__PURE__ */ new Set();
+  if (Array.isArray(markets)) {
+    let bestLiq = -1;
+    for (const m of markets) {
+      for (const k of ["liquidityAAccount", "liquidityBAccount", "pubkey"]) {
+        const v = asString(pick(m, [k]));
+        if (v) vaults.add(v);
+      }
+      const pct = asNumber(pick(m, ["lp.lpLockedPct"]));
+      const liq = asNumber(pick(m, ["lp.lpLockedUSD"])) ?? asNumber(pick(m, ["lp.quoteUSD"])) ?? 0;
+      if (pct !== null && liq > bestLiq) {
+        bestLiq = liq;
+        lockedPct = pct;
       }
     }
-    const lpStatus = lpStatusFromLockedPct(asNumber(pick(json, ["lpLockedPct", "markets.0.lp.lpLockedPct"])));
-    return { status: "ok", lpStatus, externalFlags };
   }
+  lockedPct ??= asNumber(pick(json, ["lpLockedPct"]));
+  const hasToken = pick(json, ["token"]) !== void 0;
+  const mintAuth = pick(json, ["mintAuthority", "token.mintAuthority"]);
+  const freezeAuth = pick(json, ["freezeAuthority", "token.freezeAuthority"]);
+  const mutable = pick(json, ["tokenMeta.mutable"]);
+  const rugged = pick(json, ["rugged"]);
+  return {
+    status: "ok",
+    lpStatus: lpStatusFromLockedPct(lockedPct),
+    externalFlags,
+    holders: parseHolders(json, vaults, excludeTokenAccounts, creatorHint),
+    mintAuthorityActive: hasToken ? typeof mintAuth === "string" && mintAuth.length > 0 : null,
+    freezeAuthorityActive: hasToken ? typeof freezeAuth === "string" && freezeAuth.length > 0 : null,
+    metadataMutable: typeof mutable === "boolean" ? mutable : null,
+    rugged: typeof rugged === "boolean" ? rugged : null
+  };
+}
+function parseHolders(json, vaults, excludeTokenAccounts, creatorHint) {
+  const top = pick(json, ["topHolders"]);
+  const totalHolders = asNumber(pick(json, ["totalHolders"]));
+  if (!Array.isArray(top) || top.length === 0) {
+    return totalHolders !== null ? { ...NO_CONCENTRATION, holderCount: totalHolders } : null;
+  }
+  const pools = /* @__PURE__ */ new Set([...vaults, ...excludeTokenAccounts, ...SOLANA.knownPoolAuthorities]);
+  const known2 = pick(json, ["knownAccounts"]);
+  if (known2 && typeof known2 === "object") {
+    for (const [addr, v] of Object.entries(known2)) {
+      const type = (asString(pick(v, ["type"])) ?? "").toUpperCase();
+      if (type.includes("AMM") || type.includes("LOCK") || type.includes("POOL")) pools.add(addr);
+    }
+  }
+  const burns = new Set(SOLANA.burnAddresses);
+  const creator = asString(pick(json, ["creator"])) ?? creatorHint;
+  const byOwner = /* @__PURE__ */ new Map();
+  let insiderPct = 0;
+  let devPct = 0;
+  let sawPct = false;
+  for (const h of top) {
+    const pct = asNumber(pick(h, ["pct"]));
+    if (pct === null || pct < 0 || pct > 100) continue;
+    sawPct = true;
+    const address = asString(pick(h, ["address"])) ?? "";
+    const owner = asString(pick(h, ["owner"])) ?? `acct:${address}`;
+    if (pools.has(address) || pools.has(owner) || burns.has(owner)) continue;
+    byOwner.set(owner, (byOwner.get(owner) ?? 0) + pct);
+    if (pick(h, ["insider"]) === true) insiderPct += pct;
+    if (creator && owner === creator) devPct += pct;
+  }
+  if (!sawPct) return totalHolders !== null ? { ...NO_CONCENTRATION, holderCount: totalHolders } : null;
+  const ranked = [...byOwner.values()].sort((a, b) => b - a);
+  const sum = (xs) => Math.min(100, xs.reduce((s, v) => s + v, 0));
+  return {
+    holderCount: totalHolders,
+    top5Pct: sum(ranked.slice(0, 5)),
+    top10Pct: sum(ranked.slice(0, 10)),
+    largestNonLpWalletPct: ranked.length > 0 ? Math.min(100, ranked[0]) : 0,
+    // Supply held by wallets the auditor's funding-graph analysis flags as
+    // insiders — the "bundled launch" signal the plain RPC can't compute.
+    bundledLaunchPct: Math.min(100, insiderPct),
+    smartMoneyPct: null,
+    devHoldsPct: creator ? Math.min(100, devPct) : null
+  };
+}
+var NO_CONCENTRATION = {
+  holderCount: null,
+  top5Pct: null,
+  top10Pct: null,
+  largestNonLpWalletPct: null,
+  bundledLaunchPct: null,
+  smartMoneyPct: null,
+  devHoldsPct: null
 };
 
 // lib/holderMath.ts
@@ -2914,26 +3216,57 @@ function uiAmountOf(v) {
 
 // lib/solanaClient.ts
 var TOKEN_2022_PROGRAM2 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [], creatorAddress = null, curveComplete = null) {
+async function fetchSolanaData(address, lite = false, excludeTokenAccounts = [], creatorAddress = null, curveComplete = null, fresh = false) {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return { mint: f.mint, holders: f.holders, decimals: null, status: "mock" };
   }
+  const mi = await fetchMintInfo(address, fresh);
   if (lite) {
-    const [mi2, holders2] = await Promise.all([fetchMintInfo(address), fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete)]);
-    return { mint: mi2?.mint ?? null, holders: holders2, decimals: mi2?.decimals ?? null, status: mi2 ? "partial" : "unavailable" };
+    const holders2 = await fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete, mi?.supply ?? null);
+    return { mint: mi?.mint ?? null, holders: holders2, decimals: mi?.decimals ?? null, status: mi ? "partial" : "unavailable" };
   }
-  const [mi, holders] = await Promise.all([fetchMintInfo(address), fetchHolderInfo(address, creatorAddress)]);
+  const holders = await fetchHolderInfo(address, creatorAddress, mi?.supply ?? null);
   const mint = mi?.mint ?? null;
   const status = mint && holders ? "ok" : mint || holders ? "partial" : "unavailable";
   return { mint, holders, decimals: mi?.decimals ?? null, status };
 }
-async function fetchMintInfo(address) {
-  const result = await rpcCall(rpcUrlPool(), "getAccountInfo", [
-    address,
-    { encoding: "jsonParsed", commitment: "confirmed" }
-  ]);
-  const value = result?.value;
+var mintCache = /* @__PURE__ */ new Map();
+var MINT_TTL_MS = 6e4;
+async function primeMintInfos(mints) {
+  if (MOCK_MODE) return;
+  const now2 = Date.now();
+  const need = [...new Set(mints)].filter((m) => {
+    const hit = mintCache.get(m);
+    return !hit || now2 - hit.at > MINT_TTL_MS;
+  });
+  for (let i = 0; i < need.length; i += 100) {
+    const chunk = need.slice(i, i + 100);
+    const result = await rpcCall(rpcUrlPool(), "getMultipleAccounts", [
+      chunk,
+      { encoding: "jsonParsed", commitment: "confirmed" }
+    ]);
+    const values = result?.value;
+    if (!Array.isArray(values)) continue;
+    if (mintCache.size > 1500) mintCache.clear();
+    chunk.forEach((m, idx) => mintCache.set(m, { v: parseMintAccount(values[idx]), at: Date.now() }));
+  }
+}
+async function fetchMintInfo(address, fresh = false) {
+  let hit = mintCache.get(address);
+  if (fresh || !hit || Date.now() - hit.at > MINT_TTL_MS) {
+    const result = await rpcCall(rpcUrlPool(), "getAccountInfo", [
+      address,
+      { encoding: "jsonParsed", commitment: "confirmed" }
+    ]);
+    if (result === null) return null;
+    hit = { v: parseMintAccount(result.value), at: Date.now() };
+    mintCache.set(address, hit);
+  }
+  if (!hit.v) return null;
+  return { ...hit.v, mint: { ...hit.v.mint, metadataMutable: await fetchMetadataMutable(address) } };
+}
+function parseMintAccount(value) {
   const parsed = value?.data?.parsed;
   if (!value || !parsed || parsed.type !== "mint" || !parsed.info) return null;
   const info = parsed.info;
@@ -2972,11 +3305,12 @@ async function fetchMintInfo(address) {
         break;
     }
   }
+  const decimals = asNumber(info.decimals);
+  const rawSupply = asNumber(info.supply);
   return {
     mint: {
       mintAuthorityActive,
       freezeAuthorityActive,
-      metadataMutable: await fetchMetadataMutable(address),
       isToken2022,
       transferFeeBps,
       feeAuthorityActive,
@@ -2985,7 +3319,8 @@ async function fetchMintInfo(address) {
       defaultAccountFrozen,
       nonTransferable
     },
-    decimals: asNumber(info.decimals)
+    decimals,
+    supply: rawSupply !== null && decimals !== null && rawSupply > 0 ? rawSupply / 10 ** decimals : null
   };
 }
 async function fetchMetadataMutable(address) {
@@ -2993,13 +3328,11 @@ async function fetchMetadataMutable(address) {
   const asset = await rpcCall(rpcUrlPool(), "getAsset", { id: address });
   return typeof asset?.mutable === "boolean" ? asset.mutable : null;
 }
-async function fetchHolderInfo(address, creatorAddress = null) {
-  const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]),
-    rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
-  ]);
-  const supply = uiAmountOf(supplyRes?.value);
+async function fetchHolderInfo(address, creatorAddress = null, knownSupply = null) {
+  const largestRes = await rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }]);
   const raw = parseLargest(largestRes);
+  if (raw.length === 0) return null;
+  const supply = knownSupply ?? await fetchSupply(address);
   if (supply === null || supply <= 0 || raw.length === 0) return null;
   const owners = await fetchOwners(raw.map((a) => a.address));
   const ownerPrograms = await fetchOwnerPrograms(owners);
@@ -3036,16 +3369,14 @@ function parseLargest(largestRes) {
   const value = largestRes?.value;
   return (value ?? []).map((a) => ({ address: a.address ?? "", amount: uiAmountOf(a) ?? 0 })).filter((a) => a.address && a.amount > 0);
 }
-async function fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete) {
+async function fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete, knownSupply = null) {
   if (curveComplete !== false) return null;
-  const [supplyRes, largestRes] = await Promise.all([
-    rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]),
-    rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }])
-  ]);
-  const supply = uiAmountOf(supplyRes?.value);
+  const largestRes = await rpcCall(rpcUrlPool(), "getTokenLargestAccounts", [address, { commitment: "confirmed" }]);
   const excluded = new Set(excludeTokenAccounts);
   const accounts = parseLargest(largestRes).filter((a) => !excluded.has(a.address));
-  if (supply === null || supply <= 0 || accounts.length === 0) return null;
+  if (accounts.length === 0) return null;
+  const supply = knownSupply ?? await fetchSupply(address);
+  if (supply === null || supply <= 0) return null;
   const pct = (slice) => Math.min(100, slice.reduce((s, a) => s + a.amount, 0) / supply * 100);
   return {
     holderCount: null,
@@ -3058,6 +3389,10 @@ async function fetchHolderInfoLite(address, excludeTokenAccounts, curveComplete)
     devHoldsPct: null
     // needs owner resolution — full scans only
   };
+}
+async function fetchSupply(address) {
+  const res = await rpcCall(rpcUrlPool(), "getTokenSupply", [address, { commitment: "confirmed" }]);
+  return uiAmountOf(res?.value);
 }
 async function fetchOwners(tokenAccounts) {
   const result = await rpcCall(rpcUrlPool(), "getMultipleAccounts", [
@@ -3114,6 +3449,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   handle(msg).then(sendResponse).catch((err) => sendResponse({ ok: false, error: String(err) }));
   return true;
 });
+function settingsResponse() {
+  const s = getSettings();
+  return {
+    ok: true,
+    hasHelius: hasHelius(),
+    heliusKeySet: Boolean(s.heliusKey),
+    hasX: hasX(),
+    xTokenSet: Boolean(s.xBearerToken),
+    bankrollUsd: s.bankrollUsd,
+    riskPct: s.riskPct
+  };
+}
 async function handle(msg) {
   switch (msg.type) {
     case "ANALYZE_TOKEN":
@@ -3139,17 +3486,17 @@ async function handle(msg) {
       return { ok: true, watchlist: await loadWatchlist() };
     case "GET_SETTINGS": {
       await loadSettings();
-      const s = getSettings();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+      return settingsResponse();
     }
     case "SET_SETTINGS": {
       const patch = {};
       if ("heliusKey" in msg) patch.heliusKey = msg.heliusKey ?? null;
       if ("xBearerToken" in msg) patch.xBearerToken = msg.xBearerToken ?? null;
+      if ("bankrollUsd" in msg) patch.bankrollUsd = msg.bankrollUsd ?? null;
+      if ("riskPct" in msg) patch.riskPct = msg.riskPct ?? null;
       await setSettings(patch);
       if ("heliusKey" in msg) cache.clear();
-      const s = getSettings();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+      return settingsResponse();
     }
     case "CHECK_X": {
       const buzz = await fetchXBuzz(msg.symbol, msg.address, xBearerToken());
@@ -3168,6 +3515,20 @@ async function handle(msg) {
       const tracked = (await loadGems()).gems.some((g) => g.address === msg.address && g.status === "ACTIVE");
       return { ok: true, result: res.result, early: res.early, symbol: res.symbol, tracked };
     }
+    case "GET_PICKS": {
+      if (MOCK_MODE) return { ok: false, error: "Top Picks needs live mode (MOCK_MODE=false)." };
+      const radar = await getRadar(false);
+      const { gems } = await loadGems();
+      return {
+        ok: true,
+        picks: buildPicks(gems, radar.ok ? radar.rows : [], [...feed.values()]),
+        watching: radar.ok ? radar.watching : 0,
+        scannedLaunches: feed.size,
+        sweptAt: radar.ok ? radar.sweptAt : null
+      };
+    }
+    case "GET_HEALTH":
+      return { ok: true, sources: summarizeHealth(getSourceHealth()) };
     case "GET_GEMS":
       return getGems();
     case "TRACK_GEM":
@@ -3231,6 +3592,7 @@ async function doLiveFeedSweep() {
     return !(cached && Date.now() - cached.at < CACHE_TTL_MS);
   }).sort((a, b) => (b.createdMs ?? 0) - (a.createdMs ?? 0)).slice(0, effectiveScanBudget());
   await primeDexscreenerTokens([...coins.map((c) => c.mint), ...feed.keys()]);
+  await primeMintInfos(toScan.map((c) => c.mint));
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -3341,13 +3703,13 @@ async function analyzeToken(address, force, rawGmgn, lite = false) {
 async function doAnalyze(address, rawGmgn, lite = false, force = false) {
   try {
     const gmgnPromise = !MOCK_MODE && rawGmgn ? Promise.resolve(parseGmgn(rawGmgn)) : lite && !MOCK_MODE ? Promise.resolve(emptyGmgnData()) : fetchGmgnData(address);
-    const pumpfun = await fetchPumpfunData(address);
+    const pumpfun = await fetchPumpfunData(address, force);
     const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete, force),
       // RugCheck = LP lock status off gmgn.ai. Full scans only: one more
       // rate-limited call per coin would stall the lite feed sweep.
-      lite ? Promise.resolve({ status: "disabled", lpStatus: null, externalFlags: [] }) : rugcheckAdapter.fetchAudit(address),
+      lite ? Promise.resolve({ ...EMPTY_AUDIT, status: "disabled" }) : rugcheckAdapter.fetchAudit(address, pumpfun.bondingCurveAccounts, pumpfun.creator),
       // Always fetched: served from the sweep's batch cache for lite scans, so
       // rug/dump detection runs on EVERY coin, not just the ones you open.
       fetchDexscreenerToken(address, force)
@@ -3361,7 +3723,7 @@ async function doAnalyze(address, rawGmgn, lite = false, force = false) {
       solana.decimals,
       EXIT_REALITY.referencePositionUsd
     );
-    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, sellQuote, {
+    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit, deployerHist.deployer, dexMarket, sellQuote, {
       gmgn: gmgn.status,
       solana: solana.status,
       pumpfun: pumpfun.status,
@@ -3390,13 +3752,14 @@ async function doAnalyze(address, rawGmgn, lite = false, force = false) {
     return { ok: false, error: "Analysis failed \u2014 data unavailable." };
   }
 }
-function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, dexMarket, sellQuote, sources) {
+function mergeSources(address, gmgn, solana, pumpfun, audit, deployer, dexMarket, sellQuote, sources) {
   let mint = solana.mint;
-  if (!mint && (gmgn.mintRenounced !== null || gmgn.freezeRenounced !== null || gmgn.taxBps !== null)) {
+  const auditHasAuth = audit.mintAuthorityActive !== null || audit.freezeAuthorityActive !== null;
+  if (!mint && (auditHasAuth || gmgn.mintRenounced !== null || gmgn.freezeRenounced !== null || gmgn.taxBps !== null)) {
     mint = {
-      mintAuthorityActive: gmgn.mintRenounced === null ? null : !gmgn.mintRenounced,
-      freezeAuthorityActive: gmgn.freezeRenounced !== null ? !gmgn.freezeRenounced : gmgn.isBlacklist === true ? true : null,
-      metadataMutable: null,
+      mintAuthorityActive: audit.mintAuthorityActive ?? (gmgn.mintRenounced === null ? null : !gmgn.mintRenounced),
+      freezeAuthorityActive: audit.freezeAuthorityActive ?? (gmgn.freezeRenounced !== null ? !gmgn.freezeRenounced : gmgn.isBlacklist === true ? true : null),
+      metadataMutable: audit.metadataMutable,
       isToken2022: pumpfun.isToken2022,
       transferFeeBps: gmgn.taxBps,
       feeAuthorityActive: gmgn.feeAuthorityActive,
@@ -3409,25 +3772,29 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
   } else if (mint) {
     mint = {
       ...mint,
+      // Mutability needs a DAS RPC (Helius) — RugCheck reads it keylessly.
+      metadataMutable: mint.metadataMutable ?? audit.metadataMutable,
       transferFeeBps: mint.transferFeeBps ?? gmgn.taxBps,
       feeAuthorityActive: mint.feeAuthorityActive ?? gmgn.feeAuthorityActive,
       isToken2022: mint.isToken2022 ?? pumpfun.isToken2022
     };
   }
-  const holders = solana.holders || gmgn.top10Pct !== null || gmgn.holderCount !== null ? {
-    holderCount: gmgn.holderCount ?? solana.holders?.holderCount ?? null,
-    top5Pct: solana.holders?.top5Pct ?? null,
-    top10Pct: solana.holders?.top10Pct ?? gmgn.top10Pct,
-    largestNonLpWalletPct: solana.holders?.largestNonLpWalletPct ?? null,
-    bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct,
-    smartMoneyPct: solana.holders?.smartMoneyPct ?? null,
-    devHoldsPct: solana.holders?.devHoldsPct ?? null
+  const sh = solana.holders;
+  const ah = audit.holders;
+  const holders = sh || ah || gmgn.top10Pct !== null || gmgn.holderCount !== null ? {
+    holderCount: gmgn.holderCount ?? ah?.holderCount ?? sh?.holderCount ?? null,
+    top5Pct: sh?.top5Pct ?? ah?.top5Pct ?? null,
+    top10Pct: sh?.top10Pct ?? ah?.top10Pct ?? gmgn.top10Pct,
+    largestNonLpWalletPct: sh?.largestNonLpWalletPct ?? ah?.largestNonLpWalletPct ?? null,
+    bundledLaunchPct: sh?.bundledLaunchPct ?? ah?.bundledLaunchPct ?? gmgn.sniperHoldPct,
+    smartMoneyPct: sh?.smartMoneyPct ?? null,
+    devHoldsPct: sh?.devHoldsPct ?? ah?.devHoldsPct ?? null
   } : null;
   const lpStatus = resolveLpStatus({
     gmgn: gmgn.lpStatus,
     pumpGraduated: pumpfun.status === "ok" ? pumpfun.bondingCurveComplete : null,
     deepestDexId: dexMarket?.dexId ?? null,
-    audit: auditLpStatus
+    audit: audit.lpStatus
   });
   const sellSimulation = gmgn.isHoneypot === true ? { ok: false, slippagePct: gmgn.sellSlippagePct } : gmgn.sellSlippagePct !== null ? { ok: true, slippagePct: gmgn.sellSlippagePct } : sellQuote !== null ? { ok: true, slippagePct: sellQuote.priceImpactPct } : gmgn.isHoneypot === false ? { ok: true, slippagePct: null } : null;
   const hasMarket = dexMarket !== null || gmgn.marketCapEur !== null || gmgn.liquidityEur !== null || pumpfun.marketCapEur !== null || lpStatus !== "unknown";
@@ -3470,6 +3837,7 @@ function mergeSources(address, gmgn, solana, pumpfun, auditLpStatus, deployer, d
     deployer,
     socials: gmgn.socials ?? pumpfun.socials,
     smartMoney: gmgn.smartMoney,
+    audit: audit.status === "ok" ? { rugged: audit.rugged, flags: audit.externalFlags.slice(0, 8) } : null,
     // Only attest launch-platform facts from a live pump.fun response — the
     // mock path stays null so the fixture walkthrough arithmetic holds exactly.
     // pump.fun's own data when we have it; otherwise, if DexScreener shows the
@@ -3636,12 +4004,15 @@ async function sweepWatchlist() {
   }
 }
 function ensureWatchAlarm() {
-  chrome.alarms.create("ck-watch", { periodInMinutes: WATCHLIST.pollMinutes });
-  if (LONG_HOLD.enabled && !MOCK_MODE) {
-    chrome.alarms.create("ck-radar", { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
-  }
-  if (EARLY_GEM.enabled && !MOCK_MODE) {
-    chrome.alarms.create("ck-gems", { periodInMinutes: 1 });
+  const want = [["ck-watch", WATCHLIST.pollMinutes]];
+  if (LONG_HOLD.enabled && !MOCK_MODE) want.push(["ck-radar", LONG_HOLD.radarEveryMinutes]);
+  if (EARLY_GEM.enabled && !MOCK_MODE) want.push(["ck-gems", 1]);
+  for (const [name, period] of want) {
+    chrome.alarms.get(name, (existing) => {
+      if (!existing || existing.periodInMinutes !== period) {
+        chrome.alarms.create(name, { periodInMinutes: period, delayInMinutes: Math.min(1, period) });
+      }
+    });
   }
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
@@ -3660,6 +4031,7 @@ chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
 chrome.runtime.onStartup.addListener(ensureWatchAlarm);
 void loadSettings();
 void loadGems();
+ensureWatchAlarm();
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith("ck-watch-")) return;
   const address = id.slice("ck-watch-".length).split("-")[0];

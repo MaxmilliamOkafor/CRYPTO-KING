@@ -39,6 +39,9 @@ import {
   type RadarPool,
 } from '../lib/geckoClient.ts';
 import { assessEarlyGem, computeGemPortfolio, stageForAge } from '../lib/earlyGem.ts';
+import { summarizeHealth } from '../lib/health.ts';
+import { buildPicks } from '../lib/picks.ts';
+import { getSourceHealth } from '../lib/http.ts';
 import { quickScreen } from '../lib/radarScreen.ts';
 import { assessLongHold } from '../lib/longHold.ts';
 import { onLaunchCurve, resolveLpStatus } from '../lib/lpStatus.ts';
@@ -71,12 +74,13 @@ import {
   hasX,
   loadSettings,
   setSettings,
+  type Settings,
   xBearerToken,
 } from '../lib/settings.ts';
 import { fetchXBuzz } from '../lib/twitterClient.ts';
 import { computeWatchAlerts } from '../lib/watchAlerts.ts';
-import { rugcheckAdapter } from '../lib/rugcheckClient.ts';
-import { fetchSolanaData, type SolanaData } from '../lib/solanaClient.ts';
+import { EMPTY_AUDIT, rugcheckAdapter, type AuditData } from '../lib/rugcheckClient.ts';
+import { fetchSolanaData, primeMintInfos, type SolanaData } from '../lib/solanaClient.ts';
 import type {
   AccuracyResponse,
   AnalyzeResponse,
@@ -85,6 +89,8 @@ import type {
   FeedRow,
   GemSnapshot,
   GemsResponse,
+  HealthResponse,
+  PicksResponse,
   LiveFeedResponse,
   LongHoldAccuracyResponse,
   LongHoldLedgerEntry,
@@ -159,6 +165,19 @@ chrome.runtime.onMessage.addListener((msg: BgRequest, _sender, sendResponse) => 
   return true; // async sendResponse
 });
 
+function settingsResponse(): SettingsResponse {
+  const s = getSettings();
+  return {
+    ok: true,
+    hasHelius: hasHelius(),
+    heliusKeySet: Boolean(s.heliusKey),
+    hasX: hasX(),
+    xTokenSet: Boolean(s.xBearerToken),
+    bankrollUsd: s.bankrollUsd,
+    riskPct: s.riskPct,
+  };
+}
+
 async function handle(
   msg: BgRequest,
 ): Promise<
@@ -174,6 +193,8 @@ async function handle(
   | LongHoldResponse
   | LongHoldAccuracyResponse
   | GemsResponse
+  | HealthResponse
+  | PicksResponse
 > {
   switch (msg.type) {
     case 'ANALYZE_TOKEN':
@@ -199,17 +220,17 @@ async function handle(
       return { ok: true, watchlist: await loadWatchlist() };
     case 'GET_SETTINGS': {
       await loadSettings();
-      const s = getSettings();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+      return settingsResponse();
     }
     case 'SET_SETTINGS': {
-      const patch: { heliusKey?: string | null; xBearerToken?: string | null } = {};
+      const patch: Partial<Settings> = {};
       if ('heliusKey' in msg) patch.heliusKey = msg.heliusKey ?? null;
       if ('xBearerToken' in msg) patch.xBearerToken = msg.xBearerToken ?? null;
+      if ('bankrollUsd' in msg) patch.bankrollUsd = msg.bankrollUsd ?? null;
+      if ('riskPct' in msg) patch.riskPct = msg.riskPct ?? null;
       await setSettings(patch);
       if ('heliusKey' in msg) cache.clear(); // RPC changed → re-scan everything
-      const s = getSettings();
-      return { ok: true, hasHelius: hasHelius(), heliusKeySet: Boolean(s.heliusKey), hasX: hasX(), xTokenSet: Boolean(s.xBearerToken) };
+      return settingsResponse();
     }
     case 'CHECK_X': {
       const buzz = await fetchXBuzz(msg.symbol, msg.address, xBearerToken());
@@ -228,6 +249,22 @@ async function handle(
       const tracked = (await loadGems()).gems.some((g) => g.address === msg.address && g.status === 'ACTIVE');
       return { ok: true, result: res.result, early: res.early, symbol: res.symbol, tracked };
     }
+    case 'GET_PICKS': {
+      if (MOCK_MODE) return { ok: false, error: 'Top Picks needs live mode (MOCK_MODE=false).' };
+      // Reading the radar also kicks a scan if it's stale, so the list fills
+      // even if the alarm hasn't fired yet (fresh install).
+      const radar = await getRadar(false);
+      const { gems } = await loadGems();
+      return {
+        ok: true,
+        picks: buildPicks(gems, radar.ok ? radar.rows : [], [...feed.values()]),
+        watching: radar.ok ? radar.watching : 0,
+        scannedLaunches: feed.size,
+        sweptAt: radar.ok ? radar.sweptAt : null,
+      };
+    }
+    case 'GET_HEALTH':
+      return { ok: true, sources: summarizeHealth(getSourceHealth()) };
     case 'GET_GEMS':
       return getGems();
     case 'TRACK_GEM':
@@ -319,6 +356,8 @@ async function doLiveFeedSweep(): Promise<LiveFeedResponse> {
   // being surfaced. Rows already in the feed are refreshed too, so a coin that
   // rugs AFTER it was scanned drops out instead of lingering with a stale grade.
   await primeDexscreenerTokens([...coins.map((c) => c.mint), ...feed.keys()]);
+  // …and every mint account for this sweep in ONE RPC call (not one per coin).
+  await primeMintInfos(toScan.map((c) => c.mint));
   let scannedThisPoll = toScan.length;
   let next = 0;
   const worker = async () => {
@@ -476,16 +515,18 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false, force
           : fetchGmgnData(address);
     // pump.fun goes first: its bonding-curve accounts feed the lite holder scan
     // (excluded from concentration math so the curve doesn't read as a whale).
-    const pumpfun = await fetchPumpfunData(address);
+    const pumpfun = await fetchPumpfunData(address, force);
     // Remaining adapters degrade to honest "unavailable" internally; Promise.all is safe.
     // DexScreener gives authoritative USD price/mcap/liquidity for LISTED coins
     // (fresh on-curve coins aren't listed yet → null, cached as a real answer).
     const [gmgn, solana, audit, dexMarket] = await Promise.all([
       gmgnPromise,
-      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete),
+      fetchSolanaData(address, lite, pumpfun.bondingCurveAccounts, pumpfun.creator, pumpfun.bondingCurveComplete, force),
       // RugCheck = LP lock status off gmgn.ai. Full scans only: one more
       // rate-limited call per coin would stall the lite feed sweep.
-      lite ? Promise.resolve({ status: 'disabled' as const, lpStatus: null, externalFlags: [] }) : rugcheckAdapter.fetchAudit(address),
+      lite
+        ? Promise.resolve<AuditData>({ ...EMPTY_AUDIT, status: 'disabled' })
+        : rugcheckAdapter.fetchAudit(address, pumpfun.bondingCurveAccounts, pumpfun.creator),
       // Always fetched: served from the sweep's batch cache for lite scans, so
       // rug/dump detection runs on EVERY coin, not just the ones you open.
       fetchDexscreenerToken(address, force), // forced scans bypass the 60s market cache
@@ -511,7 +552,7 @@ async function doAnalyze(address: string, rawGmgn?: unknown, lite = false, force
             EXIT_REALITY.referencePositionUsd,
           );
 
-    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit.lpStatus, deployerHist.deployer, dexMarket, sellQuote, {
+    const analysis = mergeSources(address, gmgn, solana, pumpfun, audit, deployerHist.deployer, dexMarket, sellQuote, {
       gmgn: gmgn.status,
       solana: solana.status,
       pumpfun: pumpfun.status,
@@ -552,7 +593,7 @@ function mergeSources(
   gmgn: GmgnData,
   solana: SolanaData,
   pumpfun: PumpfunData,
-  auditLpStatus: MarketInfo['lpStatus'] | null,
+  audit: AuditData,
   deployer: TokenAnalysis['deployer'],
   dexMarket: DexTokenMarket | null,
   sellQuote: SellQuote | null,
@@ -563,12 +604,15 @@ function mergeSources(
 
   /* mint: on-chain RPC is authoritative; GMGN fills gaps. */
   let mint: MintInfo | null = solana.mint;
-  if (!mint && (gmgn.mintRenounced !== null || gmgn.freezeRenounced !== null || gmgn.taxBps !== null)) {
+  const auditHasAuth = audit.mintAuthorityActive !== null || audit.freezeAuthorityActive !== null;
+  if (!mint && (auditHasAuth || gmgn.mintRenounced !== null || gmgn.freezeRenounced !== null || gmgn.taxBps !== null)) {
+    // RPC didn't answer: RugCheck's read of the mint account first, then GMGN.
     mint = {
-      mintAuthorityActive: gmgn.mintRenounced === null ? null : !gmgn.mintRenounced,
+      mintAuthorityActive: audit.mintAuthorityActive ?? (gmgn.mintRenounced === null ? null : !gmgn.mintRenounced),
       freezeAuthorityActive:
-        gmgn.freezeRenounced !== null ? !gmgn.freezeRenounced : gmgn.isBlacklist === true ? true : null,
-      metadataMutable: null,
+        audit.freezeAuthorityActive ??
+        (gmgn.freezeRenounced !== null ? !gmgn.freezeRenounced : gmgn.isBlacklist === true ? true : null),
+      metadataMutable: audit.metadataMutable,
       isToken2022: pumpfun.isToken2022,
       transferFeeBps: gmgn.taxBps,
       feeAuthorityActive: gmgn.feeAuthorityActive,
@@ -582,23 +626,31 @@ function mergeSources(
     // RPC verdicts stand; GMGN only fills fields the RPC couldn't produce.
     mint = {
       ...mint,
+      // Mutability needs a DAS RPC (Helius) — RugCheck reads it keylessly.
+      metadataMutable: mint.metadataMutable ?? audit.metadataMutable,
       transferFeeBps: mint.transferFeeBps ?? gmgn.taxBps,
       feeAuthorityActive: mint.feeAuthorityActive ?? gmgn.feeAuthorityActive,
       isToken2022: mint.isToken2022 ?? pumpfun.isToken2022,
     };
   }
 
-  /* holders: RPC concentration math wins (LP/burn excluded); GMGN fills counts & sniper rate. */
+  /* holders: RPC concentration math wins (pools excluded structurally); when
+   * the RPC refuses the holder lookup — the free public one usually does —
+   * RugCheck's top-holder list fills in, so concentration is still VERIFIED
+   * instead of "unknown". RugCheck also supplies what only it has: insider-
+   * held supply and the holder count. GMGN fills what's left on gmgn.ai. */
+  const sh = solana.holders;
+  const ah = audit.holders;
   const holders =
-    solana.holders || gmgn.top10Pct !== null || gmgn.holderCount !== null
+    sh || ah || gmgn.top10Pct !== null || gmgn.holderCount !== null
       ? {
-          holderCount: gmgn.holderCount ?? solana.holders?.holderCount ?? null,
-          top5Pct: solana.holders?.top5Pct ?? null,
-          top10Pct: solana.holders?.top10Pct ?? gmgn.top10Pct,
-          largestNonLpWalletPct: solana.holders?.largestNonLpWalletPct ?? null,
-          bundledLaunchPct: solana.holders?.bundledLaunchPct ?? gmgn.sniperHoldPct,
-          smartMoneyPct: solana.holders?.smartMoneyPct ?? null,
-          devHoldsPct: solana.holders?.devHoldsPct ?? null,
+          holderCount: gmgn.holderCount ?? ah?.holderCount ?? sh?.holderCount ?? null,
+          top5Pct: sh?.top5Pct ?? ah?.top5Pct ?? null,
+          top10Pct: sh?.top10Pct ?? ah?.top10Pct ?? gmgn.top10Pct,
+          largestNonLpWalletPct: sh?.largestNonLpWalletPct ?? ah?.largestNonLpWalletPct ?? null,
+          bundledLaunchPct: sh?.bundledLaunchPct ?? ah?.bundledLaunchPct ?? gmgn.sniperHoldPct,
+          smartMoneyPct: sh?.smartMoneyPct ?? null,
+          devHoldsPct: sh?.devHoldsPct ?? ah?.devHoldsPct ?? null,
         }
       : null;
 
@@ -608,7 +660,7 @@ function mergeSources(
     gmgn: gmgn.lpStatus,
     pumpGraduated: pumpfun.status === 'ok' ? pumpfun.bondingCurveComplete : null,
     deepestDexId: dexMarket?.dexId ?? null,
-    audit: auditLpStatus,
+    audit: audit.lpStatus,
   });
   // Sell simulation precedence: GMGN's honeypot verdict (it simulates the
   // actual sell tx) → GMGN slippage → a real Jupiter route with its price
@@ -683,6 +735,7 @@ function mergeSources(
     deployer,
     socials: gmgn.socials ?? pumpfun.socials,
     smartMoney: gmgn.smartMoney,
+    audit: audit.status === 'ok' ? { rugged: audit.rugged, flags: audit.externalFlags.slice(0, 8) } : null,
     // Only attest launch-platform facts from a live pump.fun response — the
     // mock path stays null so the fixture walkthrough arithmetic holds exactly.
     // pump.fun's own data when we have it; otherwise, if DexScreener shows the
@@ -907,14 +960,23 @@ async function sweepWatchlist(): Promise<void> {
   }
 }
 
+/**
+ * Create each alarm ONLY if it's missing. Calling alarms.create() for an alarm
+ * that exists resets its timer — and since the worker wakes every minute, an
+ * unconditional create would keep pushing the 5-minute watchlist alarm back so
+ * it never fired. Also runs on every worker wake (not just install/startup),
+ * so a cleared alarm can't silently stop the scanning.
+ */
 function ensureWatchAlarm(): void {
-  chrome.alarms.create('ck-watch', { periodInMinutes: WATCHLIST.pollMinutes });
-  if (LONG_HOLD.enabled && !MOCK_MODE) {
-    chrome.alarms.create('ck-radar', { periodInMinutes: LONG_HOLD.radarEveryMinutes, delayInMinutes: 1 });
-  }
-  if (EARLY_GEM.enabled && !MOCK_MODE) {
-    // Every minute: due re-checks only, so idle ticks cost nothing.
-    chrome.alarms.create('ck-gems', { periodInMinutes: 1 });
+  const want: Array<[string, number]> = [['ck-watch', WATCHLIST.pollMinutes]];
+  if (LONG_HOLD.enabled && !MOCK_MODE) want.push(['ck-radar', LONG_HOLD.radarEveryMinutes]);
+  if (EARLY_GEM.enabled && !MOCK_MODE) want.push(['ck-gems', 1]); // due re-checks only — idle ticks cost nothing
+  for (const [name, period] of want) {
+    chrome.alarms.get(name, (existing) => {
+      if (!existing || existing.periodInMinutes !== period) {
+        chrome.alarms.create(name, { periodInMinutes: period, delayInMinutes: Math.min(1, period) });
+      }
+    });
   }
 }
 
@@ -940,6 +1002,7 @@ chrome.runtime.onStartup.addListener(ensureWatchAlarm);
 // the tracked-gem list so feed rows are tagged 🌱 from the first sweep.
 void loadSettings();
 void loadGems();
+ensureWatchAlarm();
 
 chrome.notifications?.onClicked.addListener((id) => {
   if (!id.startsWith('ck-watch-')) return;

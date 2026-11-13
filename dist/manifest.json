@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "CRYPTO-KING — Solana Meme-Coin Risk Scanner",
-  "version": "0.1.0",
-  "description": "Read-only risk scanner for Solana meme coins on GMGN.AI and pump.fun. Shows risk information only — cannot detect all scams, does not guarantee profits. Not financial advice.",
+  "version": "2.0.0",
+  "description": "Read-only gem finder and rug scanner for Solana meme coins. Spots launches early, follows your holds, warns when the thesis breaks. Risk information only — cannot detect all scams, does not guarantee profits. Not financial advice.",
   "permissions": [
     "storage",
     "tabs",
@@ -18,7 +18,8 @@
     "https://api.rugcheck.xyz/*",
     "https://api.twitter.com/*",
     "https://lite-api.jup.ag/*",
-    "https://api.geckoterminal.com/*"
+    "https://api.geckoterminal.com/*",
+    "https://rpc.magicblock.app/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js",

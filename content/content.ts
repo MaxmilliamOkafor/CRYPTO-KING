@@ -26,6 +26,7 @@ import { gemBackgroundCheck } from '../lib/gemCriteria.ts';
 import { computeKingGrade, gradeBlurb, gradeColors, gradeLabel } from '../lib/kingGrade.ts';
 import { assessEarlyGem, EARLY_VERDICT_META, GEM_STAGE_META } from '../lib/earlyGem.ts';
 import { LONG_HOLD_TIER_META } from '../lib/longHold.ts';
+import { planPosition, type SizingStage } from '../lib/sizing.ts';
 import {
   matchFirst,
   MINT_HREF_RES,
@@ -43,12 +44,15 @@ import type {
   FeedRow,
   LiveFeedResponse,
   GemsResponse,
+  HealthResponse,
   LongHoldResponse,
   LongHoldResult,
+  PicksResponse,
   RadarResponse,
   QualityResult,
   ResolvePairsResponse,
   RiskResult,
+  SettingsResponse,
   Signal,
   TokenAnalysis,
   WatchlistResponse,
@@ -360,6 +364,25 @@ const STYLES = `
   .si-sym { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .si-reason { color: #9aa1af; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .replica { background: #4a1d1d; color: #ff9b9b; border: 1px solid #7a2e2e; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 5px; letter-spacing: .02em; }
+  .tabs { display: flex; gap: 2px; margin: -4px -4px 10px; padding: 3px; background: #10131a; border: 1px solid #262b36; border-radius: 10px; position: sticky; top: -12px; z-index: 5; }
+  .tab { flex: 1 1 0; padding: 6px 2px; border-radius: 7px; font: 700 11px/1.2 system-ui, sans-serif; color: #9aa1af; background: transparent; border: 0; cursor: pointer; white-space: nowrap; }
+  .tab:hover { color: #e6e8ee; background: #1a1e27; }
+  .tab.on { color: #1b1b18; background: #d4a017; }
+  .tab-n { display: inline-block; min-width: 0; margin-left: 4px; padding: 0 5px; border-radius: 8px; background: rgba(0,0,0,.28); font-size: 10px; }
+  .tab-n:empty { display: none; }
+  .pane { display: none; }
+  .pane.on { display: block; }
+  .pane > .scan-section:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
+  .picks-status, .radar-status { color: #9aa1af; font-size: 11px; margin: 4px 0 6px; }
+  .health { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 9px; margin-top: 12px; padding-top: 8px; border-top: 1px solid #2c303a; font-size: 10px; color: #8a91a0; }
+  .h-title { font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: #6f7686; }
+  .h-item { display: inline-flex; align-items: center; gap: 4px; cursor: help; }
+  .h-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .health-note { display: none; margin-top: 5px; padding: 5px 8px; border-radius: 6px; background: #2a2110; border: 1px solid #4a3a16; color: #f0d48a; font-size: 10.5px; line-height: 1.4; }
+  .size-line { margin-top: 6px; padding: 6px 8px; border-radius: 7px; background: #141a24; border: 1px solid #263246; font-size: 11px; }
+  .size-line b { color: #9fd0ff; }
+  .size-line ul { margin: 3px 0 0; padding: 0; }
+  .size-line li { list-style: none; color: #9aa1af; font-size: 10.5px; padding: 1px 0; }
   .pf-line { font-size: 11px; color: #cfd3dc; margin: 2px 0 6px; line-height: 1.6; }
   .pf-chip { display: inline-block; padding: 0 6px; border-radius: 5px; margin-right: 3px; font-size: 10.5px; }
   .pf-chip.up { background: #1f3d2a; color: #9be3b0; } .pf-chip.down { background: #3d1f1f; color: #ffb3b3; }
@@ -431,7 +454,7 @@ function wrapEl(): HTMLDivElement {
 function renderCollapsed(): void {
   const w = wrapEl();
   w.innerHTML = `
-    <div class="fab" title="Open CRYPTO-KING risk scanner">👑
+    <div class="fab" title="Open CRYPTO-KING">👑
       <span class="fab-badge" hidden>0</span>
     </div>`;
   refreshGemAlerts();
@@ -455,7 +478,7 @@ function cardBody(): HTMLDivElement {
     <div class="card">
       <div class="titlebar">
         <span class="crown">👑</span>
-        <span class="title">CRYPTO-KING <small>· risk scanner</small></span>
+        <span class="title">CRYPTO-KING <small>· gem finder &amp; rug scanner</small></span>
         <button class="icon-btn collapse" title="Collapse">–</button>
       </div>
       <div class="body"></div>
@@ -473,7 +496,22 @@ function renderHome(): void {
   const body = cardBody();
   const onThisPage = addressFromUrl() ?? addressFromDom();
   body.innerHTML = `
-    <div class="live-section">
+    <div class="tabs">
+      <button class="tab" data-tab="picks">🏆 Picks<span class="tab-n" data-n="picks"></span></button>
+      <button class="tab" data-tab="live">📡 Launches</button>
+      <button class="tab" data-tab="radar">🏔 Radar</button>
+      <button class="tab" data-tab="holds">💼 Holds<span class="tab-n" data-n="holds"></span></button>
+      <button class="tab" data-tab="scan">🔍 Scan</button>
+    </div>
+
+    <div class="pane" data-pane="picks">
+      <div class="scan-head"><span class="live-dot"></span><span class="t">Top picks right now — best first</span></div>
+      <div class="grade-legend">The short list: launches, young coins (1–21 days) and coins you're tracking, <b>merged and ranked</b>. Only coins that currently <b>pass their checks</b> appear. ✓ = full background check done · 🌱 = launch score only (click to run the full check). Worth researching — never a buy signal.</div>
+      <div class="picks-status">Scanning…</div>
+      <div class="picks-box"></div>
+    </div>
+
+    <div class="pane live-section" data-pane="live">
       <div class="scan-head">
         <span class="live-dot"></span>
         <span class="t">Live Solana launches — auto-scanning</span>
@@ -490,13 +528,20 @@ function renderHome(): void {
       <div class="livelist"></div>
     </div>
 
+    <div class="pane" data-pane="holds">
     <div class="scan-section gems-section">
       <div class="scan-head"><span class="t">🌱 Gem tracker — spotted at launch, followed while you hold</span></div>
       <div class="grade-legend">New launches with the strongest early evidence (fair launch, socials, fast curve, many buyers) are spotted <b>while the cap is still low</b>, then re-checked for you: alerts on milestones and the moment the thesis breaks. Most still fail — use small, equal sizes.</div>
       <div class="gem-portfolio"></div>
       <div class="gems-box"><div class="scan-empty">Watching the live feed for strong launches…</div></div>
     </div>
+    <div class="scan-section">
+      <div class="scan-head"><span class="t">👁 Watching (rug alerts)</span></div>
+      <div class="watchlist-box"><div class="scan-empty">Nothing watched — open a coin and hit "👁 Watch".</div></div>
+    </div>
+    </div>
 
+    <div class="pane" data-pane="radar">
     <div class="scan-section radar-section">
       <div class="scan-head">
         <span class="t">🏔 Young-gem radar — 1–21 days old, under $5M, best first</span>
@@ -506,7 +551,9 @@ function renderHome(): void {
       <div class="radar-status">Loading radar…</div>
       <div class="radar-box"></div>
     </div>
+    </div>
 
+    <div class="pane" data-pane="scan">
     <div class="scan-section">
       <div class="scan-head"><span class="t">Scan a specific coin (Solana only)</span></div>
       <div class="scan-row">
@@ -521,11 +568,6 @@ function renderHome(): void {
     </div>
 
     <div class="scan-section">
-      <div class="scan-head"><span class="t">👁 Watching (rug alerts)</span></div>
-      <div class="watchlist-box"><div class="scan-empty">Nothing watched — open a coin and hit "👁 Watch".</div></div>
-    </div>
-
-    <div class="scan-section">
       <div class="scan-head">
         <span class="t">Coins linked on this page</span>
         <button class="rescan">↻ Rescan</button>
@@ -533,7 +575,20 @@ function renderHome(): void {
       <div class="scan-status"></div>
       <div class="scanlist"></div>
     </div>
+    </div>
+
+    <div class="health" title="Is each data source answering? Green = yes."></div>
+    <div class="health-note"></div>
     <div class="disclaimer">${esc(DISCLAIMER)}</div>`;
+
+  // Tabs: one thing on screen at a time (the old panel stacked six lists).
+  const showTab = (name: HomeTab) => {
+    homeTab = name;
+    body.querySelectorAll<HTMLElement>('.tab').forEach((t) => t.classList.toggle('on', t.dataset.tab === name));
+    body.querySelectorAll<HTMLElement>('.pane').forEach((p) => p.classList.toggle('on', p.dataset.pane === name));
+  };
+  body.querySelectorAll<HTMLElement>('.tab').forEach((t) => t.addEventListener('click', () => showTab(t.dataset.tab as HomeTab)));
+  showTab(homeTab);
 
   const input = body.querySelector<HTMLInputElement>('.scan-input');
   const go = () => {
@@ -605,6 +660,8 @@ function renderHome(): void {
   body.querySelector('.radar-run')?.addEventListener('click', () => refreshRadarBox(true));
   refreshRadarBox(false);
   refreshGemsBox();
+  refreshPicksBox();
+  refreshHealth();
   startRadarPoll();
 
   updateScanList();
@@ -915,7 +972,7 @@ function refreshGemAlerts(): void {
   fab.classList.toggle('gem-alert', unseen > 0);
   badge.hidden = unseen === 0;
   badge.textContent = String(unseen);
-  fab.title = unseen > 0 ? `CRYPTO-KING: ${unseen} 💎 candidate${unseen > 1 ? 's' : ''} — click to review` : 'Open CRYPTO-KING risk scanner';
+  fab.title = unseen > 0 ? `CRYPTO-KING: ${unseen} 💎 candidate${unseen > 1 ? 's' : ''} — click to review` : 'Open CRYPTO-KING';
 }
 
 function setLiveStatus(text: string): void {
@@ -1040,10 +1097,92 @@ function startRadarPoll(): void {
   if (radarTimer) return;
   radarTimer = setInterval(() => {
     if (view === 'home' && !collapsed) {
+      refreshPicksBox();
       refreshRadarBox(false);
       refreshGemsBox();
+      refreshHealth();
     }
   }, 15_000);
+}
+
+type HomeTab = 'picks' | 'live' | 'radar' | 'holds' | 'scan';
+let homeTab: HomeTab = 'picks';
+
+function setTabCount(name: string, n: number): void {
+  const el = shadow?.querySelector<HTMLElement>(`.tab-n[data-n="${name}"]`);
+  if (el) el.textContent = n > 0 ? String(n) : '';
+}
+
+/** 🏆 Top Picks — tracked gems + radar + strong launches, merged, best first. */
+function refreshPicksBox(): void {
+  const box = shadow?.querySelector<HTMLDivElement>('.picks-box');
+  const status = shadow?.querySelector<HTMLDivElement>('.picks-status');
+  if (!box || !status) return;
+  chrome.runtime.sendMessage({ type: 'GET_PICKS' }, (res: PicksResponse | undefined) => {
+    if (chrome.runtime.lastError || !box.isConnected) return;
+    if (!res || !res.ok) {
+      status.textContent = res && !res.ok ? res.error : 'Top Picks unavailable.';
+      return;
+    }
+    setTabCount('picks', res.picks.length);
+    const deep = res.picks.filter((p) => p.deepChecked).length;
+    status.textContent =
+      `👀 ${res.watching.toLocaleString('en-US')} young coins + ${res.scannedLaunches} launches watched · ` +
+      `🏆 ${res.picks.length} pass right now (${deep} fully checked)`;
+    if (res.picks.length === 0) {
+      box.innerHTML = `<div class="scan-empty">Nothing passes right now. That's normal — about 95% of coins don't. Scanning continues every minute, even with this panel closed; picks appear here (and as desktop alerts) the moment one passes.</div>`;
+      return;
+    }
+    box.innerHTML = res.picks
+      .map((p) => {
+        const gc = gradeColors(p.score);
+        const v = p.verdict;
+        const m = v in LONG_HOLD_TIER_META ? LONG_HOLD_TIER_META[v as keyof typeof LONG_HOLD_TIER_META] : EARLY_VERDICT_META[v as keyof typeof EARLY_VERDICT_META];
+        const sm = GEM_STAGE_META[p.stage];
+        const age = p.ageHours === null ? null : p.ageHours < 1 ? `${Math.max(1, Math.round(p.ageHours * 60))}m old` : p.ageHours < 48 ? `${Math.round(p.ageHours)}h old` : `${Math.floor(p.ageHours / 24)}d old`;
+        const meta = [
+          p.marketCapUsd !== null ? eurShort(p.marketCapUsd) : null,
+          age,
+          p.multiple !== null ? `${p.multiple >= 10 ? p.multiple.toFixed(0) : p.multiple.toFixed(1)}× since spotted` : null,
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        return `
+          <div class="scan-item${p.tier === 1 ? ' gem' : ''}" data-addr="${esc(p.address)}">
+            <span class="mini-badge" style="background:${gc.color};color:${gc.textColor}">${p.score === null ? '—' : `${p.score}%`}</span>
+            <span class="si-main">
+              <span class="si-sym">${p.source === 'tracked' ? '<span title="You are tracking this coin">💼</span> ' : ''}${esc(p.symbol ?? short(p.address))}
+                <span class="lh-tier" style="background:${sm.color};color:${sm.textColor}">${esc(sm.label)}</span>
+                ${m ? `<span class="lh-tier" style="background:${m.color};color:${m.textColor}">${esc(m.label.replace(/^[^A-Za-z]+/, ''))}</span>` : ''}
+                <span class="lh-tier" style="background:#232833;color:${p.deepChecked ? '#8fe0a6' : '#c9b56a'}" title="${p.deepChecked ? 'Full background check done' : 'Launch score only — click to run the full check'}">${p.deepChecked ? '✓ checked' : '🌱 launch score'}</span></span>
+              <span class="si-reason">${esc(meta)}${meta && p.headline ? ' · ' : ''}${esc(p.headline ?? '')}</span>
+            </span>
+            <button class="copy" data-copy="${esc(p.address)}" title="Copy token address">⧉</button>
+          </div>`;
+      })
+      .join('');
+    wireRowHandlers(box);
+  });
+}
+
+/** One dot per data source, so a failing API is visible instead of mysterious. */
+function refreshHealth(): void {
+  const el = shadow?.querySelector<HTMLDivElement>('.health');
+  const noteEl = shadow?.querySelector<HTMLDivElement>('.health-note');
+  if (!el || !noteEl) return;
+  chrome.runtime.sendMessage({ type: 'GET_HEALTH' }, (res: HealthResponse | undefined) => {
+    if (chrome.runtime.lastError || !el.isConnected || !res?.ok) return;
+    const color = { ok: '#46a758', degraded: '#ffb224', down: '#e5484d', idle: '#4a5060' } as const;
+    const word = { ok: 'working', degraded: 'unreliable', down: 'not answering', idle: 'not used yet' } as const;
+    el.innerHTML =
+      '<span class="h-title">Data</span>' +
+      res.sources
+        .map((r) => `<span class="h-item" title="${esc(r.label)}: ${word[r.status]}${r.note ? ` — ${esc(r.note)}` : ''}"><span class="h-dot" style="background:${color[r.status]}"></span>${esc(r.label)}</span>`)
+        .join('');
+    const notes = res.sources.filter((r) => r.note && r.status !== 'idle').map((r) => r.note as string);
+    noteEl.textContent = notes[0] ?? '';
+    noteEl.style.display = notes.length ? 'block' : 'none';
+  });
 }
 
 let radarShowRejected = false;
@@ -1137,6 +1276,7 @@ function refreshGemsBox(): void {
           })
           .join(' ')}</div>`
       : '';
+    setTabCount('holds', res.gems.filter((g) => g.status === 'ACTIVE').length);
     if (res.gems.length === 0) {
       box.innerHTML = `<div class="scan-empty">Nothing spotted yet — strong launches appear here automatically (keep the browser open). Or open any coin and hit "🌱 Track".</div>`;
       return;
@@ -1192,8 +1332,27 @@ function pillarsHtml(pillars: LongHoldResult['pillars'], disqualifiers: string[]
 }
 
 /** Long-hold verdict inside the token card (loads after the main grade). */
-function renderLongHold(el: HTMLDivElement | null, address: string): void {
+/** "Max size" line: a ceiling from the user's own bankroll (lib/sizing.ts). */
+function sizeLineHtml(stage: SizingStage, analysis: TokenAnalysis, settings: SettingsResponse | undefined): string {
+  const s = settings && settings.ok ? settings : null;
+  const exit = assessExitReality(analysis.market, analysis.mint);
+  const plan = planPosition(s?.bankrollUsd ?? null, s?.riskPct ?? null, stage, exit.maxToleratedUsd);
+  return `<div class="size-line">🧮 <b>${esc(plan.headline)}</b>${
+    plan.notes.length ? `<ul>${plan.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : ''
+  }</div>`;
+}
+
+function renderLongHold(el: HTMLDivElement | null, address: string, analysis: TokenAnalysis): void {
   if (!el) return;
+  let settings: SettingsResponse | undefined;
+  chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }, (r: SettingsResponse | undefined) => {
+    void chrome.runtime.lastError;
+    settings = r;
+    // Settings can land after the verdict rendered — fill the line in then.
+    const slot = el.querySelector<HTMLElement>('.size-slot');
+    if (slot?.dataset.stage) slot.innerHTML = sizeLineHtml(slot.dataset.stage as SizingStage, analysis, settings);
+  });
+  const sizeSlot = (stage: SizingStage) => `<div class="size-slot" data-stage="${stage}">${sizeLineHtml(stage, analysis, settings)}</div>`;
   el.innerHTML = '<div class="lh-box muted">🏔 Long-hold check: loading price history…</div>';
   chrome.runtime.sendMessage({ type: 'GET_LONGHOLD', address }, (res: LongHoldResponse | undefined) => {
     if (chrome.runtime.lastError || !el.isConnected || currentAddress !== address) return;
@@ -1234,6 +1393,7 @@ function renderLongHold(el: HTMLDivElement | null, address: string): void {
             <span class="muted" style="font-size:10.5px">Early conviction · ${esc(age)}${esc(curve)}</span>
           </div>
           <div class="lh-lead">${esc(lead)}</div>
+          ${sizeSlot(e.verdict === 'STRONG' || e.verdict === 'PROMISING' ? (e.stage === 'SEED' ? 'launch' : 'young') : 'reject')}
           <div class="row" style="margin-top:6px">${trackBtn}</div>
           <details><summary>Why — 4 pillars</summary>${pillarsHtml(e.pillars, e.disqualifiers)}
             <div class="disclaimer">At launch there's little evidence and ~80% of coins die within 48h — even STRONG launches mostly fail. Tracking re-checks it for you and alerts if the thesis breaks. Size it to lose.</div>
@@ -1257,6 +1417,7 @@ function renderLongHold(el: HTMLDivElement | null, address: string): void {
           <span class="muted" style="font-size:10.5px">Staying Power · ${r.historyDays}d of price history</span>
         </div>
         <div class="lh-lead">${esc(lead)}</div>
+        ${sizeSlot(r.tier === 'CANDIDATE' ? 'rooted' : r.tier === 'WATCH' || r.tier === 'LATE' ? 'young' : 'reject')}
         <div class="row" style="margin-top:6px">${trackBtn}</div>
         <details><summary>Why — 6 pillars</summary>${pillarsHtml(r.pillars, r.disqualifiers)}
           <div class="disclaimer">Built from what separated survivors from the ~95% that die. Even CANDIDATE coins often fail — size every position to lose it.</div>
@@ -1680,7 +1841,7 @@ function render(analysis: TokenAnalysis, risk: RiskResult, quality: QualityResul
   const copyBtn = body.querySelector<HTMLButtonElement>('.copy');
   copyBtn?.addEventListener('click', () => copyToClipboard(analysis.identity.address, copyBtn));
   renderXMonitor(body.querySelector<HTMLDivElement>('.x-monitor'), analysis);
-  renderLongHold(body.querySelector<HTMLDivElement>('.longhold'), analysis.identity.address);
+  renderLongHold(body.querySelector<HTMLDivElement>('.longhold'), analysis.identity.address, analysis);
   const watchBtn = body.querySelector<HTMLButtonElement>('.watch-btn');
   watchBtn?.addEventListener('click', () => {
     watchBtn.disabled = true;

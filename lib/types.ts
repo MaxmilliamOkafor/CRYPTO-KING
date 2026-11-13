@@ -175,6 +175,8 @@ export type SourceStatus = 'ok' | 'partial' | 'unavailable' | 'mock' | 'disabled
 
 /** Everything the scorer needs, aggregated by the background worker. */
 export interface TokenAnalysis {
+  /** Independent auditor's verdict (RugCheck), when a full scan fetched it. */
+  audit?: { rugged: boolean | null; flags: string[] } | null;
   identity: TokenIdentity;
   mint: MintInfo | null;
   holders: HolderInfo | null;
@@ -469,6 +471,20 @@ export type LongHoldAccuracyResponse =
   | { ok: true; rows: LongHoldAccuracyRow[]; tracked: number }
   | { ok: false; error: string };
 
+/* ── Data-source health ──────────────────────────────────────────────── */
+export type HealthStatus = 'ok' | 'degraded' | 'down' | 'idle';
+export interface HealthRow {
+  id: string;
+  label: string;
+  status: HealthStatus;
+  /** Plain-language explanation when something needs the user's attention. */
+  note: string | null;
+}
+export type PicksResponse =
+  | { ok: true; picks: import('./picks.ts').PickRow[]; watching: number; scannedLaunches: number; sweptAt: number | null }
+  | { ok: false; error: string };
+export type HealthResponse = { ok: true; sources: HealthRow[] } | { ok: false; error: string };
+
 export type BgRequest =
   | {
       type: 'ANALYZE_TOKEN';
@@ -491,7 +507,7 @@ export type BgRequest =
   | { type: 'UNWATCH_TOKEN'; address: string }
   | { type: 'GET_WATCHLIST' }
   | { type: 'GET_SETTINGS' }
-  | { type: 'SET_SETTINGS'; heliusKey?: string | null; xBearerToken?: string | null }
+  | { type: 'SET_SETTINGS'; heliusKey?: string | null; xBearerToken?: string | null; bankrollUsd?: number | null; riskPct?: number | null }
   | { type: 'CHECK_X'; symbol: string | null; address: string }
   | { type: 'GET_ACCURACY' }
   /** Long-hold radar list (sweeps in the background if stale). */
@@ -502,6 +518,9 @@ export type BgRequest =
   | { type: 'GET_LONGHOLD'; address: string }
   | { type: 'GET_LH_ACCURACY' }
   /** 🌱 Gem tracker list + "bought every gem at first sight" report. */
+  | { type: 'GET_HEALTH' }
+  /** 🏆 Top Picks: tracked gems + radar + strong launches, merged and ranked. */
+  | { type: 'GET_PICKS' }
   | { type: 'GET_GEMS' }
   | { type: 'TRACK_GEM'; address: string }
   | { type: 'UNTRACK_GEM'; address: string };
@@ -558,7 +577,16 @@ export type LiveFeedResponse =
 export type WatchlistResponse = { ok: true; watchlist: WatchedCoin[] } | { ok: false; error: string };
 
 export type SettingsResponse =
-  | { ok: true; hasHelius: boolean; heliusKeySet: boolean; hasX: boolean; xTokenSet: boolean }
+  | {
+      ok: true;
+      hasHelius: boolean;
+      heliusKeySet: boolean;
+      hasX: boolean;
+      xTokenSet: boolean;
+      /** Risk plan (not secrets — returned as-is). */
+      bankrollUsd: number | null;
+      riskPct: number | null;
+    }
   | { ok: false; error: string };
 
 export type AccuracyResponse =

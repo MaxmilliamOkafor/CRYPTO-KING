@@ -64,6 +64,9 @@ export function assessEarlyGem(a: TokenAnalysis, risk: RiskResult, x: EarlyInput
     hard('Token-2022 trap extension present.');
   }
   if (a.market?.sellSimulation?.ok === false) hard('Simulated sell fails — honeypot.');
+  if (a.audit?.rugged === true) hard('Marked as RUGGED by RugCheck.');
+  const bundled = a.holders?.bundledLaunchPct ?? null;
+  if (bundled !== null && bundled > t.maxInsiderPct) hard(`Insider-linked wallets hold ${bundled.toFixed(0)}% — a bundled launch.`);
   const lp = a.market?.lpStatus ?? 'unknown';
   if (!onCurve && (lp === 'unlocked' || lp === 'deployer_held')) hard('Liquidity can be pulled (LP not burned/locked).');
   if (L?.bannedOnPlatform === true) hard('Banned on its own launchpad.');

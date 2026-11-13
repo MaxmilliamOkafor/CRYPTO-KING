@@ -77,7 +77,8 @@ export function computeKingGrade(a: TokenAnalysis, risk: RiskResult, quality: Qu
     a.mint?.nonTransferable === true ||
     a.mint?.defaultAccountFrozen === true ||
     a.market?.sellSimulation?.ok === false ||
-    a.market?.lpStatus === 'deployer_held';
+    a.market?.lpStatus === 'deployer_held' ||
+    a.audit?.rugged === true;
   // The rug already happened / is happening — hardest ceiling of all. A corpse
   // must never present as a decent grade no matter how clean its structure.
   const live = assessLiveState(a.market);

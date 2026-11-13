@@ -61,6 +61,8 @@ export function assessRugPotential(a: TokenAnalysis, risk: RiskResult): RugPoten
     if (mint.freezeAuthorityActive === null) unverified.push('freeze authority');
   }
 
+  if (a.audit?.rugged === true) hard.push('Marked as RUGGED by RugCheck (independent auditor).');
+
   const sim = a.market?.sellSimulation;
   if (sim?.ok === false) hard.push('Simulated sell FAILS — honeypot behavior.');
 

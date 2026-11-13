@@ -45,7 +45,12 @@ export interface PumpfunData {
 
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 
-export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
+export async function fetchPumpfunData(
+  address: string,
+  /** Skip the cache — forced re-checks (tracker, watchlist) must see a
+   *  graduation that happened seconds ago. */
+  fresh = false,
+): Promise<PumpfunData> {
   if (MOCK_MODE) {
     const f = fixtureForAddress(address);
     return {
@@ -70,10 +75,28 @@ export async function fetchPumpfunData(address: string): Promise<PumpfunData> {
 
   if (!PUMPFUN.enabled) return { ...EMPTY, status: 'disabled' };
 
+  // Primed by the newest-coins list (which already carries every field) —
+  // saves one rate-limited request per coin in each feed sweep.
+  const hit = coinCache.get(address);
+  if (!fresh && hit && Date.now() - hit.at < COIN_TTL_MS) return hit.d;
+
   const url = `${PUMPFUN.baseUrl}${PUMPFUN.coinEndpoint.replace('{address}', address)}`;
   const json = await fetchJson(url);
   if (json === null) return { ...EMPTY, status: 'unavailable' }; // includes 404 for non-pump mints
+  const d = parseCoin(json);
+  cacheCoin(address, d);
+  return d;
+}
 
+const coinCache = new Map<string, { d: PumpfunData; at: number }>();
+const COIN_TTL_MS = 45_000; // launches move fast — keep it short
+function cacheCoin(mint: string, d: PumpfunData): void {
+  if (coinCache.size > 800) coinCache.clear();
+  coinCache.set(mint, { d, at: Date.now() });
+}
+
+/** One pump.fun coin object (single-coin endpoint OR a list item) → our shape. */
+export function parseCoin(json: unknown): PumpfunData {
   const createdMs = asNumber(pick(json, ['created_timestamp']));
   const tokenProgram = asString(pick(json, ['token_program']));
   const website = asString(pick(json, ['website']));
@@ -162,6 +185,12 @@ export async function fetchPumpfunNewCoins(limit: number, offset = 0): Promise<P
       name: asString(pick(c, ['name'])),
       createdMs: asNumber(pick(c, ['created_timestamp'])),
     });
+    // The list returns the same coin objects as /coins/<mint>. When an item
+    // is clearly a full object, prime the per-coin cache with it so the scan
+    // that follows doesn't re-fetch each coin (14 requests saved per sweep).
+    if (pick(c, ['creator']) !== undefined && pick(c, ['bonding_curve']) !== undefined && pick(c, ['complete']) !== undefined) {
+      cacheCoin(mint, parseCoin(c));
+    }
   }
   return out;
 }
